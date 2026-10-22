@@ -1,0 +1,1 @@
+main() { uint value=4294967295; uint result=value*value; if (result != 1) { panic("wrong release square"); } }

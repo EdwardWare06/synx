@@ -1,0 +1,43 @@
+pub import std.prelude.print;
+import std.utf8;
+pub import std.fs.{IoError, ErrorKind};
+extern "C" { int synx_rt_input_byte(&int error); void synx_rt_input_lock(); void synx_rt_input_unlock(); }
+struct InputLock {
+    *byte thread_bound;
+    InputLock new() { unsafe { synx_rt_input_lock(); } return InputLock { thread_bound: 0 as *byte }; }
+}
+impl Drop for InputLock { void drop(&self) { unsafe { synx_rt_input_unlock(); } } }
+
+/// None means EOF before any bytes. Some("") means a blank line.
+/// LF and a CR immediately before it are removed. A final CR at EOF is kept.
+pub Result<String?, IoError> read_line() {
+    var lock = InputLock.new();
+    Vec<byte> bytes = Vec.new();
+    while (true) {
+        int error = 0;
+        int value = unsafe { synx_rt_input_byte(&error) };
+        if (error != 0) { return Err(IoError { kind: ErrorKind.Other, os_code: error }); }
+        if (value == -1 && bytes.is_empty()) { return Ok(None); }
+        if (value == -1 || value == 10) {
+            if (value == 10 && !bytes.is_empty()) {
+                bool carriage = false;
+                match bytes.get(bytes.len() - 1) { Some(last) => { carriage = *last == 13; } None => {} }
+                if (carriage) { var removed = bytes.pop(); }
+            }
+            match utf8.decode(bytes) {
+                Some(text) => return Ok(Some(text)),
+                None => return Err(IoError { kind: ErrorKind.InvalidUtf8, os_code: 0 }),
+            }
+        }
+        bytes.push(value as byte);
+    }
+    panic("unreachable input loop");
+}
+/// Reads one line. A blank line and EOF both return an empty String.
+/// Loops must handle an empty result to stop when the input stream closes.
+pub String input() {
+    match read_line() {
+        Ok(line) => { match line { Some(text) => return text, None => return String.new() } }
+        Err(_) => panic("cannot read UTF-8 input"),
+    }
+}

@@ -1,0 +1,1 @@
+main() { int value = -2147483648; int result = -value; if (result != -2147483648) { panic("wrong release negation"); } }

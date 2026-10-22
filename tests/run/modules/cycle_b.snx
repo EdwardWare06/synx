@@ -1,0 +1,2 @@
+import cycle_a;
+pub int second() { return 7; }

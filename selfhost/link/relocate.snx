@@ -1,0 +1,43 @@
+/// Checked relocation arithmetic, independent of --release.
+/// Pc32 uses S + A - P. Rva32 uses S + A - image_base.
+/// Signed magnitudes avoid intermediate overflow when large terms cancel.
+import link.model.{RelocKind, Failure, Code};
+import link.model;
+
+struct Value { bool negative; ulong magnitude; }
+Value difference(ulong left, ulong right) {
+    if (left >= right) { return Value { negative: false, magnitude: left - right }; }
+    return Value { negative: true, magnitude: right - left };
+}
+Result<Value, Failure> add(Value base, long addend) {
+    bool negative = addend < 0;
+    ulong magnitude = if (negative) { (-(addend + 1)) as ulong + 1 } else { addend as ulong };
+    if (negative == base.negative) {
+        ulong limit = 18446744073709551615;
+        if (magnitude > limit - base.magnitude) { return Err(model.fail(Code.Range, 0, 0)); }
+        return Ok(Value { negative: negative, magnitude: base.magnitude + magnitude });
+    }
+    if (base.magnitude >= magnitude) { return Ok(Value { negative: base.negative, magnitude: base.magnitude - magnitude }); }
+    return Ok(Value { negative: negative, magnitude: magnitude - base.magnitude });
+}
+Result<ulong, Failure> unsigned_value(Value value, ulong limit) {
+    if ((value.negative && value.magnitude != 0) || value.magnitude > limit) { return Err(model.fail(Code.Range, 0, 0)); }
+    return Ok(value.magnitude);
+}
+Result<ulong, Failure> signed32(Value value) {
+    if (value.negative && value.magnitude != 0) {
+        if (value.magnitude > 2147483648) { return Err(model.fail(Code.Range, 0, 0)); }
+        return Ok(4294967296 - value.magnitude);
+    }
+    if (value.magnitude > 2147483647) { return Err(model.fail(Code.Range, 0, 0)); }
+    return Ok(value.magnitude);
+}
+pub Result<ulong, Failure> value(RelocKind kind, ulong symbol, long addend, ulong place, ulong image_base) {
+    match kind {
+        Pc32 => return signed32(add(difference(symbol, place), addend)?),
+        Rva32 => return unsigned_value(add(difference(symbol, image_base), addend)?, 4294967295),
+        Signed32 => return signed32(add(difference(symbol, 0), addend)?),
+        Abs32 => return unsigned_value(add(difference(symbol, 0), addend)?, 4294967295),
+        Abs64 => return unsigned_value(add(difference(symbol, 0), addend)?, 18446744073709551615)
+    }
+}

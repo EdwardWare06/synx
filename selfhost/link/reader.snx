@@ -1,0 +1,54 @@
+/// Checked binary input for the built-in linker. No input references escape.
+/// Invalid ranges return ReadError before indexing, allocation, or arithmetic.
+/// Fixtures: tests/linker/run.py through selfhost/link/probe.snx.
+import std.binary;
+
+pub enum ErrorKind { Truncated, Invalid, Unsupported, Overflow }
+pub struct ReadError { pub ErrorKind kind; pub usize offset; }
+pub ReadError error(ErrorKind kind, usize offset) { return ReadError { kind: kind, offset: offset }; }
+
+/// Returns the exclusive end of a range. An empty range at EOF is valid.
+pub Result<usize, ReadError> range(&const Vec<byte> data, usize offset, usize length) {
+    if (offset > data.len() || length > data.len() - offset) { return Err(error(ErrorKind.Truncated, offset)); }
+    return Ok(offset + length);
+}
+/// Width is 1..8. Endianness is explicit. Input remains unchanged.
+pub Result<ulong, ReadError> word(&const Vec<byte> data, usize offset, usize width, bool little_endian) {
+    if (width == 0 || width > 8) { return Err(error(ErrorKind.Invalid, offset)); }
+    var end = range(data, offset, width)?;
+    return Ok(binary.read_uint(data, offset, width, little_endian).unwrap());
+}
+/// Returns an owned copy of a checked range, including embedded zero bytes.
+pub Result<Vec<byte>, ReadError> copy(&const Vec<byte> data, usize offset, usize length) {
+    usize end = range(data, offset, length)?;
+    Vec<byte> out = Vec.new();
+    for (i in offset..end) { out.push(*data.get(i).unwrap()); }
+    return Ok(out);
+}
+/// ASCII decimal with optional trailing spaces. Empty or signed input is invalid.
+/// Overflow is checked in both compiler arithmetic modes.
+pub Result<usize, ReadError> decimal(&const Vec<byte> data, usize offset, usize length) {
+    usize end = range(data, offset, length)?;
+    usize digits_end = end;
+    while (digits_end > offset && *data.get(digits_end - 1).unwrap() == 32) { digits_end -= 1; }
+    if (digits_end == offset) { return Err(error(ErrorKind.Invalid, offset)); }
+    ulong value = 0;
+    ulong limit = 18446744073709551615;
+    for (i in offset..digits_end) {
+        byte ch = *data.get(i).unwrap();
+        if (ch < 48 || ch > 57) { return Err(error(ErrorKind.Invalid, i)); }
+        ulong digit = (ch - 48) as ulong;
+        if (value > (limit - digit) / 10) { return Err(error(ErrorKind.Overflow, i)); }
+        value = value * 10 + digit;
+    }
+    return Ok(value as usize);
+}
+/// Compares bytes with an ASCII token. A short range returns false.
+pub bool matches(&const Vec<byte> data, usize offset, &const str token) {
+    if (offset > data.len() || token.len() > data.len() - offset) { return false; }
+    for (i in 0..token.len()) {
+        byte wanted = unsafe { *((token.as_ptr() as usize + i) as *const byte) };
+        if (*data.get(offset + i).unwrap() != wanted) { return false; }
+    }
+    return true;
+}

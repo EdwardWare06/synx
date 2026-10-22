@@ -1,0 +1,1 @@
+main() { usize a = 18446744073709551615; usize b = 2; usize result = a * b; if (result != 18446744073709551614) { panic("wrong release result"); } }

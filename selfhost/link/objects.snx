@@ -1,0 +1,30 @@
+/// Checked object/archive dispatch. Archive directory records own names; selected
+/// member objects own payloads. No member is extracted to the filesystem.
+import link.model.{Object, Failure, Code};
+import link.model;
+import link.reader;
+import link.archive;
+import link.coff;
+import link.elf_object;
+import link.macho_object;
+import std.utf8;
+
+pub Result<Object, Failure> read(&const Vec<byte> data, &const str name, bool member, int os) {
+    if (os == 1) { return coff.read(data, name, member); }
+    if (os == 0) { return elf_object.read(data, name, member); }
+    if (os == 2) { return macho_object.read(data, name, member); }
+    return Err(model.fail(Code.Unsupported, 0, 0));
+}
+pub Result<Vec<Object>, Failure> load(&const Vec<byte> data, &const str name, int os) {
+    Vec<Object> result = Vec.new();
+    if (reader.matches(data, 0, "!<arch>\n") || reader.matches(data, 0, "!<thin>\n")) {
+        var members = match archive.parse(data) { Ok(value) => value, Err(error) => return Err(model.fail(Code.Invalid, 0, error.offset)) };
+        for (member in &const members) {
+            if (member.metadata) { continue; }
+            var payload = match reader.copy(data, member.offset, member.size) { Ok(value) => value, Err(error) => return Err(model.fail(Code.Invalid, 0, error.offset)) };
+            var label = match utf8.decode(member.name) { Some(value) => value, None => String.from("<binary member name>") };
+            result.push(read(payload, label, true, os)?);
+        }
+    } else { result.push(read(data, name, false, os)?); }
+    return Ok(result);
+}

@@ -1,0 +1,13 @@
+build/
+build-*/
+out/
+.vs/
+.vscode/
+.cache/
+*.o
+*.obj
+*.exe
+*.pdb
+compile_commands.json
+
+dist/

@@ -1,0 +1,118 @@
+/// AMD64 PE32+ console writer for static and function-importing executables.
+/// Separate RX/R/RW sections, zero-fill BSS, DEP and DIR64 base relocations.
+/// Startup belongs to the supplied inputs. Never writes files.
+import link.model.{Object, Failure, Code, SectionKind};
+import link.model;
+import link.image;
+import link.imports.Import;
+import link.pe_dynamic;
+import link.buffer.{Buffer, align};
+import std.collections.sort;
+
+Result<Vec<byte>, Failure> base_relocations(&const Vec<ulong> sites) {
+    Vec<ulong> sorted = Vec.new(); for (site in sites) { sorted.push(*site); }
+    sort(&sorted);
+    var out = Buffer.new(); usize cursor = 0;
+    while (cursor < sorted.len()) {
+        ulong page = *sorted.get(cursor).unwrap() & ~(4095 as ulong);
+        usize start = out.data.len(); out.word(page, 4); out.word(0, 4);
+        usize count = 0;
+        while (cursor < sorted.len() && (*sorted.get(cursor).unwrap() & ~(4095 as ulong)) == page) {
+            out.word(0xa000 | (*sorted.get(cursor).unwrap() - page), 2);
+            cursor += 1; count += 1;
+        }
+        if (count % 2 != 0) { out.word(0, 2); }
+        out.patch(start + 4, (out.data.len() - start) as ulong, 4);
+    }
+    return Ok(out.data);
+}
+void section_header(&Buffer out, &const str name, ulong size, ulong rva,
+                    ulong raw_size, ulong raw_offset, ulong flags) {
+    out.name(name); out.word(size, 4); out.word(rva, 4);
+    out.word(raw_size, 4); out.word(raw_offset, 4);
+    out.word(0, 4); out.word(0, 4); out.word(0, 2); out.word(0, 2); out.word(flags, 4);
+}
+pub Result<Vec<byte>, Failure> write(&const Vec<Object> inputs, &const str entry) {
+    var linked = image.build(inputs, entry, 5368709120)?;
+    return serialize(linked, 0, 0, 0, 0);
+}
+/// Import catalogs contain only function exports. Synthesized thunks support
+/// direct calls, function pointers, and __imp_ indirect calls. Windows loads and
+/// initializes dependent runtime DLLs before the supplied executable entry.
+pub Result<Vec<byte>, Failure> write_dynamic(&const Vec<Object> inputs, &const str entry, &const Vec<Import> catalog) {
+    var prepared = pe_dynamic.prepare(inputs, catalog)?;
+    var linked = image.build(prepared.inputs, entry, 5368709120)?;
+    ulong directory = 0; ulong iat = 0;
+    if (prepared.directory_size != 0) {
+        directory = image.symbol(linked, "__synx_pe_import_directory").unwrap() - linked.base;
+        iat = image.symbol(linked, "__synx_pe_iat_start").unwrap() - linked.base;
+    }
+    return serialize(linked, directory, prepared.directory_size, iat, prepared.iat_size);
+}
+Result<Vec<byte>, Failure> serialize(&const image.Image linked, ulong directory, ulong directory_size, ulong iat, ulong iat_size) {
+    if (!linked.rebase_safe) { return Err(model.fail(Code.Unsupported, 0, 0)); }
+    var relocs = base_relocations(linked.absolute_sites)?;
+    if (directory != 0 && relocs.is_empty()) {
+        // A fully RIP-relative image still needs a relocation directory so the
+        // loader can rebase it. ABSOLUTE entries require no memory updates.
+        for (i in 0..12) { relocs.push(if (i == 4) { 12 } else { 0 }); }
+    }
+    ulong count = 0; ulong file_cursor = 1024;
+    ulong code_size = 0; ulong initialized = 0; ulong uninitialized = 0;
+    Vec<ulong> offsets = Vec.new(); Vec<ulong> sizes = Vec.new();
+    for (segment in &const linked.segments) {
+        ulong size = align(segment.data.len() as ulong, 512)?;
+        offsets.push(if (size == 0) { 0 } else { file_cursor }); sizes.push(size);
+        // image.build reserves one virtual page even for an empty group. Keep
+        // that page represented so PE section RVAs stay adjacent.
+        count += 1;
+        match segment.kind {
+            Text => { code_size += size; }, Bss => { uninitialized += if (segment.size == 0) { 1 } else { segment.size }; }, _ => { initialized += size; }
+        }
+        file_cursor += size;
+    }
+    ulong reloc_offset = file_cursor;
+    ulong reloc_size = align(relocs.len() as ulong, 512)?;
+    ulong image_size = linked.end_rva;
+    if (!relocs.is_empty()) {
+        count += 1; initialized += reloc_size;
+        image_size = align(image_size + relocs.len() as ulong, 4096)?;
+    }
+    var out = Buffer.new(); out.word(0x5a4d, 2);
+    var dos = out.pad(128)?; out.patch(60, 128, 4);
+    out.word(0x4550, 4); out.word(0x8664, 2); out.word(count, 2);
+    out.word(0, 4); out.word(0, 4); out.word(0, 4); out.word(240, 2); out.word(0x22, 2);
+    out.word(0x20b, 2); out.word(0, 1); out.word(0, 1);
+    out.word(code_size, 4); out.word(initialized, 4); out.word(uninitialized, 4);
+    out.word(linked.entry - linked.base, 4); out.word(4096, 4); out.word(linked.base, 8);
+    out.word(4096, 4); out.word(512, 4);
+    out.word(6, 2); out.word(0, 2); out.word(0, 2); out.word(0, 2); out.word(6, 2); out.word(0, 2);
+    out.word(0, 4); out.word(image_size, 4); out.word(1024, 4); out.word(0, 4);
+    out.word(3, 2); out.word(0x160, 2);
+    out.word(8388608, 8); out.word(4096, 8); out.word(1048576, 8); out.word(4096, 8);
+    out.word(0, 4); out.word(16, 4);
+    for (i in 0..16) {
+        out.word(if (i == 1) { directory } else { if (i == 12) { iat } else { if (i == 5 && !relocs.is_empty()) { linked.end_rva } else { 0 } } }, 4);
+        out.word(if (i == 1) { directory_size } else { if (i == 12) { iat_size } else { if (i == 5) { relocs.len() as ulong } else { 0 } } }, 4);
+    }
+    for (i in 0..linked.segments.len()) {
+        var segment = linked.segments.get(i).unwrap();
+        var name = match segment.kind { Text => ".text", ReadOnly => ".rdata", Data => ".data", Bss => ".bss" };
+        ulong flags = match segment.kind { Text => 0x60000020, ReadOnly => 0x40000040, Data => 0xc0000040, Bss => 0xc0000080 };
+        section_header(&out, name, if (segment.size == 0) { 1 } else { segment.size }, segment.rva, *sizes.get(i).unwrap(), *offsets.get(i).unwrap(), flags);
+    }
+    if (!relocs.is_empty()) { section_header(&out, ".reloc", relocs.len() as ulong, linked.end_rva, reloc_size, reloc_offset, 0x42000040); }
+    var headers = out.pad(1024)?;
+    for (i in 0..linked.segments.len()) {
+        var segment = linked.segments.get(i).unwrap();
+        if (segment.data.is_empty()) { continue; }
+        var padding = out.pad(*offsets.get(i).unwrap())?;
+        out.append(segment.data);
+        var end = out.pad(*offsets.get(i).unwrap() + *sizes.get(i).unwrap())?;
+    }
+    if (!relocs.is_empty()) {
+        var padding = out.pad(reloc_offset)?; out.append(relocs);
+        var end = out.pad(reloc_offset + reloc_size)?;
+    }
+    return Ok(out.data);
+}

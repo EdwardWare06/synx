@@ -1,0 +1,100 @@
+import std.mem;
+void expect(bool condition) { if (!condition) { panic("mutation assertion failed"); } }
+struct Cell { int value; Option<Box<Cell>> next; }
+struct Chain {
+    Option<Box<Cell>> head;
+    void push_front(&self, int value) {
+        var previous = self.head.take();
+        self.head = Some(Box<Cell>.new(Cell { value: value, next: previous }));
+    }
+    int? pop_front(&self) {
+        match self.head.take() {
+            Some(box) => {
+                var cell = box.into_inner();
+                int value = cell.value;
+                self.head = cell.next;
+                return Some(value);
+            }
+            None => return None,
+        }
+    }
+}
+struct Branch { int value; Option<Box<Branch>> left; Option<Box<Branch>> right; }
+void insert(&Option<Box<Branch>> slot, int value) {
+    if (slot.is_none()) { *slot = Some(Box<Branch>.new(Branch { value: value, left: None, right: None })); return; }
+    match slot.as_mut() {
+        Some(box) => {
+            var node = box.as_mut();
+            if (value < node.value) { insert(&node.left, value); }
+            else { insert(&node.right, value); }
+        }
+        None => {},
+    }
+}
+bool contains(&const Option<Box<Branch>> slot, int value) {
+    match slot.as_ref() {
+        Some(box) => {
+            var node = box.as_ref();
+            if (value == node.value) { return true; }
+            if (value < node.value) { return contains(node.left, value); }
+            return contains(node.right, value);
+        }
+        None => return false,
+    }
+}
+// Remove a whole subtree; the returned owner can be inspected or dropped.
+Option<Box<Branch>> remove_subtree(&Option<Box<Branch>> slot, int value) {
+    bool found = false;
+    match slot.as_ref() { Some(box) => { found = box.as_ref().value == value; } None => {} }
+    if (found) { return slot.take(); }
+    match slot.as_mut() {
+        Some(box) => {
+            var node = box.as_mut();
+            if (value < node.value) { return remove_subtree(&node.left, value); }
+            return remove_subtree(&node.right, value);
+        }
+        None => return None,
+    }
+}
+struct Ticket { int id; }
+impl Drop for Ticket { void drop(&self) { print("drop {self.id}"); } }
+main() {
+    var chain = Chain { head: None };
+    chain.push_front(1); chain.push_front(2); chain.push_front(3);
+    expect(chain.pop_front().unwrap() == 3);
+    expect(chain.pop_front().expect("missing") == 2);
+    expect(chain.pop_front().unwrap_or(0) == 1);
+    expect(chain.pop_front().unwrap_or(0) == 0);
+    print("chain");
+    Option<Box<Branch>> root = None;
+    insert(&root, 5); insert(&root, 2); insert(&root, 8); insert(&root, 1); insert(&root, 3);
+    expect(contains(root, 3)); expect(contains(root, 8));
+    var removed = remove_subtree(&root, 2);
+    expect(contains(removed, 3)); expect(!contains(root, 3)); expect(contains(root, 8));
+    print("tree");
+    {
+        var a = Box<Ticket>.new(Ticket { id: 10 });
+        var b = Box<Ticket>.new(Ticket { id: 11 });
+        mem.swap(&a, &b);
+        expect(a.as_ref().id == 11);
+        var previous = mem.replace(&a, Box<Ticket>.new(Ticket { id: 12 }));
+        expect(previous.as_ref().id == 11);
+    }
+    {
+        Option<Box<Ticket>> option = Some(Box<Ticket>.new(Ticket { id: 20 }));
+        var old = option.replace(Box<Ticket>.new(Ticket { id: 21 }));
+        expect(old.unwrap().as_ref().id == 20);
+        var value = option.take();
+        expect(option.is_none());
+        expect(value.unwrap().as_ref().id == 21);
+    }
+    {
+        Option<Box<Ticket>> option = Some(Box<Ticket>.new(Ticket { id: 30 }));
+        var fallback = Box<Ticket>.new(Ticket { id: 31 });
+        var value = option.unwrap_or(fallback);
+        expect(value.as_ref().id == 30);
+    }
+    mem.drop(Box<Ticket>.new(Ticket { id: 40 }));
+    print("early drop complete");
+    print("done");
+}

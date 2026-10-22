@@ -1,0 +1,131 @@
+/// Owned lexical paths. Operations do not access the filesystem or resolve links.
+pub enum Style { Unix, Windows }
+extern "C" { int synx_rt_windows(); }
+pub Style host_style() { return if (unsafe { synx_rt_windows() } == 1) { Style.Windows } else { Style.Unix }; }
+bool windows(Style style) { match style { Windows => return true, Unix => return false } }
+byte at(&const str text, usize i) { return unsafe { *((text.as_ptr() as usize + i) as *const byte) }; }
+bool separator(byte b, Style style) { return b == 47 || (windows(style) && b == 92); }
+String copy(&const str text, usize first, usize end) {
+    if (first == end) { return String.new(); }
+    return String.from(unsafe { str_from_raw((text.as_ptr() as usize + first) as *const byte, end - first) });
+}
+bool drive(&const str text, Style style) {
+    if (!windows(style) || text.len() < 2 || at(text, 1) != 58) { return false; }
+    byte b = at(text, 0);
+    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+usize prefix(&const str text, Style style) {
+    usize n = text.len();
+    if (n == 0) { return 0; }
+    if (drive(text, style)) { return if (n > 2 && separator(at(text, 2), style)) { 3 } else { 2 }; }
+    if (!separator(at(text, 0), style)) { return 0; }
+    if (windows(style) && n > 1 && separator(at(text, 1), style)) {
+        usize i = 2;
+        while (i < n && !separator(at(text, i), style)) { i += 1; }
+        if (i < n) { i += 1; }
+        while (i < n && !separator(at(text, i), style)) { i += 1; }
+        return i;
+    }
+    return 1;
+}
+bool rooted(&const str text, Style style) {
+    return text.len() > 0 && (separator(at(text, 0), style) || (drive(text, style) && text.len() > 2 && separator(at(text, 2), style)));
+}
+
+pub struct Path {
+    String text;
+    Style style;
+
+    pub Path from(&const str text) { return Path.with_style(text, host_style()); }
+    pub Path with_style(&const str text, Style style) { return Path { text: String.from(text), style: style }; }
+    pub &const str as_str(&const self) { return self.text.as_str(); }
+    pub bool is_absolute(&const self) {
+        if (!windows(self.style)) { return rooted(self.text, self.style); }
+        return (drive(self.text, self.style) && rooted(self.text, self.style)) ||
+               (self.text.len() > 1 && separator(at(self.text, 0), self.style) && separator(at(self.text, 1), self.style));
+    }
+    pub Path join(&const self, &const str child) {
+        var other = Path.with_style(child, self.style);
+        if (other.is_absolute() || drive(child, self.style)) { return other; }
+        if (child.len() > 0 && separator(at(child, 0), self.style)) {
+            var text = if (drive(self.text, self.style)) { copy(self.text, 0, 2) } else { String.new() };
+            text.push_str(child); return Path { text: text, style: self.style };
+        }
+        var text = String.from(self.text);
+        usize n = text.len();
+        if (n > 0 && child.len() > 0 && !separator(at(text, n - 1), self.style) && !(drive(text, self.style) && n == 2)) { text.push('/'); }
+        text.push_str(child);
+        return Path { text: text, style: self.style };
+    }
+    pub String? file_name(&const self) {
+        usize root = prefix(self.text, self.style); usize end = self.text.len();
+        while (end > root && separator(at(self.text, end - 1), self.style)) { end -= 1; }
+        if (end <= root) { return None; }
+        usize start = end;
+        while (start > root && !separator(at(self.text, start - 1), self.style)) { start -= 1; }
+        var name = copy(self.text, start, end);
+        if (name == String.from(".") || name == String.from("..")) { return None; }
+        return Some(name);
+    }
+    pub Path? parent(&const self) {
+        usize root = prefix(self.text, self.style); usize end = self.text.len();
+        while (end > root && separator(at(self.text, end - 1), self.style)) { end -= 1; }
+        if (end <= root) { return None; }
+        while (end > root && !separator(at(self.text, end - 1), self.style)) { end -= 1; }
+        while (end > root && separator(at(self.text, end - 1), self.style)) { end -= 1; }
+        return Some(Path { text: copy(self.text, 0, end), style: self.style });
+    }
+    pub String? extension(&const self) {
+        match self.file_name() {
+            None => return None,
+            Some(name) => {
+                usize i = name.len();
+                while (i > 0) {
+                    i -= 1;
+                    if (at(name, i) == 46) { return if (i == 0) { None } else { Some(copy(name, i + 1, name.len())) }; }
+                }
+                return None;
+            }
+        }
+    }
+    /// Removes dot components and cancels ordinary components before .. .
+    /// Leading .. survives on relative paths. A root cannot be crossed.
+    pub Path normalize(&const self) {
+        usize root = prefix(self.text, self.style);
+        Vec<String> parts = Vec.new();
+        usize i = root;
+        while (i < self.text.len()) {
+            if (separator(at(self.text, i), self.style)) { i += 1; continue; }
+            usize start = i;
+            while (i < self.text.len() && !separator(at(self.text, i), self.style)) { i += 1; }
+            var part = copy(self.text, start, i);
+            if (part == String.from(".")) { continue; }
+            if (part == String.from("..")) {
+                bool cancel = false;
+                if (!parts.is_empty()) {
+                    match parts.get(parts.len() - 1) { Some(last) => { cancel = *last != String.from(".."); } None => {} }
+                }
+                if (cancel) { var removed = parts.pop(); }
+                else if (!rooted(self.text, self.style)) { parts.push(part); }
+            } else { parts.push(part); }
+        }
+        var result = String.new();
+        usize j = 0;
+        while (j < root) {
+            if (separator(at(self.text, j), self.style)) { result.push('/'); j += 1; }
+            else {
+                usize start = j;
+                while (j < root && !separator(at(self.text, j), self.style)) { j += 1; }
+                var segment = copy(self.text, start, j);
+                result.push_str(segment);
+            }
+        }
+        for (part in &const parts) {
+            usize n = result.len();
+            if (n > 0 && at(result, n - 1) != 47 && !(drive(result, self.style) && n == 2)) { result.push('/'); }
+            result.push_str(part.as_str());
+        }
+        if (result.is_empty() && !self.text.is_empty()) { result.push('.'); }
+        return Path { text: result, style: self.style };
+    }
+}

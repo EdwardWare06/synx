@@ -1,0 +1,82 @@
+import std.collections.sort;
+
+void expect(bool condition, &const str message) { if (!condition) { panic(message); } }
+
+struct Item { int rank; String name; }
+impl Ord for Item { bool lt(&const self, &const Self other) { return self.rank < other.rank; } }
+impl Drop for Item { void drop(&self) { print("drop {self.rank} {self.name}"); } }
+
+struct Callback { int rank; fn() -> int call; }
+impl Ord for Callback { bool lt(&const self, &const Self other) { return self.rank < other.rank; } }
+
+void integer_cases() {
+    var empty = Vec<int>.new(); sort(&empty); expect(empty.is_empty(), "empty");
+    empty.push(1); sort(&empty); expect(empty.len() == 1, "single"); empty.swap(0,0);
+    for (count in 0..65) {
+        var values = Vec<int>.new();
+        for (i in 0..count) { values.push(count - i); }
+        sort(&values);
+        int wanted = 1;
+        for (n in &const values) { expect(*n == wanted, "reverse order"); wanted += 1; }
+        sort(&values);
+        wanted = 1;
+        for (n in &const values) { expect(*n == wanted, "already sorted"); wanted += 1; }
+    }
+    var duplicates = Vec<int>.new();
+    int[31] counts = [0; 31];
+    for (i in 0..2000) {
+        int n = (i * 7919) % 31 - 15;
+        duplicates.push(n); counts[(n + 15) as usize] += 1;
+    }
+    sort(&duplicates);
+    int previous = -16; int sum = 0;
+    for (n in &const duplicates) {
+        expect(*n >= previous, "duplicate order"); previous = *n; sum += *n;
+        counts[(*n + 15) as usize] -= 1;
+    }
+    for (count in counts) { expect(count == 0, "preserved multiplicities"); }
+    int expected_sum = 0; for (i in 0..2000) { expected_sum += (i * 7919) % 31 - 15; }
+    expect(sum == expected_sum && duplicates.len() == 2000, "permutation");
+    var same = Vec<int>.new(); for (i in 0..100) { same.push(7); } sort(&same);
+    for (n in &const same) { expect(*n == 7, "all equal"); }
+    var extremes = Vec<int>.new(); extremes.push(2147483647); extremes.push(-2147483647 - 1); extremes.push(0);
+    sort(&extremes);
+    match extremes.get(0) { Some(n) => expect(*n == -2147483647 - 1, "minimum"), None => panic("minimum absent") }
+    print("integers ok");
+}
+
+void owned_cases() {
+    var words = Vec<String>.new(); words.push(String.from("zeta")); words.push(String.from("alpha")); words.push(String.from("beta"));
+    sort(&words); for (word in &const words) { print(word); }
+    {
+        var items = Vec<Item>.new();
+        items.push(Item { rank: 3, name: String.from("three") });
+        items.push(Item { rank: 1, name: String.from("one") });
+        items.push(Item { rank: 2, name: String.from("two") });
+        sort(&items);
+        for (item in &const items) { print("item {item.rank} {item.name}"); }
+        items.swap(0,2); items.swap(1,1);
+        print("swapped");
+    }
+    var callbacks = Vec<Callback>.new();
+    callbacks.push(Callback { rank: 2, call: || 20 });
+    callbacks.push(Callback { rank: 1, call: || 10 });
+    sort(&callbacks);
+    int result = 0; for (callback in &callbacks) { result += callback.call(); }
+    expect(result == 30, "owned callbacks");
+    print("ownership ok");
+}
+
+void other_types() {
+    var unsigned = Vec<ulong>.new(); unsigned.push(18446744073709551615 as ulong); unsigned.push(0); unsigned.push(1);
+    sort(&unsigned); match unsigned.get(0) { Some(n) => expect(*n == 0, "unsigned order"), None => panic("unsigned absent") }
+    var floating = Vec<double>.new(); floating.push(2.5); floating.push(-1.25); floating.push(0.0); sort(&floating);
+    match floating.get(0) { Some(n) => expect(*n == -1.25, "float order"), None => panic("float absent") }
+    int a = 3; int b = 1; int c = 2;
+    var borrowed = Vec<&const int>.new(); borrowed.push(&const a); borrowed.push(&const b); borrowed.push(&const c);
+    sort(&borrowed); int wanted = 1;
+    for (n in &const borrowed) { expect(**n == wanted, "borrowed values"); wanted += 1; }
+    print("types ok");
+}
+
+main() { integer_cases(); owned_cases(); other_types(); }

@@ -1,0 +1,64 @@
+import std.task.{block_on, yield_now};
+void expect(bool value) { if (!value) { panic("async assertion failed"); } }
+async int add(int a, int b) { await yield_now(); return a+b; }
+async T identity<T>(T value) { await yield_now(); return value; }
+async int sum() {
+    var values = [1,2,3,4];
+    int total = 0;
+    for (i in 0..(4 as usize)) {
+        await yield_now();
+        values[i] += i as int;
+        total += values[i];
+    }
+    return total;
+}
+async int factorial(int n) {
+    if (n == 0) { return 1; }
+    await yield_now();
+    return n * (await factorial(n-1));
+}
+async (String, int) pair() { await yield_now(); return (String.from("pair"),7); }
+async Result<int,int> step(bool success) {
+    await yield_now();
+    if (success) { return Ok(8); }
+    return Err(3);
+}
+async Result<int,int> chain(bool success) { int value=(await step(success))?; return Ok(value+1); }
+async int callback(fn once() -> String take) { await yield_now(); var text=take(); return text.len() as int; }
+async &const int borrowed(&const int value) { await yield_now(); return value; }
+async int reference() {
+    var text=String.from("fixed address");
+    var view=&const text;
+    await yield_now();
+    await yield_now();
+    return view.len() as int;
+}
+async int nested_borrow() { int value=30; return *(await borrowed(&const value)); }
+struct Number {
+    int value;
+    async int read(&const self) { await yield_now(); return self.value; }
+}
+main() {
+    print("add {block_on(add(4,5))}");
+    print("sum {block_on(sum())}");
+    print("factorial {block_on(factorial(6))}");
+    var text=block_on(identity(String.from("generic")));
+    print("identity {text}");
+    var values=Vec<int>.new(); values.push(12); values.push(13);
+    var returned=block_on(identity(values));
+    print("vector {returned[0]} {returned[1]}");
+    var result=block_on(pair()); print("tuple {result.0} {result.1}");
+    match block_on(chain(true)) { Ok(n) => print("ok {n}"), Err(n) => print("wrong {n}") }
+    match block_on(chain(false)) { Err(n) => print("err {n}"), Ok(n) => print("wrong {n}") }
+    var owned=String.from("capture");
+    print("callback {block_on(callback(once || owned))}");
+    fn(int,int) -> Task<int> named=add;
+    print("named {block_on(named(2,3))}");
+    int number=17;
+    { var view=block_on(borrowed(&const number)); print("borrowed {*view}"); }
+    number=18;
+    print("local reference {block_on(reference())}");
+    print("nested borrow {block_on(nested_borrow())}");
+    var object=Number { value:22 }; print("method {block_on(object.read())}");
+    expect(number==18);
+}

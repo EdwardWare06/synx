@@ -1,0 +1,1 @@
+pub struct Unit { pub int n; pub int read(&const self) { return self.n; } }

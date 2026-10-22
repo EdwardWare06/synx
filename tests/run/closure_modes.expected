@@ -1,0 +1,30 @@
+reference 10 10
+write 12 15
+outer 15
+shared 3 4
+field 5
+reference field 5
+array 7
+adapted 9
+named 8 10
+consume 21
+drop 21
+value 20
+drop 20
+drop 30
+drop 31
+drop 40
+early 7
+drop 41
+drop 50
+conditional
+conditional
+drop 51
+nested borrow 7
+nested owner 60
+drop 60
+vector 15
+map 16
+popped 70
+drop 70
+done

@@ -1,0 +1,148 @@
+/// Resolution, range, ownership, and native-image fixtures. No filesystem I/O.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
+import link.model;
+import link.resolve;
+import link.relocate;
+import link.image;
+
+void require(bool value) { if (!value) { panic("native linker check failed"); } }
+T expect<T>(Result<T, Failure> value) { match value { Ok(item) => return item, Err(_) => panic("native linker unexpected failure") } }
+byte digit(byte ch) { return if (ch >= 48 && ch <= 57) { ch - 48 } else { ch - 87 }; }
+pub Vec<byte> octets(&const str hex) {
+    require(hex.len() % 2 == 0); Vec<byte> out = Vec.new();
+    for (i in 0..hex.len() / 2) {
+        byte a = unsafe { *((hex.as_ptr() as usize + 2 * i) as *const byte) };
+        byte b = unsafe { *((hex.as_ptr() as usize + 2 * i + 1) as *const byte) };
+        out.push((digit(a) << 4) | digit(b));
+    }
+    return out;
+}
+Object simple(&const str name, &const str symbol, bool lazy) {
+    var object = Object.new(name, lazy);
+    object.sections.push(Section.new(SectionKind.Text, 16, octets("c3")));
+    object.symbols.push(Symbol.new(symbol, Binding.Global, Definition.Section(0, 0)));
+    return object;
+}
+int code(Code value) { return match value { Invalid => 0, Unsupported => 1, Duplicate => 2, Unresolved => 3, Range => 4, Entry => 5 }; }
+void failure<T>(Result<T, Failure> result, Code expected) {
+    match result { Ok(_) => panic("native linker accepted invalid input"), Err(error) => require(code(error.code) == code(expected)) }
+}
+void resolution_checks() {
+    // Backward archive dependency and cycle: root -> later -> tail -> root.
+    var root = simple("root", "entry", false);
+    root.symbols.push(Symbol.new("later", Binding.Global, Definition.Undefined));
+    root.symbols.push(Symbol.new("private", Binding.Local, Definition.Section(0, 0)));
+    var later = simple("later", "later", true);
+    later.symbols.push(Symbol.new("tail", Binding.Global, Definition.Undefined));
+    later.symbols.push(Symbol.new("private", Binding.Local, Definition.Section(0, 0)));
+    var tail = simple("tail", "tail", true);
+    tail.symbols.push(Symbol.new("entry", Binding.Global, Definition.Undefined));
+    Vec<Object> inputs = Vec.new(); inputs.push(tail); inputs.push(root); inputs.push(later);
+    inputs.push(simple("unused duplicate", "entry", true));
+    var result = expect(resolve.run(inputs, "entry"));
+    require(*result.selected.get(0).unwrap()); require(*result.selected.get(1).unwrap()); require(*result.selected.get(2).unwrap());
+    require(!*result.selected.get(3).unwrap());
+    require(result.targets.get(1).unwrap().get(2).unwrap().input.index == 1);
+    require(result.targets.get(2).unwrap().get(2).unwrap().input.index == 2);
+    require(result.targets.get(0).unwrap().get(1).unwrap().input.index == 1);
+    require(inputs.get(0).unwrap().archive_member);
+
+    Vec<Object> duplicate = Vec.new(); duplicate.push(simple("one", "entry", false)); duplicate.push(simple("two", "entry", false));
+    failure(resolve.run(duplicate, "entry"), Code.Duplicate);
+    Vec<Object> missing = Vec.new(); var unresolved = simple("root", "entry", false);
+    unresolved.symbols.push(Symbol.new("missing", Binding.Global, Definition.Undefined)); missing.push(unresolved);
+    failure(resolve.run(missing, "entry"), Code.Unresolved);
+    failure(resolve.run(missing, "absent"), Code.Entry);
+
+    Vec<Object> partial = Vec.new(); var first = simple("first", "entry", false);
+    first.symbols.push(Symbol.new("needed", Binding.Global, Definition.Undefined));
+    var conflict = simple("conflict", "needed", true);
+    conflict.symbols.push(Symbol.new("entry", Binding.Global, Definition.Section(0, 0)));
+    partial.push(first); partial.push(conflict); failure(resolve.run(partial, "entry"), Code.Duplicate);
+
+    var invalid = simple("invalid", "entry", false);
+    invalid.symbols.push(Symbol.new("weak", Binding.Weak, Definition.Undefined));
+    failure(model.validate(invalid, 0), Code.Unsupported);
+    var removed = invalid.symbols.pop();
+    invalid.symbols.push(Symbol.new("common", Binding.Global, Definition.Common(8)));
+    failure(model.validate(invalid, 0), Code.Unsupported);
+    var removed2 = invalid.symbols.pop();
+    invalid.sections.get_mut(0).unwrap().alignment = 3;
+    failure(model.validate(invalid, 0), Code.Invalid);
+    invalid.sections.get_mut(0).unwrap().alignment = 8192;
+    failure(model.validate(invalid, 0), Code.Unsupported);
+    invalid.sections.get_mut(0).unwrap().alignment = 16;
+    invalid.relocations.push(Relocation { section: 0, offset: 0, symbol: 99, kind: RelocKind.Pc32, addend: 0 });
+    failure(model.validate(invalid, 0), Code.Invalid);
+    invalid.relocations.get_mut(0).unwrap().symbol = 0;
+    failure(model.validate(invalid, 0), Code.Invalid);
+    Vec<Object> noncode = Vec.new(); var data_entry = simple("data entry", "entry", false);
+    data_entry.sections.get_mut(0).unwrap().kind = SectionKind.ReadOnly; noncode.push(data_entry);
+    failure(resolve.run(noncode, "entry"), Code.Entry);
+}
+void relocation_checks() {
+    ulong maximum = 18446744073709551615;
+    require(expect(relocate.value(RelocKind.Pc32, 2147483647, 0, 0, 0)) == 2147483647);
+    require(expect(relocate.value(RelocKind.Pc32, 0, -2147483648, 0, 0)) == 2147483648);
+    failure(relocate.value(RelocKind.Pc32, 2147483648, 0, 0, 0), Code.Range);
+    failure(relocate.value(RelocKind.Pc32, 0, -2147483649, 0, 0), Code.Range);
+    require(expect(relocate.value(RelocKind.Pc32, maximum, 1, maximum, 0)) == 1);
+    require(expect(relocate.value(RelocKind.Pc32, 9223372036854775808, -9223372036854775808, 0, 0)) == 0);
+    require(expect(relocate.value(RelocKind.Pc32, 0, 9223372036854775807, 9223372036854775808, 0)) == 4294967295);
+    require(expect(relocate.value(RelocKind.Abs64, maximum, 0, 0, 0)) == maximum);
+    require(expect(relocate.value(RelocKind.Abs64, 9223372036854775808, -9223372036854775808, 0, 0)) == 0);
+    failure(relocate.value(RelocKind.Abs64, maximum, 1, 0, 0), Code.Range);
+    failure(relocate.value(RelocKind.Abs64, 0, -1, 0, 0), Code.Range);
+    require(expect(relocate.value(RelocKind.Abs32, 4294967295, 0, 0, 0)) == 4294967295);
+    failure(relocate.value(RelocKind.Abs32, 4294967296, 0, 0, 0), Code.Range);
+    require(expect(relocate.value(RelocKind.Signed32, 0, -1, 0, 0)) == 4294967295);
+    failure(relocate.value(RelocKind.Signed32, 2147483648, 0, 0, 0), Code.Range);
+    require(expect(relocate.value(RelocKind.Rva32, maximum, 1, 0, maximum)) == 1);
+    failure(relocate.value(RelocKind.Rva32, 0, 0, 0, 1), Code.Range);
+}
+void image_checks() {
+    Vec<Object> overlap = Vec.new(); var object = simple("overlap", "entry", false);
+    object.sections.get_mut(0).unwrap().data = octets("00000000000000000000000000000000");
+    object.sections.get_mut(0).unwrap().size = 16;
+    object.relocations.push(Relocation { section: 0, offset: 0, symbol: 0, kind: RelocKind.Abs64, addend: 0 });
+    object.relocations.push(Relocation { section: 0, offset: 4, symbol: 0, kind: RelocKind.Pc32, addend: 0 });
+    overlap.push(object); failure(image.build(overlap, "entry", 4194304), Code.Invalid);
+    require(*overlap.get(0).unwrap().sections.get(0).unwrap().data.get(0).unwrap() == 0);
+    failure(image.build(overlap, "entry", 1), Code.Invalid);
+    Vec<Object> huge = Vec.new(); var large = simple("large", "entry", false);
+    large.sections.push(Section.bss(18446744073709551615, 8)); huge.push(large);
+    failure(image.build(huge, "entry", 4194304), Code.Range);
+}
+pub void run() { resolution_checks(); relocation_checks(); image_checks(); }
+
+/// Root -> helper archive -> numbers archive -> root. The unused member stays
+/// unselected. Abs64 fields in text/data exercise PE rebasing. BSS must read zero.
+pub Vec<Object> fixture(bool windows) {
+    var root = Object.new("root", false);
+    root.sections.push(Section.new(SectionKind.Text, 16,
+        octets(if (windows) { "4883ec28e8000000004883c428c3" } else { "e80000000089c7b83c0000000f05" })));
+    root.symbols.push(Symbol.new("entry", Binding.Global, Definition.Section(0, 0)));
+    root.symbols.push(Symbol.new("helper", Binding.Global, Definition.Undefined));
+    root.relocations.push(Relocation { section: 0, offset: if (windows) { 5 } else { 1 }, symbol: 1, kind: RelocKind.Pc32, addend: -4 });
+    var helper = Object.new("archive/helper", true);
+    helper.sections.push(Section.new(SectionKind.Text, 16, octets("48b80000000000000000488b008b0048b900000000000000000301c3")));
+    helper.sections.push(Section.new(SectionKind.Data, 8, octets("0000000000000000")));
+    helper.sections.push(Section.bss(8, 8));
+    helper.symbols.push(Symbol.new("helper", Binding.Global, Definition.Section(0, 0)));
+    helper.symbols.push(Symbol.new("numbers", Binding.Global, Definition.Undefined));
+    helper.symbols.push(Symbol.new("private", Binding.Local, Definition.Section(1, 0)));
+    helper.symbols.push(Symbol.new("counter", Binding.Global, Definition.Section(2, 0)));
+    helper.relocations.push(Relocation { section: 0, offset: 2, symbol: 2, kind: RelocKind.Abs64, addend: 0 });
+    helper.relocations.push(Relocation { section: 0, offset: 17, symbol: 3, kind: RelocKind.Abs64, addend: 0 });
+    helper.relocations.push(Relocation { section: 1, offset: 0, symbol: 1, kind: RelocKind.Abs64, addend: 4 });
+    var numbers = Object.new("archive/numbers", true);
+    numbers.sections.push(Section.new(SectionKind.ReadOnly, 4, octets("290000002a000000")));
+    numbers.sections.push(Section.new(SectionKind.Data, 8, octets("0000000000000000")));
+    numbers.symbols.push(Symbol.new("numbers", Binding.Global, Definition.Section(0, 0)));
+    numbers.symbols.push(Symbol.new("private", Binding.Local, Definition.Section(1, 0)));
+    numbers.symbols.push(Symbol.new("entry", Binding.Global, Definition.Undefined));
+    numbers.relocations.push(Relocation { section: 1, offset: 0, symbol: 2, kind: RelocKind.Abs64, addend: 0 });
+    Vec<Object> inputs = Vec.new(); inputs.push(numbers); inputs.push(root); inputs.push(helper);
+    inputs.push(simple("unused helper duplicate", "helper", true));
+    return inputs;
+}

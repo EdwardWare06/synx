@@ -1,0 +1,26 @@
+// A return without a semicolon ends a block, with and without a written
+// return type.
+int square(int n) {
+    return n * n
+}
+
+int clamp(int n) {
+    if (n > 100) {
+        return 100
+    }
+    return n
+}
+
+String label(int n) {
+    return "value {n}"
+}
+
+half(int n) {
+    return n / 2
+}
+
+main() {
+    print("{square(9)} {clamp(250)} {clamp(42)}");
+    print(label(3));
+    print("{half(10)}");
+}

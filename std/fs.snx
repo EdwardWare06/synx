@@ -1,0 +1,319 @@
+import std.utf8;
+
+extern "C" {
+    int synx_rt_absolute(*const byte path, usize length, *byte buffer, &usize count);
+    int synx_rt_canonical(*const byte path, usize length, *byte buffer, &usize count);
+    int synx_rt_same_file(*const byte a, usize an, *const byte b, usize bn);
+    int synx_rt_file_open(*const byte path, usize length, int mode, &(*byte) handle);
+    int synx_rt_file_close(*byte handle);
+    int synx_rt_file_flush(*byte handle);
+    int synx_rt_file_read(*byte handle, *byte data, usize length, &usize count);
+    int synx_rt_file_write(*byte handle, *const byte data, usize length, &usize count);
+    int synx_rt_file_seek(*byte handle, long offset, int origin);
+    int synx_rt_file_position(*byte handle, &ulong position);
+    int synx_rt_file_remove(*const byte path, usize length);
+    int synx_rt_io_kind(int code);
+    int synx_rt_file_metadata(*const byte path, usize length, &int kind, &ulong size);
+    int synx_rt_create_dir(*const byte path, usize length);
+    int synx_rt_remove_dir(*const byte path, usize length);
+    int synx_rt_file_rename(*const byte from, usize from_length, *const byte to, usize to_length);
+    int synx_rt_current_dir(*byte buffer, usize capacity, &usize count);
+}
+
+pub enum ErrorKind { Other, NotFound, PermissionDenied, InvalidInput, AlreadyExists, Closed, InvalidUtf8, UnexpectedEof }
+pub struct IoError {
+    pub ErrorKind kind;
+    /// Native errno, or zero for an error detected by the Synx library.
+    pub int os_code;
+    /// Convert an errno value returned by an extern C host adapter.
+    pub IoError from_os(int code) { return native_error(code); }
+}
+IoError native_error(int code) {
+    int kind = unsafe { synx_rt_io_kind(code) };
+    if (kind == 1) { return IoError { kind: ErrorKind.NotFound, os_code: code }; }
+    if (kind == 2) { return IoError { kind: ErrorKind.PermissionDenied, os_code: code }; }
+    if (kind == 3) { return IoError { kind: ErrorKind.InvalidInput, os_code: code }; }
+    if (kind == 4) { return IoError { kind: ErrorKind.AlreadyExists, os_code: code }; }
+    if (kind == 5) { return IoError { kind: ErrorKind.InvalidUtf8, os_code: code }; }
+    return IoError { kind: ErrorKind.Other, os_code: code };
+}
+IoError closed_error() { return IoError { kind: ErrorKind.Closed, os_code: 0 }; }
+Result<bool, IoError> status(int code) {
+    if (code != 0) { return Err(native_error(code)); }
+    return Ok(true);
+}
+
+pub enum SeekFrom { Start, Current, End }
+
+/// An owning binary stream. Drop closes it; close reports close errors.
+/// open reads, create truncates and writes, append writes at the end.
+pub struct File {
+    *byte handle;
+    int mode;
+    int direction;
+
+    Result<File, IoError> open_mode(&const str path, int mode) {
+        var handle = 0 as *byte;
+        int code = unsafe { synx_rt_file_open(path.as_ptr(), path.len(), mode, &handle) };
+        if (code != 0) { return Err(native_error(code)); }
+        return Ok(File { handle: handle, mode: mode, direction: 0 });
+    }
+    pub Result<File, IoError> open(&const str path) { return File.open_mode(path, 0); }
+    pub Result<File, IoError> create(&const str path) { return File.open_mode(path, 1); }
+    pub Result<File, IoError> append(&const str path) { return File.open_mode(path, 2); }
+    /// Open an existing file for reading and writing. Direction changes
+    /// synchronize the underlying stream before the next operation.
+    pub Result<File, IoError> open_read_write(&const str path) { return File.open_mode(path, 3); }
+
+    pub Result<Vec<byte>, IoError> read(&self, usize limit) {
+        if (self.handle as usize == 0) { return Err(closed_error()); }
+        if (self.mode != 0 && self.mode != 3) { return Err(IoError { kind: ErrorKind.InvalidInput, os_code: 0 }); }
+        if (self.direction == 2) {
+            int code = unsafe { synx_rt_file_flush(self.handle) };
+            if (code != 0) { return Err(native_error(code)); }
+        }
+        self.direction = 1;
+        usize size = if (limit > 65536) { 65536 } else { limit };
+        Vec<byte> bytes = Vec.new();
+        for (i in 0..size) { bytes.push(0); }
+        if (size == 0) { return Ok(bytes); }
+        usize count = 0;
+        int code = unsafe { synx_rt_file_read(self.handle, bytes.as_mut_ptr(), size, &count) };
+        if (code != 0) { return Err(native_error(code)); }
+        while (bytes.len() > count) { var unused = bytes.pop(); }
+        return Ok(bytes);
+    }
+    pub Result<Vec<byte>, IoError> read_exact(&self, usize length) {
+        Vec<byte> result = Vec.new();
+        while (result.len() < length) {
+            match self.read(length - result.len()) {
+                Err(error) => return Err(error),
+                Ok(chunk) => {
+                    if (chunk.is_empty()) { return Err(IoError { kind: ErrorKind.UnexpectedEof, os_code: 0 }); }
+                    for (b in &const chunk) { result.push(*b); }
+                }
+            }
+        }
+        return Ok(result);
+    }
+    pub Result<Vec<byte>, IoError> read_to_end(&self) {
+        Vec<byte> result = Vec.new();
+        while (true) {
+            match self.read(4096) {
+                Err(error) => return Err(error),
+                Ok(chunk) => {
+                    if (chunk.is_empty()) { return Ok(result); }
+                    for (b in &const chunk) { result.push(*b); }
+                }
+            }
+        }
+        panic("unreachable file read loop");
+    }
+    pub Result<String, IoError> read_text(&self) {
+        match self.read_to_end() {
+            Err(error) => return Err(error),
+            Ok(bytes) => {
+                match utf8.decode(bytes) {
+                    Some(text) => return Ok(text),
+                    None => return Err(IoError { kind: ErrorKind.InvalidUtf8, os_code: 0 }),
+                }
+            }
+        }
+    }
+    Result<bool, IoError> write_raw(&self, *const byte data, usize length) {
+        if (self.handle as usize == 0) { return Err(closed_error()); }
+        if (self.mode == 0) { return Err(IoError { kind: ErrorKind.InvalidInput, os_code: 0 }); }
+        if (self.direction == 1) {
+            int code = unsafe { synx_rt_file_seek(self.handle, 0, 1) };
+            if (code != 0) { return Err(native_error(code)); }
+        }
+        self.direction = 2;
+        usize at = 0;
+        while (at < length) {
+            usize count = 0;
+            int code = unsafe { synx_rt_file_write(self.handle, (data as usize + at) as *const byte, length - at, &count) };
+            if (code != 0) { return Err(native_error(code)); }
+            if (count == 0) { return Err(IoError { kind: ErrorKind.Other, os_code: 0 }); }
+            at += count;
+        }
+        return Ok(true);
+    }
+    pub Result<bool, IoError> write_all(&self, &const Vec<byte> bytes) { return self.write_raw(bytes.as_ptr(), bytes.len()); }
+    pub Result<bool, IoError> write_text(&self, &const str text) { return self.write_raw(text.as_ptr(), text.len()); }
+    pub Result<bool, IoError> flush(&self) {
+        if (self.handle as usize == 0) { return Err(closed_error()); }
+        return status(unsafe { synx_rt_file_flush(self.handle) });
+    }
+    pub Result<bool, IoError> close(self) {
+        if (self.handle as usize == 0) { return Err(closed_error()); }
+        var handle = self.handle;
+        self.handle = 0 as *byte;
+        return status(unsafe { synx_rt_file_close(handle) });
+    }
+    pub Result<bool, IoError> seek(&self, long offset, SeekFrom from) {
+        if (self.handle as usize == 0) { return Err(closed_error()); }
+        int origin = match from { Start => 0, Current => 1, End => 2 };
+        int code = unsafe { synx_rt_file_seek(self.handle, offset, origin) };
+        if (code == 0) { self.direction = 0; }
+        return status(code);
+    }
+    pub Result<ulong, IoError> position(&self) {
+        if (self.handle as usize == 0) { return Err(closed_error()); }
+        ulong value = 0;
+        int code = unsafe { synx_rt_file_position(self.handle, &value) };
+        if (code != 0) { return Err(native_error(code)); }
+        return Ok(value);
+    }
+}
+impl Drop for File {
+    void drop(&self) {
+        if (self.handle as usize != 0) {
+            unsafe { synx_rt_file_close(self.handle); }
+            self.handle = 0 as *byte;
+        }
+    }
+}
+
+pub Result<Vec<byte>, IoError> read(&const str path) {
+    match File.open(path) { Ok(file) => return file.read_to_end(), Err(error) => return Err(error) }
+}
+pub Result<String, IoError> read_text(&const str path) {
+    match File.open(path) { Ok(file) => return file.read_text(), Err(error) => return Err(error) }
+}
+pub Result<bool, IoError> write(&const str path, &const Vec<byte> bytes) {
+    match File.create(path) {
+        Err(error) => return Err(error),
+        Ok(file) => {
+            match file.write_all(bytes) { Err(error) => return Err(error), Ok(_) => {} }
+            return file.close();
+        }
+    }
+}
+pub Result<bool, IoError> write_text(&const str path, &const str text) {
+    match File.create(path) {
+        Err(error) => return Err(error),
+        Ok(file) => {
+            match file.write_text(text) { Err(error) => return Err(error), Ok(_) => {} }
+            return file.close();
+        }
+    }
+}
+pub Result<bool, IoError> remove(&const str path) {
+    return status(unsafe { synx_rt_file_remove(path.as_ptr(), path.len()) });
+}
+
+pub struct Metadata {
+    pub bool is_file;
+    pub bool is_dir;
+    /// Byte length for files. Directory and special-file sizes are OS specific.
+    pub ulong len;
+}
+/// Follows symbolic links.
+pub Result<Metadata, IoError> metadata(&const str path) {
+    int kind = 0; ulong size = 0;
+    int code = unsafe { synx_rt_file_metadata(path.as_ptr(), path.len(), &kind, &size) };
+    if (code != 0) { return Err(native_error(code)); }
+    return Ok(Metadata { is_file: kind == 1, is_dir: kind == 2, len: size });
+}
+/// Missing paths return Ok(false). Other errors remain errors.
+pub Result<bool, IoError> exists(&const str path) {
+    match metadata(path) {
+        Ok(_) => return Ok(true),
+        Err(error) => {
+            match error.kind { NotFound => return Ok(false), _ => return Err(error) }
+        }
+    }
+}
+pub Result<bool, IoError> create_dir(&const str path) {
+    return status(unsafe { synx_rt_create_dir(path.as_ptr(), path.len()) });
+}
+/// Removes an empty directory.
+pub Result<bool, IoError> remove_dir(&const str path) {
+    return status(unsafe { synx_rt_remove_dir(path.as_ptr(), path.len()) });
+}
+/// Existing-destination behavior follows the host OS. This is not a
+/// portable replacement or no-replace operation.
+pub Result<bool, IoError> rename(&const str from, &const str to) {
+    return status(unsafe { synx_rt_file_rename(from.as_ptr(), from.len(), to.as_ptr(), to.len()) });
+}
+pub Result<String, IoError> current_dir() {
+    usize capacity = 256;
+    while (true) {
+        Vec<byte> bytes = Vec.new();
+        for (i in 0..capacity) { bytes.push(0); }
+        usize count = 0;
+        int code = unsafe { synx_rt_current_dir(bytes.as_mut_ptr(), capacity, &count) };
+        if (code == -1) {
+            if (count <= capacity) { return Err(IoError { kind: ErrorKind.Other, os_code: 0 }); }
+            capacity = count;
+        } else {
+            if (code != 0) { return Err(native_error(code)); }
+            while (bytes.len() > count) { var unused = bytes.pop(); }
+            match utf8.decode(bytes) {
+                Some(text) => return Ok(text),
+                None => return Err(IoError { kind: ErrorKind.InvalidUtf8, os_code: 0 }),
+            }
+        }
+    }
+    panic("unreachable current directory loop");
+}
+
+unsafe impl Send for File {}
+unsafe impl Owned for File {}
+
+/// Make a path absolute without checking its target or resolving symbolic links.
+/// Windows resolves drive-relative paths and dot components. Unix retains dots.
+/// Empty paths and embedded zero bytes are invalid input.
+pub Result<String, IoError> absolute(&const str path) {
+    usize capacity = 256;
+    while (true) {
+        Vec<byte> bytes = Vec.new();
+        for (i in 0..capacity) { bytes.push(0); }
+        usize count = capacity;
+        int code = unsafe { synx_rt_absolute(path.as_ptr(), path.len(), bytes.as_mut_ptr(), &count) };
+        if (code == -1) {
+            if (count <= capacity) { return Err(IoError { kind: ErrorKind.Other, os_code: 0 }); }
+            capacity = count;
+        } else {
+            if (code != 0) { return Err(native_error(code)); }
+            while (bytes.len() > count) { var unused = bytes.pop(); }
+            match utf8.decode(bytes) {
+                Some(text) => return Ok(text),
+                None => return Err(IoError { kind: ErrorKind.InvalidUtf8, os_code: 0 }),
+            }
+        }
+    }
+    panic("unreachable absolute path loop");
+}
+
+/// Return the absolute path of an existing file or directory, following links.
+/// Windows retains its native extended path prefix. Missing paths are errors.
+pub Result<String, IoError> canonicalize(&const str path) {
+    usize capacity = 256;
+    while (true) {
+        Vec<byte> bytes = Vec.new();
+        for (i in 0..capacity) { bytes.push(0); }
+        usize count = capacity;
+        int code = unsafe { synx_rt_canonical(path.as_ptr(), path.len(), bytes.as_mut_ptr(), &count) };
+        if (code == -1) {
+            if (count <= capacity) { return Err(IoError { kind: ErrorKind.Other, os_code: 0 }); }
+            capacity = count;
+        } else {
+            if (code != 0) { return Err(native_error(code)); }
+            while (bytes.len() > count) { var unused = bytes.pop(); }
+            match utf8.decode(bytes) {
+                Some(text) => return Ok(text),
+                None => return Err(IoError { kind: ErrorKind.InvalidUtf8, os_code: 0 }),
+            }
+        }
+    }
+    panic("unreachable canonical path loop");
+}
+
+/// Compare OS file identities. Detects hard links as well as symbolic links.
+/// Both paths must exist. This does not reserve either path against changes.
+pub Result<bool, IoError> same_file(&const str a, &const str b) {
+    int code = unsafe { synx_rt_same_file(a.as_ptr(), a.len(), b.as_ptr(), b.len()) };
+    if (code < 0) { return Err(native_error(-code)); }
+    return Ok(code != 0);
+}

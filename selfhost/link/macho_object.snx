@@ -1,0 +1,168 @@
+/// Checked x86-64 Mach-O MH_OBJECT reader. Names retain leading underscores.
+/// Section-relative local relocations and external implicit addends normalize to
+/// S+A or S+A-P. TLS, weak/common, GOT, subtractor and scattered records fail.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
+import link.model;
+import link.reader;
+import link.buffer;
+import std.utf8;
+
+struct SourceSection { ulong address; ulong size; usize offset; usize relocations; usize count; usize destination; bool included; }
+Result<ulong, Failure> word(&const Vec<byte> data, usize at, usize width) {
+    return match reader.word(data, at, width, true) { Ok(value) => Ok(value), Err(_) => Err(model.fail(Code.Invalid, 0, at)) };
+}
+Result<bool, Failure> range(&const Vec<byte> data, usize at, usize count) {
+    return match reader.range(data, at, count) { Ok(_) => Ok(true), Err(_) => Err(model.fail(Code.Invalid, 0, at)) };
+}
+Result<Vec<byte>, Failure> copy(&const Vec<byte> data, usize at, usize count) {
+    return match reader.copy(data, at, count) { Ok(value) => Ok(value), Err(_) => Err(model.fail(Code.Invalid, 0, at)) };
+}
+Result<String, Failure> fixed(&const Vec<byte> data, usize at) {
+    var valid = range(data, at, 16)?; usize count = 0;
+    while (count < 16 && *data.get(at + count).unwrap() != 0) { count += 1; }
+    var bytes = copy(data, at, count)?;
+    return match utf8.decode(bytes) { Some(name) => Ok(name), None => Err(model.fail(Code.Unsupported, 0, at)) };
+}
+Result<Vec<byte>, Failure> name(&const Vec<byte> data, usize at, usize end) {
+    if (at >= end || end > data.len()) { return Err(model.fail(Code.Invalid, 0, at)); }
+    usize stop = at; while (stop < end && *data.get(stop).unwrap() != 0) { stop += 1; }
+    if (stop == end) { return Err(model.fail(Code.Invalid, 0, at)); }
+    return copy(data, at, stop - at);
+}
+long signed32(ulong value) { return if (value >= 0x80000000) { value as long - 4294967296 } else { value as long }; }
+
+pub Result<Object, Failure> read(&const Vec<byte> data, &const str input_name, bool archive_member) {
+    if (data.len() as ulong > buffer.LIMIT) { return Err(model.fail(Code.Range, 0, 0)); }
+    var header = range(data, 0, 32)?;
+    if (word(data, 0, 4)? != 0xfeedfacf || word(data, 4, 4)? != 0x1000007 || word(data, 12, 4)? != 1) { return Err(model.fail(Code.Unsupported, 0, 0)); }
+    ulong subtype = word(data, 8, 4)?;
+    if ((subtype & 0xffffff) != 3 && (subtype & 0xffffff) != 8) { return Err(model.fail(Code.Unsupported, 0, 8)); }
+    usize commands = word(data, 16, 4)? as usize; usize command_bytes = word(data, 20, 4)? as usize;
+    var command_range = range(data, 32, command_bytes)?;
+    if (commands > command_bytes / 8) { return Err(model.fail(Code.Invalid, 0, 16)); }
+    usize end_commands = 32 + command_bytes; usize at = 32;
+    var out = Object.new(input_name, archive_member);
+    Vec<SourceSection> sections = Vec.new();
+    ulong image_size = 0;
+    usize relocation_count = 0;
+    bool has_symbols = false; usize symbol_offset = 0; usize symbol_count = 0; usize string_offset = 0; usize string_size = 0;
+    for (command in 0..commands) {
+        if (at > end_commands || end_commands - at < 8) { return Err(model.fail(Code.Invalid, 0, at)); }
+        ulong kind = word(data, at, 4)?; usize size = word(data, at + 4, 4)? as usize;
+        if (size < 8 || size % 8 != 0 || size > end_commands - at) { return Err(model.fail(Code.Invalid, 0, at)); }
+        if (kind == 0x19) {
+            if (size < 72) { return Err(model.fail(Code.Invalid, 0, at)); }
+            usize count = word(data, at + 64, 4)? as usize;
+            if (count > (size - 72) / 80 || size != 72 + count * 80) { return Err(model.fail(Code.Invalid, 0, at)); }
+            for (i in 0..count) {
+                usize pos = at + 72 + i * 80;
+                var section_name = fixed(data, pos)?; var segment_name = fixed(data, pos + 16)?;
+                ulong address = word(data, pos + 32, 8)?; ulong length = word(data, pos + 40, 8)?;
+                usize offset = word(data, pos + 48, 4)? as usize; ulong exponent = word(data, pos + 52, 4)?;
+                usize relocations = word(data, pos + 56, 4)? as usize; usize reloc_count = word(data, pos + 60, 4)? as usize;
+                ulong flags = word(data, pos + 64, 4)?; ulong section_type = flags & 255;
+                if (length > buffer.LIMIT || address > buffer.LIMIT || length > buffer.LIMIT - address || exponent > 12) { return Err(model.fail(Code.Range, 0, pos)); }
+                if (reloc_count > data.len() / 8) { return Err(model.fail(Code.Invalid, 0, pos)); }
+                var relocation_range = range(data, relocations, reloc_count * 8)?;
+                bool included = (flags & 0x02000000) == 0;
+                bool zero = section_type == 1;
+                if (!zero) { var payload_range = range(data, offset, length as usize)?; }
+                usize destination = out.sections.len();
+                if (included) {
+                    if (length > buffer.LIMIT - image_size) { return Err(model.fail(Code.Range, 0, pos)); }
+                    image_size += length;
+                    if (reloc_count > data.len() / 8 - relocation_count) { return Err(model.fail(Code.Range, 0, pos)); }
+                    relocation_count += reloc_count;
+                    if (section_type != 0 && section_type != 1 && section_type != 2 && section_type != 3 && section_type != 4 && section_type != 5 && section_type != 14) { return Err(model.fail(Code.Unsupported, 0, pos)); }
+                    SectionKind group = SectionKind.Data;
+                    if (zero) { if (reloc_count != 0) { return Err(model.fail(Code.Unsupported, 0, pos)); } group = SectionKind.Bss; }
+                    else if ((flags & 0x80000400) != 0 || section_name == String.from("__text")) { group = SectionKind.Text; }
+                    else if (segment_name == String.from("__TEXT") || segment_name == String.from("__DATA_CONST") || section_name == String.from("__const")) { group = SectionKind.ReadOnly; }
+                    else if (segment_name != String.from("__DATA")) { return Err(model.fail(Code.Unsupported, 0, pos)); }
+                    Vec<byte> payload = if (zero) { Vec.new() } else { copy(data, offset, length as usize)? };
+                    out.sections.push(Section { kind: group, alignment: 1 as ulong << exponent, data: payload, size: length });
+                }
+                sections.push(SourceSection { address: address, size: length, offset: offset,
+                    relocations: relocations, count: reloc_count, destination: destination, included: included });
+            }
+        } else if (kind == 2) {
+            if (has_symbols || size != 24) { return Err(model.fail(Code.Invalid, 0, at)); }
+            has_symbols = true; symbol_offset = word(data, at + 8, 4)? as usize; symbol_count = word(data, at + 12, 4)? as usize;
+            string_offset = word(data, at + 16, 4)? as usize; string_size = word(data, at + 20, 4)? as usize;
+        } else if (kind != 0xb && kind != 0x1b && kind != 0x24 && kind != 0x32 && kind != 0x2e && kind != 0x29 && kind != 0x26) {
+            return Err(model.fail(Code.Unsupported, 0, at));
+        }
+        at += size;
+    }
+    if (at != end_commands || !has_symbols || symbol_count > data.len() / 16) { return Err(model.fail(Code.Invalid, 0, at)); }
+    var symbol_range = range(data, symbol_offset, symbol_count * 16)?; var strings_range = range(data, string_offset, string_size)?;
+    Vec<usize> symbol_map = Vec.new(); Vec<bool> symbol_kept = Vec.new();
+    ulong name_size = 0;
+    for (i in 0..symbol_count) {
+        usize pos = symbol_offset + i * 16;
+        usize string_index = word(data, pos, 4)? as usize; ulong flags = word(data, pos + 4, 1)?;
+        usize section_index = word(data, pos + 5, 1)? as usize; ulong description = word(data, pos + 6, 2)?; ulong value = word(data, pos + 8, 8)?;
+        symbol_map.push(out.symbols.len()); symbol_kept.push(false);
+        if ((flags & 0xe0) != 0) { continue; }
+        if ((description & 0xc0) != 0) { return Err(model.fail(Code.Unsupported, 0, pos)); }
+        if (string_index >= string_size) { return Err(model.fail(Code.Invalid, 0, pos)); }
+        var bytes = name(data, string_offset + string_index, string_offset + string_size)?;
+        if (bytes.len() as ulong > buffer.LIMIT - name_size) { return Err(model.fail(Code.Range, 0, pos)); }
+        name_size += bytes.len() as ulong;
+        Binding binding = if ((flags & 1) != 0) { Binding.Global } else { Binding.Local };
+        if (bytes.is_empty()) { if ((flags & 1) != 0) { return Err(model.fail(Code.Invalid, 0, pos)); } bytes = utf8.encode("$symbol{i}"); }
+        Definition definition = Definition.Undefined; ulong symbol_type = flags & 0xe;
+        if (symbol_type == 0xe) {
+            if (section_index == 0 || section_index > sections.len()) { return Err(model.fail(Code.Invalid, 0, pos)); }
+            var source = sections.get(section_index - 1).unwrap();
+            if (!source.included) { continue; }
+            if (value < source.address || value - source.address > source.size) { return Err(model.fail(Code.Invalid, 0, pos)); }
+            definition = Definition.Section(source.destination, value - source.address);
+        } else if (symbol_type == 2) {
+            if (section_index != 0) { return Err(model.fail(Code.Invalid, 0, pos)); } definition = Definition.Absolute(value);
+        } else if (symbol_type == 0) {
+            if (value != 0 || section_index != 0 || (flags & 1) == 0) { return Err(model.fail(Code.Unsupported, 0, pos)); }
+        } else { return Err(model.fail(Code.Unsupported, 0, pos)); };
+        *symbol_kept.get_mut(i).unwrap() = true; out.symbols.push(Symbol { name: bytes, binding: binding, definition: definition });
+    }
+    Vec<usize> section_symbols = Vec.new();
+    for (i in 0..sections.len()) {
+        var source = sections.get(i).unwrap(); section_symbols.push(out.symbols.len());
+        if (source.included) { out.symbols.push(Symbol.new("$section{i}", Binding.Local, Definition.Section(source.destination, 0))); }
+    }
+    for (source in &const sections) {
+        if (!source.included) { continue; }
+        for (i in 0..source.count) {
+            usize pos = source.relocations + i * 8;
+            ulong offset = word(data, pos, 4)?; ulong info = word(data, pos + 4, 4)?;
+            if ((offset & 0x80000000) != 0) { return Err(model.fail(Code.Unsupported, 0, pos)); }
+            usize target = (info & 0xffffff) as usize; bool pcrel = (info & 0x1000000) != 0;
+            ulong width = 1 as ulong << ((info >> 25) & 3); bool external = (info & 0x8000000) != 0; ulong kind = info >> 28;
+            if (offset > source.size || width > source.size - offset) { return Err(model.fail(Code.Invalid, 0, pos)); }
+            bool absolute = kind == 0 && !pcrel && width == 8;
+            bool relative = pcrel && width == 4 && (kind == 1 || kind == 2 || kind == 6 || kind == 7 || kind == 8);
+            if (!absolute && !relative) { return Err(model.fail(Code.Unsupported, 0, pos)); }
+            ulong implicit = word(data, source.offset + offset as usize, width as usize)?;
+            long addend = if (absolute) { implicit as long } else { signed32(implicit) };
+            usize symbol = 0;
+            if (external) {
+                if (target >= symbol_count || !*symbol_kept.get(target).unwrap()) { return Err(model.fail(Code.Invalid, 0, pos)); }
+                symbol = *symbol_map.get(target).unwrap();
+                // SIGNED_1/2/4 already encode their trailing-byte displacement
+                // in the field. Mach-O's +bias embedded-addend adjustment and
+                // -(P+4+bias) relocation cancel, leaving raw_field - 4.
+                if (relative) { addend -= 4; }
+            } else {
+                if (target == 0 || target > sections.len() || !sections.get(target - 1).unwrap().included) { return Err(model.fail(Code.Invalid, 0, pos)); }
+                var target_section = sections.get(target - 1).unwrap(); symbol = *section_symbols.get(target - 1).unwrap();
+                if (absolute) {
+                    if (addend < -9223372036854775808 + target_section.address as long) { return Err(model.fail(Code.Range, 0, pos)); }
+                    addend -= target_section.address as long;
+                } else { addend += source.address as long + offset as long - target_section.address as long; }
+            }
+            out.relocations.push(Relocation { section: source.destination, offset: offset, symbol: symbol,
+                kind: if (absolute) { RelocKind.Abs64 } else { RelocKind.Pc32 }, addend: addend });
+        }
+    }
+    var valid = model.validate(out, 0)?; return Ok(out);
+}

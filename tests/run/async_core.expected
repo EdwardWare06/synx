@@ -1,0 +1,14 @@
+add 9
+sum 16
+factorial 720
+identity generic
+vector 12 13
+tuple pair 7
+ok 9
+err 3
+callback 7
+named 5
+borrowed 17
+local reference 13
+nested borrow 30
+method 22

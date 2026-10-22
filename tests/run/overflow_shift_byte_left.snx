@@ -1,0 +1,1 @@
+main() { byte value=255; byte count=8; byte result=value << count; if (result != 255) { panic("wrong release shift"); } }

@@ -1,0 +1,2 @@
+import link.native_probe;
+main() { native_probe.run(); }

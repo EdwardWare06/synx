@@ -1,0 +1,68 @@
+/// Owned OS threads. Dropping a handle joins and discards its result.
+extern "C" {
+    *byte synx_rt_thread_start(*byte job, *int error);
+    void synx_rt_thread_join(*byte handle);
+    void synx_rt_thread_yield();
+    void synx_rt_thread_sleep(usize milliseconds);
+}
+
+pub struct ThreadError { pub int os_code; }
+struct ThreadPacket<T> { (fn once send() -> T)? job; T? result; }
+
+pub struct JoinHandle<T: Send + Owned> {
+    *byte handle;
+    *ThreadPacket<T> packet;
+    pub T join(self) {
+        unsafe {
+            synx_rt_thread_join(self.handle);
+            self.handle = 0 as *byte;
+            T result = (*self.packet).result.take().expect("thread returned without a result");
+            drop_in_place<ThreadPacket<T>>(self.packet);
+            synx_rt_free(self.packet as *byte);
+            self.packet = 0 as *ThreadPacket<T>;
+            return result;
+        }
+    }
+}
+impl<T: Send + Owned> Drop for JoinHandle<T> {
+    void drop(&self) {
+        if (self.handle as usize != 0) {
+            unsafe {
+                synx_rt_thread_join(self.handle);
+                self.handle = 0 as *byte;
+                drop_in_place<ThreadPacket<T>>(self.packet);
+                synx_rt_free(self.packet as *byte);
+                self.packet = 0 as *ThreadPacket<T>;
+            }
+        }
+    }
+}
+unsafe impl<T: Send + Owned> Send for JoinHandle<T> {}
+unsafe impl<T: Send + Owned> Owned for JoinHandle<T> {}
+
+/// Thread creation errors preserve cleanup of the closure and its captures.
+pub Result<JoinHandle<T>, ThreadError> spawn<T: Send + Owned>(fn once send() -> T job) {
+    unsafe {
+        var packet = synx_rt_alloc(size_of<ThreadPacket<T>>()) as *ThreadPacket<T>;
+        *packet = ThreadPacket { job: Some(job), result: None };
+        fn once() boot = once || {
+            var job = (*packet).job.take().expect("thread job missing");
+            (*packet).result = Some(job());
+        };
+        var pair = synx_rt_alloc(size_of<fn once()>()) as *fn once();
+        *pair = boot;
+        int code = 0;
+        var handle = synx_rt_thread_start(pair as *byte, &code as *int);
+        if (handle as usize == 0) {
+            drop_in_place<fn once()>(pair);
+            synx_rt_free(pair as *byte);
+            drop_in_place<ThreadPacket<T>>(packet);
+            synx_rt_free(packet as *byte);
+            return Err(ThreadError { os_code: code });
+        }
+        return Ok(JoinHandle { handle: handle, packet: packet });
+    }
+}
+
+pub void yield_now() { unsafe { synx_rt_thread_yield(); } }
+pub void sleep_ms(usize milliseconds) { unsafe { synx_rt_thread_sleep(milliseconds); } }

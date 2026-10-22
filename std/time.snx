@@ -1,0 +1,183 @@
+import std.sync.{Arc, Mutex, Condvar};
+import std.thread;
+import std.mem;
+extern "C" { usize synx_rt_monotonic_ms(); void synx_rt_blocking_check(*byte pool); }
+pub usize now_ms() { return unsafe { synx_rt_monotonic_ms() }; }
+pub enum TimerError { Closed, Cancelled }
+pub enum TimeoutError { Elapsed, TimerClosed }
+struct TimerStatus { bool ready; bool cancelled; bool closed; Waker? wake; }
+struct TimerFlag { Mutex<TimerStatus> status; }
+struct TimerEntry { usize deadline; Arc<TimerFlag> flag; }
+struct TimerQueue { Vec<TimerEntry> entries; bool closed; usize wait_ms; }
+struct TimerState { Mutex<TimerQueue> queue; Condvar changed; }
+
+void fire(Arc<TimerFlag> flag, bool closed) {
+    Waker? wake = None;
+    {
+        var guard = flag.get().status.lock();
+        var status = guard.get_mut();
+        if (!status.cancelled) {
+            status.ready = true;
+            status.closed = closed;
+            wake = status.wake.take();
+        }
+    }
+    match wake { Some(waker) => waker.wake(), None => {} }
+}
+void reactor(Arc<TimerState> shared) {
+    var state = shared.get();
+    loop {
+        var ready = Vec<Arc<TimerFlag>>.new();
+        var removed = Vec<TimerEntry>.new();
+        bool closed = false;
+        {
+            var guard = state.queue.lock();
+            {
+                var queue = guard.get_mut();
+                closed = queue.closed;
+                usize now = now_ms();
+                usize nearest = ~(0 as usize);
+                usize i = 0;
+                while (i < queue.entries.len()) {
+                    bool cancelled = false;
+                    { var flag = queue.entries[i].flag.clone(); var shared = flag.get(); var status = shared.status.lock(); cancelled = status.get().cancelled; }
+                    if (closed || cancelled || queue.entries[i].deadline <= now) {
+                        usize last = queue.entries.len() - 1;
+                        queue.entries.swap(i, last);
+                        var entry = queue.entries.pop().unwrap();
+                        if (!cancelled) { ready.push(entry.flag.clone()); }
+                        removed.push(entry);
+                    } else {
+                        if (queue.entries[i].deadline < nearest) { nearest = queue.entries[i].deadline; }
+                        i += 1;
+                    }
+                }
+                // Release the data borrow before the condition wait releases the guard.
+                if (!closed && ready.is_empty() && removed.is_empty()) {
+                    if (nearest == ~(0 as usize)) { nearest = 0; }
+                    else if (nearest > now) { nearest -= now; }
+                    else { nearest = 1; }
+                } else { nearest = 0; }
+                // A wait timeout is stored separately from the borrowed queue.
+                queue.wait_ms = nearest;
+            }
+            if (!closed && ready.is_empty() && removed.is_empty()) {
+                usize wait = guard.get().wait_ms;
+                if (wait == 0) { state.changed.wait(&guard); }
+                else { state.changed.wait_for(&guard, wait); }
+            }
+        }
+        for (i in 0..ready.len()) { fire(ready[i].clone(), closed); }
+        if (closed) { return; }
+    }
+}
+
+pub struct Sleep {
+    Arc<TimerFlag> flag;
+    Arc<TimerState> timer;
+    bool done;
+    pub void cancel(&self) {
+        Waker? previous = None;
+        {
+            var guard = self.flag.get().status.lock();
+            var status = guard.get_mut();
+            status.cancelled = true;
+            previous = status.wake.take();
+        }
+        {
+            var queue = self.timer.get().queue.lock();
+            self.timer.get().changed.notify_all();
+        }
+        match previous { Some(wake) => wake.wake(), None => {} }
+    }
+}
+impl Future<Result<void, TimerError>> for Sleep {
+    Poll<Result<void, TimerError>> poll(&self, Waker wake) {
+        if (self.done) { panic("timer polled after completion"); }
+        Waker? previous = None;
+        {
+            var guard = self.flag.get().status.lock();
+            var status = guard.get_mut();
+            if (status.closed) { self.done = true; return Poll.Ready(Err(TimerError.Closed)); }
+            if (status.cancelled) { self.done = true; return Poll.Ready(Err(TimerError.Cancelled)); }
+            if (status.ready) { self.done = true; return Poll.Ready(Ok(())); }
+            previous = status.wake.replace(wake);
+        }
+        return Poll.Pending;
+    }
+}
+impl Drop for Sleep { void drop(&self) { if (!self.done) { self.cancel(); } } }
+
+pub struct TimerSpawner {
+    Arc<TimerState> state;
+    pub TimerSpawner clone(&const self) { return TimerSpawner { state: self.state.clone() }; }
+    pub Sleep sleep(&const self, usize milliseconds) {
+        var flag = Arc.new(TimerFlag { status: Mutex.new(TimerStatus { ready: false, cancelled: false, closed: false, wake: None }) });
+        usize now = now_ms();
+        usize maximum = ~(0 as usize);
+        usize deadline = if (milliseconds > maximum - now) { maximum } else { now + milliseconds };
+        {
+            var guard = self.state.get().queue.lock();
+            var queue = guard.get_mut();
+            if (queue.closed) { var status = flag.get().status.lock(); status.get_mut().closed = true; }
+            else { queue.entries.push(TimerEntry { deadline: deadline, flag: flag.clone() }); }
+        }
+        self.state.get().changed.notify_all();
+        return Sleep { flag: flag, timer: self.state.clone(), done: false };
+    }
+    pub Timeout<T> timeout<T: Send + Owned>(&const self, SendTask<T> task, usize milliseconds) {
+        return Timeout { task: Some(task), sleep: self.sleep(milliseconds), done: false };
+    }
+}
+
+pub struct TimerService {
+    Arc<TimerState> state;
+    thread.JoinHandle<void>? thread;
+    pub Result<TimerService, thread.ThreadError> new() {
+        var state = Arc.new(TimerState { queue: Mutex.new(TimerQueue { entries: Vec.new(), closed: false, wait_ms: 0 }), changed: Condvar.new() });
+        var shared = state.clone();
+        match thread.spawn(send once || reactor(shared)) {
+            Ok(handle) => return Ok(TimerService { state: state, thread: Some(handle) }),
+            Err(error) => return Err(error)
+        }
+    }
+    pub TimerSpawner spawner(&const self) { return TimerSpawner { state: self.state.clone() }; }
+    pub Sleep sleep(&const self, usize milliseconds) { return self.spawner().sleep(milliseconds); }
+    pub Timeout<T> timeout<T: Send + Owned>(&const self, SendTask<T> task, usize milliseconds) { return self.spawner().timeout(task, milliseconds); }
+    pub void shutdown(&self) {
+        if (self.thread.is_none()) { return; }
+        unsafe { synx_rt_blocking_check(0 as *byte); }
+        { var guard = self.state.get().queue.lock(); guard.get_mut().closed = true; }
+        self.state.get().changed.notify_all();
+        match self.thread.take() { Some(handle) => handle.join(), None => {} }
+    }
+}
+impl Drop for TimerService { void drop(&self) { self.shutdown(); } }
+
+pub struct Timeout<T: Send + Owned> { SendTask<T>? task; Sleep sleep; bool done; }
+impl<T: Send + Owned> Future<Result<T, TimeoutError>> for Timeout<T> {
+    Poll<Result<T, TimeoutError>> poll(&self, Waker wake) {
+        if (self.done) { panic("timeout polled after completion"); }
+        T? output = None;
+        match self.task.as_mut() {
+            Some(task) => match task.poll(wake.clone()) { Poll.Ready(value) => { output = Some(value); }, Poll.Pending => {} },
+            None => panic("timeout lost its task")
+        }
+        match output {
+            Some(value) => {
+                self.done = true;
+                self.sleep.cancel();
+                mem.drop(self.task.take());
+                return Poll.Ready(Ok(value));
+            }, None => {}
+        }
+        match self.sleep.poll(wake) {
+            Poll.Pending => return Poll.Pending,
+            Poll.Ready(result) => {
+                self.done = true;
+                mem.drop(self.task.take());
+                match result { Ok(_) => return Poll.Ready(Err(TimeoutError.Elapsed)), Err(_) => return Poll.Ready(Err(TimeoutError.TimerClosed)) }
+            }
+        }
+    }
+}

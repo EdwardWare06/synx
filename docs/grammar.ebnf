@@ -1,0 +1,204 @@
+(* Synx grammar, version 0.1 draft. ISO 14977 style EBNF.
+   Terminals in quotes. Lexer rules are described in DESIGN.md section 2. *)
+
+(* ---------- lexical tokens produced by the lexer ---------- *)
+
+ident      = ? identifier token ? ;
+int_lit    = ? integer literal token ? ;
+long_lit   = ? integer literal with L suffix ? ;
+float_lit  = ? float literal with f suffix ? ;
+double_lit = ? float literal without suffix ? ;
+char_lit   = ? character literal ? ;
+string_lit = ? string literal ? ;
+
+(* ---------- module ---------- *)
+
+module     = { item } ;
+
+item       = [ doc_comment ] [ "pub" ] item_body ;
+item_body  = import_decl
+           | const_decl
+           | function
+           | struct_decl
+           | enum_decl
+           | trait_decl
+           | impl_decl
+           | extern_block ;
+
+doc_comment = ? one or more /// lines ? ;
+
+(* ---------- imports ---------- *)
+
+import_decl = "import" path [ "." "{" ident { "," ident } [ "," ] "}" ] ";" ;
+path        = ident { "." ident } ;
+
+(* ---------- constants ---------- *)
+
+const_decl  = "const" [ type ] ident "=" expression ";" ;
+
+(* ---------- functions ---------- *)
+
+function    = [ "async" ] [ type ] ident [ generic_params ] "(" [ param_list ] ")" block ;
+
+param_list  = param { "," param } [ "," ] ;
+param       = self_param | type ident ;
+self_param  = "self" | "&" "self" | "&" "const" "self" ;
+
+generic_params = "<" generic_param { "," generic_param } [ "," ] ">" ;
+generic_param  = ident [ ":" bound { "+" bound } ] ;
+bound          = path [ generic_args ] ;
+
+(* The parser decides between "type ident (" and "ident (" by lookahead:
+   if the first token is an identifier followed by "(" or "<", there is no
+   return type. *)
+
+(* ---------- structs ---------- *)
+
+struct_decl = "struct" ident [ generic_params ] "{" { struct_member } "}" ;
+struct_member = [ doc_comment ] [ "pub" ] ( field | function ) ;
+field       = type ident ";" ;
+
+(* ---------- enums ---------- *)
+
+enum_decl   = "enum" ident [ generic_params ] "{" { enum_member } "}" ;
+enum_member = variant [ "," ] | function ;
+variant     = [ doc_comment ] ident [ "(" type { "," type } [ "," ] ")"
+                                    | "{" { field } "}" ] ;
+
+(* ---------- traits ---------- *)
+
+trait_decl  = "trait" ident [ generic_params ] "{" { trait_member } "}" ;
+trait_member = [ doc_comment ] ( function | function_sig ) ;
+function_sig = [ type ] ident [ generic_params ] "(" [ param_list ] ")" ";" ;
+
+(* ---------- impl ---------- *)
+
+impl_decl   = [ "unsafe" ] "impl" [ generic_params ] bound "for" type "{" { struct_member } "}" ;
+
+(* ---------- extern ---------- *)
+
+extern_block = "extern" string_lit "{" { function_sig } "}" ;
+
+(* ---------- types ---------- *)
+
+type        = ( ref_type | ptr_type | postfix_type ) { "?" } ;   (* T? is Option<T>, applies to the whole type: &const str? is Option<&const str> *)
+ref_type    = "&" [ "const" ] postfix_type ;
+ptr_type    = "*" [ "const" ] postfix_type ;
+postfix_type = base_type { type_suffix } ;
+type_suffix = "[" [ expression ] "]" ;        (* T[N] array, T[] slice *)
+base_type   = primitive
+            | path [ generic_args ]
+            | "(" type ")"                                (* grouping *)
+            | "(" [ type "," [ type { "," type } [ "," ] ] ] ")"   (* tuple, () is void *)
+            | "fn" [ "const" | "once" ] [ "send" ] "(" [ type { "," type } ] ")" [ "->" type ]
+            | "dyn" bound
+            | "Self" ;
+primitive   = "bool" | "byte" | "short" | "int" | "long" | "uint" | "ulong"
+            | "usize" | "float" | "double" | "char" | "void" ;
+generic_args = "<" type { "," type } [ "," ] ">" ;
+
+(* ---------- statements ---------- *)
+
+block       = "{" { statement } [ expression ] "}" ;
+
+statement   = var_decl
+            | const_decl
+            | expression ";"
+            | assignment ";"
+            | if_expr
+            | while_stmt
+            | loop_stmt
+            | for_stmt
+            | match_expr
+            | block
+            | ";" ;
+
+var_decl    = ( type | "var" ) ident [ "=" expression ] ";" ;
+
+assignment  = expression assign_op expression ;
+assign_op   = "=" | "+=" | "-=" | "*=" | "/=" | "%="
+            | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
+
+if_expr     = "if" "(" expression ")" block [ "else" ( if_expr | block ) ] ;
+while_stmt  = "while" "(" expression ")" block ;
+loop_stmt   = "loop" block ;
+for_stmt    = "for" "(" pattern "in" expression ")" block ;
+
+match_expr  = "match" expression "{" { match_arm } "}" ;
+match_arm   = pattern [ "if" expression ] "=>" ( expression "," | block [ "," ] ) ;
+
+(* ---------- patterns ---------- *)
+
+pattern     = "_"
+            | literal
+            | ident                                  (* binding *)
+            | path [ "(" [ pattern { "," pattern } ] ")" ]
+            | path "{" [ field_pat { "," field_pat } ] "}"
+            | "(" [ pattern { "," pattern } ] ")"
+            | pattern "|" pattern
+            | literal ".." literal | literal "..=" literal ;
+field_pat   = ident [ ":" pattern ] ;
+
+(* ---------- expressions, lowest to highest precedence ---------- *)
+
+expression  = range_expr ;
+range_expr  = or_expr [ ( ".." | "..=" ) or_expr ] ;
+or_expr     = and_expr { "||" and_expr } ;
+and_expr    = cmp_expr { "&&" cmp_expr } ;
+cmp_expr    = bitor_expr [ ( "==" | "!=" | "<" | ">" | "<=" | ">=" ) bitor_expr ] ;
+bitor_expr  = bitxor_expr { "|" bitxor_expr } ;
+bitxor_expr = bitand_expr { "^" bitand_expr } ;
+bitand_expr = shift_expr { "&" shift_expr } ;
+shift_expr  = add_expr { ( "<<" | ">>" ) add_expr } ;
+add_expr    = mul_expr { ( "+" | "-" ) mul_expr } ;
+mul_expr    = cast_expr { ( "*" | "/" | "%" ) cast_expr } ;
+cast_expr   = unary_expr { "as" type } ;
+unary_expr  = ( "-" | "!" | "~" | "*" | "&" [ "const" ] ) unary_expr
+            | postfix_expr ;
+postfix_expr = primary { postfix } ;
+postfix     = "(" [ expression { "," expression } [ "," ] ] ")"   (* call *)
+            | "[" expression "]"                                 (* index *)
+            | "." ident                                          (* field, method, variant, or associated item *)
+            | "." int_lit                                        (* tuple field *)
+            | "?"                                                (* error propagation *)
+            | "?." ident                                         (* optional chaining *)
+            | "??" unary_expr                                    (* fallback *)
+            | generic_args ;                                     (* explicit type args, see note *)
+
+(* Explicit type arguments on a call are written name<int>(x). The parser
+   only treats "<" after a path as type arguments when it can parse a type
+   list closed by ">" that is followed by "(" or ".". Otherwise "<" is the
+   less than operator. Name resolution, not syntax, decides whether a path
+   like Rect.square names a value's field or a type's associated item. *)
+
+primary     = literal
+            | path
+            | struct_lit
+            | "(" expression ")"
+            | "(" expression "," [ expression { "," expression } ] ")"   (* tuple *)
+            | "[" [ expression { "," expression } [ "," ] ] "]"           (* array *)
+            | "[" expression ";" expression "]"                           (* [value; N] *)
+            | block
+            | if_expr
+            | match_expr
+            | closure
+            | "unsafe" block
+            | "await" unary_expr
+            | "return" [ expression ]        (* return, break, continue are expressions *)
+            | "break"                        (* so they can appear in match arms: *)
+            | "continue"                     (* Some(n) => return Ok(n), *)
+            | "self" ;
+
+struct_lit  = path "{" [ field_init { "," field_init } [ "," ] ] "}" ;
+field_init  = ident [ ":" expression ] ;
+(* struct_lit is only parsed where a path is followed by "{" and the parser
+   is not inside an if, while, for, or match condition. *)
+
+closure     = [ capture_list ] [ "const" | "once" | "send" ( "const" | "once" ) ]
+              ( "||" | "|" [ param { "," param } ] "|" )
+              [ "->" type ] ( expression | block ) ;
+capture_list = "[" [ capture { "," capture } [ "," ] ] "]" ;
+capture     = [ "&" [ "const" ] ] ( identifier | "self" ) ;
+
+literal     = int_lit | long_lit | float_lit | double_lit
+            | char_lit | string_lit | "true" | "false" ;

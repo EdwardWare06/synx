@@ -1,0 +1,53 @@
+stress ok
+collisions ok
+key types ok
+owned begin
+key 11
+value 100
+key 10
+value 101
+key 12
+value 200
+key 20
+value 300
+key 30
+owned end
+key growth begin
+key growth clear
+value 700
+key 600
+value 701
+key 601
+value 702
+key 602
+value 703
+key 603
+value 704
+key 604
+value 705
+key 605
+value 706
+key 606
+value 707
+key 607
+value 708
+key 608
+value 709
+key 609
+key growth end
+value 0
+value 1
+value 2
+value 3
+value 4
+value 5
+value 6
+value 7
+value 8
+value 9
+value 400
+value 500
+empty value
+empty value
+value 800
+ownership ok

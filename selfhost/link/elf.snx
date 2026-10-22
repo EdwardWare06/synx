@@ -1,0 +1,47 @@
+/// Initial x86-64 ELF64 ET_EXEC writer for fully resolved, runtime-free inputs.
+/// Page-separated load segments and a non-executable GNU stack. No dynamic/TLS
+/// records yet. Returns complete bytes; caller owns publication and chmod.
+import link.model.{Object, Failure};
+import link.image;
+import link.buffer.Buffer;
+import link.elf_dynamic;
+import link.imports.Import;
+
+pub Result<Vec<byte>, Failure> write_dynamic(&const Vec<Object> inputs, &const str entry,
+                                            &const Vec<Import> imported) {
+    return elf_dynamic.write(inputs, entry, imported);
+}
+
+void program_header(&Buffer out, ulong kind, ulong flags, ulong offset,
+                    ulong address, ulong file_size, ulong memory_size, ulong alignment) {
+    out.word(kind, 4); out.word(flags, 4); out.word(offset, 8);
+    out.word(address, 8); out.word(address, 8);
+    out.word(file_size, 8); out.word(memory_size, 8); out.word(alignment, 8);
+}
+pub Result<Vec<byte>, Failure> write(&const Vec<Object> inputs, &const str entry) {
+    var linked = image.build(inputs, entry, 4194304)?;
+    ulong count = 2;
+    for (segment in &const linked.segments) { if (segment.size != 0) { count += 1; } }
+    var out = Buffer.new();
+    out.word(0x464c457f, 4); out.word(2, 1); out.word(1, 1); out.word(1, 1); out.word(0, 1);
+    var ident = out.pad(16)?;
+    out.word(2, 2); out.word(62, 2); out.word(1, 4);
+    out.word(linked.entry, 8); out.word(64, 8); out.word(0, 8);
+    out.word(0, 4); out.word(64, 2); out.word(56, 2); out.word(count, 2);
+    out.word(0, 2); out.word(0, 2); out.word(0, 2);
+    program_header(&out, 1, 4, 0, linked.base, 4096, 4096, 4096);
+    for (segment in &const linked.segments) {
+        if (segment.size == 0) { continue; }
+        ulong flags = match segment.kind { Text => 5, ReadOnly => 4, _ => 6 };
+        program_header(&out, 1, flags, segment.rva, linked.base + segment.rva,
+            segment.data.len() as ulong, segment.size, 4096);
+    }
+    program_header(&out, 0x6474e551, 6, 0, 0, 0, 0, 16);
+    var header_page = out.pad(4096)?;
+    for (segment in &const linked.segments) {
+        if (segment.size == 0) { continue; }
+        var padding = out.pad(segment.rva)?;
+        out.append(segment.data);
+    }
+    return Ok(out.data);
+}

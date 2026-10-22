@@ -1,0 +1,2 @@
+import nested.point;
+pub point.Point make() { return point.Point { x: 42 }; }

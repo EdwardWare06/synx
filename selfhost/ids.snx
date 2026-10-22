@@ -1,0 +1,9 @@
+/// Typed handles for semantic arenas. NONE marks an absent record.
+/// Handles contain no references and remain valid when an arena grows.
+pub const uint NONE = 4294967295;
+pub struct TypeId { pub uint index; pub TypeId none() { return TypeId { index: NONE }; } }
+pub struct ModuleId { pub uint index; pub ModuleId none() { return ModuleId { index: NONE }; } }
+pub enum DefKind { Struct, Enum, Trait, Impl, Function, Const }
+pub struct DefId { pub DefKind kind; pub uint index;
+    pub DefId none() { return DefId { kind: DefKind.Function, index: NONE }; }
+}

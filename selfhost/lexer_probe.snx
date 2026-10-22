@@ -1,0 +1,200 @@
+/// Binary lexer parity driver. Format: selfhost/README.md.
+import source.{SourceFile, Span};
+import diagnostics.{DiagnosticSink, Severity};
+import token;
+import lexer;
+import bytes;
+import std.fs;
+import std.env;
+import std.text;
+import std.binary;
+T require<T, E>(Result<T, E> result) { match result { Ok(value) => return value, Err(_) => panic("parity I/O failed") } }
+void put(&Vec<byte> output, ulong value, usize width) {
+    if (!binary.write_uint(&*output, value, width, true)) { panic("parity integer overflow"); }
+}
+void blob(&Vec<byte> output, &const Vec<byte> value) {
+    put(&*output, value.len() as ulong, 8); bytes.append(&*output, value);
+}
+void string(&Vec<byte> output, &const str value) {
+    put(&*output, value.len() as ulong, 8); bytes.text(&*output, value);
+}
+void span(&Vec<byte> output, Span value) {
+    put(&*output, value.start as ulong, 4); put(&*output, value.end as ulong, 4); put(&*output, value.file as ulong, 4);
+}
+void inspect(&Vec<byte> output, &const str path, uint id) {
+    var file = require(SourceFile.load(path, id));
+    var sink = DiagnosticSink.new(); var tokens = lexer.tokenize(file, &sink);
+    put(&*output, tokens.len() as ulong, 8);
+    for (item in &const tokens) {
+        put(&*output, token.index(item.kind) as ulong, 4); span(&*output, item.span); blob(&*output, item.text);
+        put(&*output, item.int_value, 8);
+        double value = item.float_value; ulong bits = unsafe { *((&const value as *const double) as *const ulong) };
+        put(&*output, bits, 8);
+    }
+    put(&*output, sink.errors as ulong, 8); put(&*output, sink.items.len() as ulong, 8);
+    for (item in &const sink.items) {
+        uint severity = 0; match item.severity { Severity.Error => {}, Severity.Warning => { severity = 1; }, Severity.Note => { severity = 2; } }
+        put(&*output, severity as ulong, 4); span(&*output, item.span); blob(&*output, item.message); string(&*output, item.code.as_str());
+    }
+    Vec<SourceFile> registered = Vec.new();
+    var rendered = sink.render(file, registered); blob(&*output, rendered);
+    put(&*output, file.line_count() as ulong, 4);
+    for (i in 0..=(file.data().len() + 1)) {
+        var lc = file.line_col(i as uint); put(&*output, lc.line as ulong, 4); put(&*output, lc.col as ulong, 4);
+    }
+    for (i in 0..=(file.line_count() + 1)) { var line = file.line_text(i); blob(&*output, line); }
+    var merged = Span.merge(Span { start: 5, end: 9, file: id }, Span { start: 2, end: 7, file: id + 1 });
+    span(&*output, merged);
+    // Exercise source selection, fallback, warning/note, empty and multiline spans.
+    var mixed = DiagnosticSink.new();
+    mixed.error(Span { start: 0, end: file.data().len() as uint, file: id }, "whole source", "SNXTEST");
+    Vec<byte> message = Vec.new(); bytes.text(&message, "warning");
+    mixed.add(Severity.Warning, Span { start: file.data().len() as uint, end: file.data().len() as uint, file: id }, message, String.new());
+    Vec<byte> note = Vec.new(); bytes.text(&note, "fallback");
+    mixed.add(Severity.Note, Span { start: 0, end: 0, file: id + 100000 }, note, String.new());
+    registered.push(SourceFile.new(String.from("replaced.snx"), Vec.new(), id));
+    var alternate = SourceFile.new(String.from("registered.snx"), Vec.new(), id);
+    registered.push(alternate);
+    var multi = mixed.render(file, registered); blob(&*output, multi);
+}
+extern "C" { int synx_rt_parse_double(*const byte data, usize length, &double value); }
+void numeric_contract() {
+    var invalid = ["", "nan", "inf", "0x1p3", "1f", "1e", " 1", "-1", "+1", "1.", "1_0", "1\0x"];
+    for (input in &const invalid) {
+        double value = 42.0;
+        int status = unsafe { synx_rt_parse_double(input.as_ptr(), input.len(), &value) };
+        if (status == 0 || value != 0.0) { panic("invalid decimal conversion accepted"); }
+    }
+    double value = 42.0;
+    if (unsafe { synx_rt_parse_double(0 as *const byte, 1, &value) } == 0 || value != 0.0) { panic("null decimal input accepted"); }
+    if (unsafe { synx_rt_parse_double("1.5".as_ptr(), 3, &value) } != 0 || value != 1.5) { panic("decimal conversion mismatch"); }
+    if (unsafe { synx_rt_parse_double("0e999999".as_ptr(), 8, &value) } != 0 || value != 0.0) { panic("zero conversion mismatch"); }
+    if (unsafe { synx_rt_parse_double("1e309".as_ptr(), 5, &value) } == 0 || !(value > 1e308)) { panic("overflow conversion mismatch"); }
+}
+void catalog(&Vec<byte> output) {
+    var kinds = [
+        token.Kind.Eof,
+        token.Kind.Error,
+        token.Kind.Ident,
+        token.Kind.IntLit,
+        token.Kind.LongLit,
+        token.Kind.FloatLit,
+        token.Kind.DoubleLit,
+        token.Kind.CharLit,
+        token.Kind.StringLit,
+        token.Kind.StringStart,
+        token.Kind.StringText,
+        token.Kind.InterpStart,
+        token.Kind.InterpEnd,
+        token.Kind.StringEnd,
+        token.Kind.DocComment,
+        token.Kind.KwAs,
+        token.Kind.KwAsync,
+        token.Kind.KwAwait,
+        token.Kind.KwBreak,
+        token.Kind.KwConst,
+        token.Kind.KwContinue,
+        token.Kind.KwDyn,
+        token.Kind.KwElse,
+        token.Kind.KwEnum,
+        token.Kind.KwExtern,
+        token.Kind.KwFalse,
+        token.Kind.KwFn,
+        token.Kind.KwFor,
+        token.Kind.KwIf,
+        token.Kind.KwImpl,
+        token.Kind.KwImport,
+        token.Kind.KwIn,
+        token.Kind.KwLoop,
+        token.Kind.KwMatch,
+        token.Kind.KwOnce,
+        token.Kind.KwPub,
+        token.Kind.KwReturn,
+        token.Kind.KwSelf,
+        token.Kind.KwSelfType,
+        token.Kind.KwStruct,
+        token.Kind.KwTrait,
+        token.Kind.KwTrue,
+        token.Kind.KwUnsafe,
+        token.Kind.KwVar,
+        token.Kind.KwWhile,
+        token.Kind.KwBool,
+        token.Kind.KwByte,
+        token.Kind.KwShort,
+        token.Kind.KwInt,
+        token.Kind.KwLong,
+        token.Kind.KwUint,
+        token.Kind.KwUlong,
+        token.Kind.KwUsize,
+        token.Kind.KwFloat,
+        token.Kind.KwDouble,
+        token.Kind.KwChar,
+        token.Kind.KwVoid,
+        token.Kind.LParen,
+        token.Kind.RParen,
+        token.Kind.LBracket,
+        token.Kind.RBracket,
+        token.Kind.LBrace,
+        token.Kind.RBrace,
+        token.Kind.Comma,
+        token.Kind.Semi,
+        token.Kind.Colon,
+        token.Kind.ColonColon,
+        token.Kind.Dot,
+        token.Kind.DotDot,
+        token.Kind.DotDotEq,
+        token.Kind.Arrow,
+        token.Kind.FatArrow,
+        token.Kind.Question,
+        token.Kind.QuestionDot,
+        token.Kind.QuestionQuestion,
+        token.Kind.Plus,
+        token.Kind.Minus,
+        token.Kind.Star,
+        token.Kind.Slash,
+        token.Kind.Percent,
+        token.Kind.Eq,
+        token.Kind.EqEq,
+        token.Kind.Bang,
+        token.Kind.BangEq,
+        token.Kind.Lt,
+        token.Kind.Gt,
+        token.Kind.LtEq,
+        token.Kind.GtEq,
+        token.Kind.AmpAmp,
+        token.Kind.PipePipe,
+        token.Kind.Amp,
+        token.Kind.Pipe,
+        token.Kind.Caret,
+        token.Kind.Tilde,
+        token.Kind.Shl,
+        token.Kind.PlusEq,
+        token.Kind.MinusEq,
+        token.Kind.StarEq,
+        token.Kind.SlashEq,
+        token.Kind.PercentEq,
+        token.Kind.AmpEq,
+        token.Kind.PipeEq,
+        token.Kind.CaretEq,
+        token.Kind.ShlEq,
+        token.Kind.ShrEq
+    ];
+    put(&*output, 105, 4);
+    for (kind in &const kinds) {
+        string(&*output, token.name(*kind));
+        output.push(if (token.is_keyword(*kind)) { 1 } else { 0 });
+        output.push(if (token.is_primitive_type_keyword(*kind)) { 1 } else { 0 });
+    }
+}
+main() {
+    numeric_contract();
+    var args = env.args();
+    if (args.len() != 3) { panic("usage: lexer_probe <manifest> <report>"); }
+    var manifest = require(fs.read_text(args.get(1).unwrap().as_str()));
+    var paths = text.lines(manifest); Vec<byte> output = Vec.new(); catalog(&output); uint id = 7;
+    for (path in &const paths) {
+        if (path.is_empty()) { continue; }
+        inspect(&output, path.as_str(), id); id += 1;
+    }
+    require(fs.write(args.get(2).unwrap().as_str(), output));
+}

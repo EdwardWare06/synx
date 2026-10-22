@@ -1,0 +1,1 @@
+main() { int[1] a=[2147483647]; a[0] += 1; if (a[0] != -2147483648) { panic("wrong array result"); } }

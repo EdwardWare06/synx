@@ -1,0 +1,168 @@
+/// Linux x86-64 dynamic ET_EXEC output. Imports use eager GLOB_DAT slots and
+/// six-byte indirect jump thunks. Loader metadata contains no borrowed storage.
+/// The shared runtime owns CRT setup, TLS and native library dependencies.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
+import link.model;
+import link.imports.Import;
+import link.image;
+import link.buffer.{Buffer, align};
+
+Vec<byte> copy_bytes(&const Vec<byte> source) {
+    Vec<byte> out = Vec.new(); for (ch in source) { out.push(*ch); } return out;
+}
+Object copy_object(&const Object source) {
+    var out = Object.new(source.name, source.archive_member);
+    for (section in &const source.sections) {
+        out.sections.push(Section { kind: section.kind, alignment: section.alignment,
+            data: copy_bytes(section.data), size: section.size });
+    }
+    for (symbol in &const source.symbols) {
+        out.symbols.push(Symbol { name: copy_bytes(symbol.name), binding: symbol.binding,
+            definition: symbol.definition });
+    }
+    for (reloc in &const source.relocations) {
+        out.relocations.push(Relocation { section: reloc.section, offset: reloc.offset,
+            symbol: reloc.symbol, kind: reloc.kind, addend: reloc.addend });
+    }
+    return out;
+}
+void text(&Buffer out, &const str value) {
+    for (i in 0..value.len()) { out.word(unsafe { *((value.as_ptr() as usize + i) as *const byte) } as ulong, 1); }
+    out.word(0, 1);
+}
+void program_header(&Buffer out, ulong kind, ulong flags, ulong offset,
+                    ulong address, ulong file_size, ulong memory_size, ulong alignment) {
+    out.word(kind, 4); out.word(flags, 4); out.word(offset, 8);
+    out.word(address, 8); out.word(address, 8);
+    out.word(file_size, 8); out.word(memory_size, 8); out.word(alignment, 8);
+}
+void tag(&Buffer out, ulong kind, ulong value) { out.word(kind, 8); out.word(value, 8); }
+Result<ulong, Failure> location(&const image.Image linked, &const str name) {
+    return match image.symbol(linked, name) {
+        Some(address) => Ok(address), None => Err(model.fail(Code.Invalid, 0, 0))
+    };
+}
+Result<bool, Failure> replace_bytes(&image.Image linked, ulong address, &const Vec<byte> bytes) {
+    for (segment in &linked.segments) {
+        ulong start = linked.base + segment.rva;
+        if (address >= start && address - start <= segment.data.len() as ulong) {
+            ulong offset = address - start;
+            if (bytes.len() as ulong > segment.data.len() as ulong - offset) { continue; }
+            for (i in 0..bytes.len()) { *segment.data.get_mut(offset as usize + i).unwrap() = *bytes.get(i).unwrap(); }
+            return Ok(true);
+        }
+    }
+    return Err(model.fail(Code.Invalid, 0, 0));
+}
+pub Result<Vec<byte>, Failure> write(&const Vec<Object> inputs, &const str entry,
+                                    &const Vec<Import> imported) {
+    // Each name contributes a symbol, an eager relocation and one GOT slot.
+    if (imported.len() as ulong > 1048576) { return Err(model.fail(Code.Range, 0, 0)); }
+    var strings = Buffer.new(); strings.word(0, 1);
+    Vec<ulong> names = Vec.new();
+    Vec<String> libraries = Vec.new(); Vec<ulong> needed = Vec.new();
+    for (item in imported) {
+        if (item.name.is_empty()) { return Err(model.fail(Code.Invalid, 0, 0)); }
+        if (item.name.len() as ulong > 16777216 || item.library.len() > 4096) { return Err(model.fail(Code.Range, 0, 0)); }
+        for (i in 0..item.library.len()) {
+            if (unsafe { *((item.library.as_str().as_ptr() as usize + i) as *const byte) } == 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
+        }
+        names.push(strings.data.len() as ulong);
+        for (ch in &const item.name) {
+            if (*ch == 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
+            strings.word(*ch as ulong, 1);
+        }
+        strings.word(0, 1);
+        bool found = false;
+        for (library in &const libraries) { if (*library == item.library) { found = true; } }
+        if (!found) {
+            if (item.library.len() == 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
+            libraries.push(String.from(item.library)); needed.push(strings.data.len() as ulong);
+            text(&strings, item.library);
+        }
+        if (strings.data.len() as ulong > 16777216) { return Err(model.fail(Code.Range, 0, 0)); }
+    }
+    ulong runpath = strings.data.len() as ulong; text(&strings, "$ORIGIN");
+    ulong string_size = strings.data.len() as ulong;
+    ulong sym_offset = align(string_size, 8)?;
+    var ro = Buffer.new(); ro.append(strings.data); var p0 = ro.pad(sym_offset)?;
+    var null_symbol = ro.pad(sym_offset + 24)?;
+    for (name in &const names) {
+        ro.word(*name, 4); ro.word(0x12, 1); ro.word(0, 1); ro.word(0, 2);
+        ro.word(0, 8); ro.word(0, 8);
+    }
+    ulong hash_offset = align(ro.data.len() as ulong, 8)?; var p1 = ro.pad(hash_offset)?;
+    // One valid SysV hash bucket keeps lookup deterministic and includes every
+    // dynamic symbol; dynamic symbol zero remains the undefined terminator.
+    ro.word(1, 4); ro.word(imported.len() as ulong + 1, 4);
+    ro.word(if (imported.is_empty()) { 0 } else { 1 }, 4); ro.word(0, 4);
+    for (i in 0..imported.len()) { ro.word(if (i + 1 < imported.len()) { i as ulong + 2 } else { 0 }, 4); }
+    ulong rela_offset = align(ro.data.len() as ulong, 8)?; var p2 = ro.pad(rela_offset)?;
+    var rela_space = ro.pad(rela_offset + imported.len() as ulong * 24)?;
+    ulong dynamic_offset = imported.len() as ulong * 8;
+    ulong dynamic_size = (libraries.len() as ulong + 12) * 16;
+    var rw = Buffer.new(); var rw_space = rw.pad(dynamic_offset + dynamic_size)?;
+    var thunks = Buffer.new();
+    var synthetic = Object.new("<ELF dynamic imports>", false);
+    for (i in 0..imported.len()) {
+        var item = imported.get(i).unwrap();
+        synthetic.symbols.push(Symbol { name: copy_bytes(item.name), binding: Binding.Global,
+            definition: Definition.Section(0, thunks.data.len() as ulong) });
+        thunks.word(0x25ff, 2); thunks.word(0, 4);
+    }
+    usize got_symbol = synthetic.symbols.len();
+    synthetic.symbols.push(Symbol.new("__synx_elf_rw", Binding.Global, Definition.Section(2, 0)));
+    synthetic.symbols.push(Symbol.new("__synx_elf_ro", Binding.Global, Definition.Section(1, 0)));
+    for (i in 0..imported.len()) {
+        synthetic.relocations.push(Relocation { section: 0, offset: i as ulong * 6 + 2,
+            symbol: got_symbol, kind: RelocKind.Pc32, addend: i as long * 8 - 4 });
+    }
+    synthetic.sections.push(Section.new(SectionKind.Text, 16, thunks.data));
+    synthetic.sections.push(Section.new(SectionKind.ReadOnly, 8, ro.data));
+    synthetic.sections.push(Section.new(SectionKind.Data, 8, rw.data));
+    Vec<Object> all = Vec.new(); for (object in inputs) { all.push(copy_object(object)); } all.push(synthetic);
+    var linked = image.build(all, entry, 4194304)?;
+    ulong ro_address = location(linked, "__synx_elf_ro")?;
+    ulong rw_address = location(linked, "__synx_elf_rw")?;
+    var relas = Buffer.new();
+    for (i in 0..imported.len()) {
+        relas.word(rw_address + i as ulong * 8, 8);
+        relas.word(((i as ulong + 1) << 32) | 6, 8); relas.word(0, 8);
+    }
+    var patch_rela = replace_bytes(&linked, ro_address + rela_offset, relas.data)?;
+    var dynamic = Buffer.new();
+    for (offset in &const needed) { tag(&dynamic, 1, *offset); }
+    tag(&dynamic, 4, ro_address + hash_offset); tag(&dynamic, 5, ro_address);
+    tag(&dynamic, 6, ro_address + sym_offset); tag(&dynamic, 10, string_size); tag(&dynamic, 11, 24);
+    tag(&dynamic, 7, ro_address + rela_offset); tag(&dynamic, 8, imported.len() as ulong * 24);
+    tag(&dynamic, 9, 24); tag(&dynamic, 29, runpath); tag(&dynamic, 30, 8);
+    tag(&dynamic, 0x6ffffffb, 1); tag(&dynamic, 0, 0);
+    var patch_dynamic = replace_bytes(&linked, rw_address + dynamic_offset, dynamic.data)?;
+    ulong count = 5;
+    for (segment in &const linked.segments) { if (segment.size != 0) { count += 1; } }
+    var out = Buffer.new();
+    out.word(0x464c457f, 4); out.word(2, 1); out.word(1, 1); out.word(1, 1); out.word(0, 1);
+    var ident = out.pad(16)?;
+    out.word(2, 2); out.word(62, 2); out.word(1, 4); out.word(linked.entry, 8);
+    out.word(64, 8); out.word(0, 8); out.word(0, 4); out.word(64, 2);
+    out.word(56, 2); out.word(count, 2); out.word(0, 2); out.word(0, 2); out.word(0, 2);
+    program_header(&out, 6, 4, 64, linked.base + 64, count * 56, count * 56, 8);
+    program_header(&out, 3, 4, 1024, linked.base + 1024, 28, 28, 1);
+    program_header(&out, 1, 4, 0, linked.base, 4096, 4096, 4096);
+    for (segment in &const linked.segments) {
+        if (segment.size == 0) { continue; }
+        ulong flags = match segment.kind { Text => 5, ReadOnly => 4, _ => 6 };
+        program_header(&out, 1, flags, segment.rva, linked.base + segment.rva,
+            segment.data.len() as ulong, segment.size, 4096);
+    }
+    program_header(&out, 2, 6, rw_address - linked.base + dynamic_offset,
+        rw_address + dynamic_offset, dynamic_size, dynamic_size, 8);
+    program_header(&out, 0x6474e551, 6, 0, 0, 0, 0, 16);
+    var interp_padding = out.pad(1024)?; text(&out, "/lib64/ld-linux-x86-64.so.2");
+    var header_page = out.pad(4096)?;
+    for (segment in &const linked.segments) {
+        if (segment.size == 0) { continue; }
+        var padding = out.pad(segment.rva)?; out.append(segment.data);
+    }
+    return Ok(out.data);
+}

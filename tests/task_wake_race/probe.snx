@@ -1,0 +1,37 @@
+/// Deterministic wake/retention interleaving. Requires the test-only C adapter.
+import std.task.{block_on, block_on_send, LocalExecutor};
+import std.env;
+extern "C" {
+    void synx_test_mode(int mode);
+    void synx_test_arm(*const byte holder);
+    int synx_test_injections();
+}
+struct Injected { bool polled; bool silent; }
+impl Future<int> for Injected {
+    Poll<int> poll(&self, Waker wake) {
+        if (self.silent) { return Poll.Pending; }
+        if (!self.polled) {
+            self.polled = true;
+            unsafe { synx_test_arm((&const wake as *const Waker) as *const byte); }
+            return Poll.Pending;
+        }
+        return Poll.Ready(42);
+    }
+}
+async send int send_case(bool silent) { return await Injected { polled: false, silent: silent }; }
+async int local_case(bool silent) { return await Injected { polled: false, silent: silent }; }
+async void executor_case(bool silent) { if ((await local_case(silent)) != 42) { panic("wrong task result"); } }
+main() {
+    var args = env.args(); if (args.len() != 2) { panic("usage: wake_probe <send|local|executor|silent-send|silent-local|silent-executor>"); }
+    var mode = args.get(1).unwrap().as_str();
+    bool silent = mode == "silent-send" || mode == "silent-local" || mode == "silent-executor";
+    if (mode == "executor" || mode == "silent-executor") {
+        unsafe { synx_test_mode(1); }
+        var executor = LocalExecutor.new(); executor.spawn(executor_case(silent)); executor.run();
+    } else {
+        unsafe { synx_test_mode(0); }
+        int value = if (mode == "send" || mode == "silent-send") { block_on_send(send_case(silent)) } else { block_on(local_case(silent)) };
+        if (value != 42) { panic("wrong task result"); }
+    }
+    if (unsafe { synx_test_injections() } != 1) { panic("wake race hook did not run exactly once"); }
+}

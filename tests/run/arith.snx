@@ -1,0 +1,12 @@
+int add(int a, int b) { return a + b; }
+
+int main() {
+    int x = add(2, 3);
+    int y = x * 10 - 4;
+    long big = 3000000000L;
+    double d = 2.5 * 4.0;
+    bool t = y > 40 && !(x == 0);
+    print("{x} {y} {big} {d} {t}");
+    print("{7 / 2} {7 % 2} {-7 / 2} {1 << 4} {255 as byte}");
+    return y - 44;
+}

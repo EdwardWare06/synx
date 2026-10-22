@@ -1,0 +1,14 @@
+import std.thread;
+import std.sync.{Arc, AtomicUsize};
+struct Token { Arc<AtomicUsize> drops; String data; }
+impl Drop for Token { void drop(&self) { self.drops.get().fetch_add(1); } }
+main() {
+    var drops = Arc.new(AtomicUsize.new(0));
+    var token = Token { drops: drops.clone(), data: String.from("captured") };
+    match thread.spawn(send once || { var owned = token; return String.from("result"); }) {
+        Err(error) => { if (error.os_code == 0) { panic("missing error"); } },
+        Ok(handle) => { handle.join(); panic("creation failure was not injected"); }
+    }
+    if (drops.get().load() != 1 || drops.strong_count() != 1) { panic("failed spawn leaked its captures"); }
+    print("spawn failure cleanup passed");
+}

@@ -1,0 +1,16 @@
+import std.thread;
+import std.sync.{Arc, AtomicBool};
+main() {
+    var gate = Arc.new(AtomicBool.new(false));
+    var handles = Vec<thread.JoinHandle<int>>.new();
+    for (i in 0..100) {
+        var ready = gate.clone();
+        match thread.spawn(send once || { while (!ready.get().load()) { thread.sleep_ms(1); } return 1; }) {
+            Ok(handle) => handles.push(handle), Err(_) => panic("spawn failed")
+        }
+    }
+    gate.get().store(true);
+    int count = 0;
+    while (!handles.is_empty()) { count += handles.pop().unwrap().join(); }
+    print("{count}");
+}

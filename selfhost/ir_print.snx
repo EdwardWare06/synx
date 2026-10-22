@@ -1,0 +1,112 @@
+/// Human Dendrite output. Source: compiler/src/ir_print.cpp.
+/// Strict pass-oracle output stays in module_dump.snx.
+import ir;
+import ids.{TypeId, NONE};
+import declare.Resolver;
+import ast_print;
+import driver_io;
+import bytes;
+
+String place(&const ir.Place p) {
+    String text = "_{p.local}";
+    for (pr in &const p.proj) {
+        match pr.kind { Field => { text.push_str(".{pr.index}"); }, Index => { text.push_str("[_{pr.index}]"); },
+            Deref => { text = "(*{text})"; }, Downcast => { text = "({text} as variant {pr.index})"; } }
+    }
+    return text;
+}
+struct Writer {
+    Vec<byte> out;
+    void text(&self, &const str value) { bytes.text(&self.out, value); }
+    void raw(&self, &const Vec<byte> value) { bytes.append(&self.out, value); }
+    void type(&self, &const Resolver r, TypeId type) { if (type.index == NONE) { self.text("?"); } else { self.text(r.types.to_string(type)); } }
+    void function_name(&self, &const ir.Module m, uint index) { if (index == NONE) { self.text("?"); } else { self.text(m.functions.get(index as usize).unwrap().name); } }
+    void constant(&self, &const Resolver r, &const ir.Module m, &const ir.Constant c) {
+        match c.kind {
+            Int => { self.text("{c.int_value}"); if (c.type.index != NONE) { self.text("_"); self.type(r, c.type); } },
+            Float => { self.raw(driver_io.float_text(c.float_value)); if (c.type.index != NONE) { self.text("_"); self.type(r, c.type); } },
+            Bool => self.text(if (c.int_value != 0) { "true" } else { "false" }),
+            Char => { var value = driver_io.hex(c.int_value); self.text("'\\u\{{value}\}'"); },
+            Str => { self.text("\""); self.raw(c.str_value); self.text("\""); }, Unit => self.text("()"),
+            Fn => { self.text("fn "); self.function_name(m, c.fn_index); },
+        }
+    }
+    void operand(&self, &const Resolver r, &const ir.Module m, &const ir.Operand o) {
+        match o.kind { Copy => { self.text("copy "); self.text(place(o.place)); }, Move => { self.text("move "); self.text(place(o.place)); },
+            Const => { self.text("const "); self.constant(r, m, o.constant); } }
+    }
+    void operands(&self, &const Resolver r, &const ir.Module m, &const Vec<ir.Operand> operands) {
+        for (i in 0..operands.len()) { if (i != 0) { self.text(", "); } self.operand(r, m, operands.get(i).unwrap()); }
+    }
+    void rvalue(&self, &const Resolver r, &const ir.Module m, &const ir.Rvalue v) {
+        match v.kind {
+            Use => self.operand(r, m, v.a),
+            Ref => { self.text(if (v.is_const) { "&const " } else { "&" }); self.text(place(v.place)); },
+            Binary => { self.text(ast_print.binary(v.bop)); self.text("("); self.operand(r, m, v.a); self.text(", "); self.operand(r, m, v.b); self.text(")"); },
+            Unary => { self.text(ast_print.unary(v.uop)); self.text("("); self.operand(r, m, v.a); self.text(")"); },
+            Cast => { self.operand(r, m, v.a); self.text(" as "); self.type(r, v.type); },
+            Aggregate => {
+                match v.agg {
+                    Struct => { self.type(r, v.type); self.text(" \{"); }, Tuple => self.text("("), Array => self.text("["),
+                    Variant => { self.type(r, v.type); self.text("::{v.variant}("); }
+                }
+                self.operands(r, m, v.elems);
+                match v.agg { Struct => self.text("\}"), Array => self.text("]"), _ => self.text(")") }
+                if (!v.captures.is_empty()) { self.text(" captures ["); self.operands(r, m, v.captures); self.text("]"); }
+            },
+            Discriminant => { self.text("discriminant("); self.text(place(v.place)); self.text(")"); },
+            Len => { self.text("len("); self.text(place(v.place)); self.text(")"); },
+            StrFromString => { self.text("str_from_string("); self.operand(r, m, v.a); self.text(")"); },
+            ArrayToSlice => { self.text("array_to_slice("); self.operand(r, m, v.a); self.text(")"); },
+            VecToSlice => { self.text("vec_to_slice("); self.operand(r, m, v.a); self.text(")"); },
+            ToDyn => { self.text("to_dyn("); self.operand(r, m, v.a); self.text(", "); self.type(r, v.type); self.text(")"); },
+        }
+    }
+    void terminator(&self, &const Resolver r, &const ir.Module m, &const ir.Terminator t) {
+        match t.kind {
+            Goto => self.text("goto bb{t.target}"),
+            Switch => { self.text("switch "); self.operand(r, m, t.discr); self.text(" [");
+                for (i in 0..t.cases.len()) { if (i != 0) { self.text(", "); } var c = t.cases.get(i).unwrap(); self.text("{c.value}: bb{c.block}"); }
+                self.text(", otherwise: bb{t.otherwise}]"); },
+            Call => {
+                if (!t.diverges && !t.dest.is_none()) { self.text(place(t.dest)); self.text(" = "); }
+                match t.callee.kind {
+                    Direct => { self.text("call "); self.function_name(m, t.callee.fn_index); },
+                    Builtin => self.text("call @{t.callee.builtin}"), Virtual => self.text("call virtual[{t.callee.vtable_slot}]"),
+                    Indirect => { self.text("call ("); self.operand(r, m, t.callee.fn_operand); self.text(")"); }
+                }
+                self.text("("); self.operands(r, m, t.args); self.text(")");
+                if (t.diverges) { self.text(" -> diverges"); } else { self.text(" -> bb{t.target}"); }
+            },
+            Assert => { self.text("assert "); self.operand(r, m, t.cond); self.text(" \"{t.message}\" -> bb{t.target}"); },
+            Return => self.text("return"), Unreachable => self.text("unreachable"),
+        }
+    }
+    void function(&self, &const Resolver r, &const ir.Module m, &const ir.Function f) {
+        self.text("fn {f.name}(");
+        for (i in 1..f.arg_count + 1) { if (i > 1) { self.text(", "); } self.text("_{i}: "); self.type(r, f.locals.get(i as usize).unwrap().type); }
+        self.text(") -> "); self.type(r, f.ret); self.text(" \{\n");
+        for (i in 0..f.locals.len()) { var local = f.locals.get(i).unwrap(); self.text("  let _{i}: "); self.type(r, local.type);
+            if (!local.name.is_empty()) { self.text("  // {local.name}"); } self.text("\n"); }
+        for (i in 0..f.blocks.len()) {
+            self.text("  bb{i}:\n"); var block = f.blocks.get(i).unwrap();
+            for (s in &const block.stmts) {
+                self.text("    ");
+                match s.kind {
+                    Assign => { self.text(place(s.place)); self.text(" = "); self.rvalue(r, m, s.rvalue); },
+                    Drop => { self.text("drop "); self.text(place(s.place)); },
+                    DropIf => { self.text("drop "); self.text(place(s.place)); self.text(" if _{s.flag_local}"); },
+                    StorageDead => { self.text("storage_dead "); self.text(place(s.place)); }, Nop => self.text("nop"),
+                }
+                self.text("\n");
+            }
+            self.text("    "); self.terminator(r, m, block.term); self.text("\n");
+        }
+        self.text("\}\n");
+    }
+}
+pub Vec<byte> module(&const Resolver resolver, &const ir.Module module) {
+    var writer = Writer { out: Vec.new() }; for (f in &const module.functions) {
+        if (!f.lowered) { continue; } if (!writer.out.is_empty()) { writer.out.push(10); } writer.function(resolver, module, f);
+    } return writer.out;
+}

@@ -1,0 +1,129 @@
+/// Merge selected strong-symbol inputs into page-separated Text/ReadOnly/Data/BSS.
+/// Apply checked relocations into owned copies; inputs remain unchanged.
+/// Maximum virtual image size is buffer.LIMIT. Alignments are at most 4096.
+/// No import, TLS, unwind, COMDAT, or CRT records are accepted by this model yet.
+import link.model.{Object, SymbolId, RelocKind, SectionKind, Failure, Code};
+import link.model;
+import link.resolve;
+import link.relocate;
+import link.buffer;
+import std.collections.HashMap;
+import std.utf8;
+
+pub struct Segment { pub SectionKind kind; pub Vec<byte> data; pub ulong size; pub ulong rva; }
+struct Placement { usize group; ulong offset; }
+pub struct Image {
+    pub ulong base;
+    pub ulong entry;
+    pub ulong end_rva;
+    pub Vec<Segment> segments;
+    pub Vec<ulong> absolute_sites;
+    pub bool rebase_safe;
+    pub HashMap<String, ulong> globals;
+}
+pub ulong? symbol(&const Image linked, &const str name) {
+    match linked.globals.get(model.key(utf8.encode(name))) { Some(value) => return Some(*value), None => return None }
+}
+ulong address(&const Vec<Object> inputs, &const Vec<Vec<Placement>> placements,
+              &const Vec<Segment> segments, ulong base, SymbolId symbol) {
+    var object = inputs.get(symbol.input.index).unwrap();
+    match object.symbols.get(symbol.index).unwrap().definition {
+        Absolute(value) => return value,
+        Section(index, offset) => {
+            var place = placements.get(symbol.input.index).unwrap().get(index).unwrap();
+            return base + segments.get(place.group).unwrap().rva + place.offset + offset;
+        },
+        _ => panic("linker resolved an undefined symbol")
+    }
+}
+/// Resolves entry and all selected symbols before allocation of the image.
+/// Returns complete relocated segments or Failure. No file is written.
+pub Result<Image, Failure> build(&const Vec<Object> inputs, &const str entry, ulong base) {
+    var resolved = resolve.run(inputs, entry)?;
+    if (base % 4096 != 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    Vec<Segment> segments = Vec.new();
+    segments.push(Segment { kind: SectionKind.Text, data: Vec.new(), size: 0, rva: 0 });
+    segments.push(Segment { kind: SectionKind.ReadOnly, data: Vec.new(), size: 0, rva: 0 });
+    segments.push(Segment { kind: SectionKind.Data, data: Vec.new(), size: 0, rva: 0 });
+    segments.push(Segment { kind: SectionKind.Bss, data: Vec.new(), size: 0, rva: 0 });
+    Vec<Vec<Placement>> placements = Vec.new();
+    ulong total = 0;
+    for (i in 0..inputs.len()) {
+        Vec<Placement> row = Vec.new();
+        if (*resolved.selected.get(i).unwrap()) {
+            var object = inputs.get(i).unwrap();
+            for (section in &const object.sections) {
+                usize group = model.group(section.kind);
+                var segment = segments.get_mut(group).unwrap();
+                ulong offset = buffer.align(segment.size, section.alignment)?;
+                if (section.size > buffer.LIMIT - offset) { return Err(model.fail(Code.Range, i, row.len())); }
+                ulong growth = offset - segment.size + section.size;
+                if (growth > buffer.LIMIT - total) { return Err(model.fail(Code.Range, i, row.len())); }
+                total += growth;
+                if (group != 3) {
+                    while (segment.data.len() as ulong < offset) { segment.data.push(0); }
+                    for (ch in &const section.data) { segment.data.push(*ch); }
+                }
+                segment.size = offset + section.size;
+                row.push(Placement { group: group, offset: offset });
+            }
+        }
+        placements.push(row);
+    }
+    ulong cursor = 4096;
+    for (segment in &segments) {
+        segment.rva = cursor;
+        ulong extent = buffer.align(if (segment.size == 0) { 1 } else { segment.size }, 4096)?;
+        if (extent > buffer.LIMIT - cursor) { return Err(model.fail(Code.Range, 0, 0)); }
+        cursor += extent;
+    }
+    ulong limit = 18446744073709551615;
+    if (base > limit - cursor) { return Err(model.fail(Code.Range, 0, 0)); }
+    ulong entry_address = address(inputs, placements, segments, base, resolved.entry);
+    Vec<ulong> absolute_sites = Vec.new();
+    HashMap<ulong, bool> patched = HashMap.new();
+    bool rebase_safe = true;
+    for (i in 0..inputs.len()) {
+        if (!*resolved.selected.get(i).unwrap()) { continue; }
+        var object = inputs.get(i).unwrap();
+        for (j in 0..object.relocations.len()) {
+            var reloc = object.relocations.get(j).unwrap();
+            var place = placements.get(i).unwrap().get(reloc.section).unwrap();
+            var target = *resolved.targets.get(i).unwrap().get(reloc.symbol).unwrap();
+            ulong symbol = address(inputs, placements, segments, base, target);
+            ulong offset = place.offset + reloc.offset;
+            ulong rva = segments.get(place.group).unwrap().rva + offset;
+            ulong width = model.width(reloc.kind);
+            for (k in 0..width as usize) {
+                if (patched.contains_key(rva + k as ulong)) { return Err(model.fail(Code.Invalid, i, j)); }
+                patched.insert(rva + k as ulong, true);
+            }
+            ulong value = match relocate.value(reloc.kind, symbol, reloc.addend, base + rva, base) {
+                Ok(value) => value, Err(error) => return Err(model.fail(error.code, i, j))
+            };
+            bool relative = match inputs.get(target.input.index).unwrap().symbols.get(target.index).unwrap().definition { Section(_, _) => true, _ => false };
+            match reloc.kind {
+                Abs64 => { if (relative) { absolute_sites.push(rva); } },
+                Pc32 => { if (!relative) { rebase_safe = false; } },
+                Rva32 => { if (!relative) { rebase_safe = false; } },
+                _ => { if (relative) { rebase_safe = false; } }
+            }
+            var segment = segments.get_mut(place.group).unwrap();
+            for (k in 0..width as usize) { *segment.data.get_mut(offset as usize + k).unwrap() = ((value >> (8 * k as ulong)) & 255) as byte; }
+        }
+    }
+    HashMap<String, ulong> globals = HashMap.new();
+    for (i in 0..inputs.len()) {
+        if (!*resolved.selected.get(i).unwrap()) { continue; }
+        var object = inputs.get(i).unwrap();
+        for (j in 0..object.symbols.len()) {
+            var item = object.symbols.get(j).unwrap();
+            match item.binding { Local => continue, _ => {} }
+            if (!model.defined(item.definition)) { continue; }
+            globals.insert(model.key(item.name), address(inputs, placements, segments, base,
+                SymbolId { input: model.InputId { index: i }, index: j }));
+        }
+    }
+    return Ok(Image { base: base, entry: entry_address, end_rva: cursor, segments: segments,
+        absolute_sites: absolute_sites, rebase_safe: rebase_safe, globals: globals });
+}

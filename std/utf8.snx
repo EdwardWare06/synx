@@ -1,0 +1,33 @@
+/// UTF-8 validation and conversion. Invalid byte sequences return None.
+pub String? decode(&const Vec<byte> bytes) {
+    usize i = 0;
+    while (i < bytes.len()) {
+        byte first = unsafe { *((bytes.as_ptr() as usize + i) as *const byte) };
+        usize count = 0;
+        uint value = 0;
+        uint minimum = 0;
+        if (first < 128) { count = 1; value = first as uint; }
+        else if (first >= 194 && first <= 223) { count = 2; value = (first & 31) as uint; minimum = 128; }
+        else if (first >= 224 && first <= 239) { count = 3; value = (first & 15) as uint; minimum = 2048; }
+        else if (first >= 240 && first <= 244) { count = 4; value = (first & 7) as uint; minimum = 65536; }
+        else { return None; }
+        if (count > bytes.len() - i) { return None; }
+        for (j in 1..count) {
+            byte next = unsafe { *((bytes.as_ptr() as usize + i + j) as *const byte) };
+            if (next < 128 || next > 191) { return None; }
+            value = (value << 6) | ((next & 63) as uint);
+        }
+        if (value < minimum || value > 1114111 || (value >= 55296 && value <= 57343)) { return None; }
+        i += count;
+    }
+    if (bytes.is_empty()) { return Some(String.new()); }
+    return Some(String.from(unsafe { str_from_raw(bytes.as_ptr(), bytes.len()) }));
+}
+
+pub Vec<byte> encode(&const str text) {
+    Vec<byte> bytes = Vec.new();
+    for (i in 0..text.len()) {
+        bytes.push(unsafe { *((text.as_ptr() as usize + i) as *const byte) });
+    }
+    return bytes;
+}

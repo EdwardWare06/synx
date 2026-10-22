@@ -1,0 +1,120 @@
+/// Deterministic strong-symbol resolution with lazy archive member selection.
+/// Explicit inputs load first. Archive members scan in input order to a fixed
+/// point; a member loads only when it defines a currently unresolved symbol.
+/// Duplicate definitions in unselected members are permitted. Inputs are unchanged.
+import link.model.{Object, SymbolId, InputId, Binding, Definition, Failure, Code};
+import link.model;
+import std.collections.HashMap;
+import std.utf8;
+
+pub struct Resolution {
+    pub Vec<bool> selected;
+    pub Vec<Vec<SymbolId>> targets;
+    pub SymbolId entry;
+}
+struct Need { String key; SymbolId origin; }
+struct State {
+    HashMap<String, SymbolId> definitions;
+    HashMap<String, bool> needed;
+    Vec<Need> order;
+    State new() { return State { definitions: HashMap.new(), needed: HashMap.new(), order: Vec.new() }; }
+    void need(&self, String key, SymbolId origin) {
+        if (self.needed.contains_key(key)) { return; }
+        self.needed.insert(String.from(key), true);
+        self.order.push(Need { key: key, origin: origin });
+    }
+    Result<bool, Failure> load(&self, &const Object object, usize index) {
+        for (i in 0..object.symbols.len()) {
+            var symbol = object.symbols.get(i).unwrap();
+            match symbol.binding { Local => continue, _ => {} }
+            var key = model.key(symbol.name);
+            var id = SymbolId { input: InputId { index: index }, index: i };
+            if (!model.defined(symbol.definition)) { self.need(key, id); continue; }
+            if (self.definitions.contains_key(key)) {
+                var name = utf8.decode(symbol.name).unwrap_or(model.key(symbol.name));
+                return Err(model.named(Code.Duplicate, index, i, name));
+            }
+            self.definitions.insert(key, id);
+        }
+        return Ok(true);
+    }
+    bool wanted(&const self, &const Object object) {
+        for (symbol in &const object.symbols) {
+            match symbol.binding { Local => continue, _ => {} }
+            if (!model.defined(symbol.definition)) { continue; }
+            var key = model.key(symbol.name);
+            if (self.needed.contains_key(key) && !self.definitions.contains_key(key)) { return true; }
+        }
+        return false;
+    }
+}
+Result<Vec<bool>, Failure> select(&State state, &const Vec<Object> inputs, &const str entry) {
+    Vec<bool> selected = Vec.new();
+    var entry_key = model.key(utf8.encode(entry));
+    state.need(String.from(entry_key), SymbolId { input: InputId { index: 0 }, index: 0 });
+    for (i in 0..inputs.len()) {
+        var object = inputs.get(i).unwrap();
+        var valid = model.validate(object, i)?;
+        selected.push(!object.archive_member);
+        if (!object.archive_member) { var loaded = state.load(object, i)?; }
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (i in 0..inputs.len()) {
+            if (*selected.get(i).unwrap()) { continue; }
+            if (state.wanted(inputs.get(i).unwrap())) {
+                var loaded = state.load(inputs.get(i).unwrap(), i)?;
+                *selected.get_mut(i).unwrap() = true; changed = true;
+            }
+        }
+    }
+    return Ok(selected);
+}
+/// Selects archive members using strong definitions without resolving imports.
+/// All records are validated, including records in inactive members. Entry is
+/// a selection root; its definition and executable address are checked by run.
+pub Result<Vec<bool>, Failure> active(&const Vec<Object> inputs, &const str entry) {
+    var state = State.new();
+    return select(&state, inputs, entry);
+}
+/// Entry must resolve to a byte inside a Text section. No weak/common semantics.
+/// Errors identify the input and record that caused the failure.
+pub Result<Resolution, Failure> run(&const Vec<Object> inputs, &const str entry) {
+    var state = State.new();
+    var selected = select(&state, inputs, entry)?;
+    var entry_key = model.key(utf8.encode(entry));
+    if (!state.definitions.contains_key(entry_key)) { return Err(model.fail(Code.Entry, 0, 0)); }
+    for (need in &const state.order) {
+        if (!state.definitions.contains_key(need.key)) {
+            var symbol = inputs.get(need.origin.input.index).unwrap().symbols.get(need.origin.index).unwrap();
+            var name = utf8.decode(symbol.name).unwrap_or(model.key(symbol.name));
+            return Err(model.named(Code.Unresolved, need.origin.input.index, need.origin.index, name));
+        }
+    }
+    var entry_id = *state.definitions.get(entry_key).unwrap();
+    var entry_object = inputs.get(entry_id.input.index).unwrap();
+    match entry_object.symbols.get(entry_id.index).unwrap().definition {
+        Section(index, offset) => {
+            var section = entry_object.sections.get(index).unwrap();
+            if (model.group(section.kind) != 0 || offset >= section.size) { return Err(model.fail(Code.Entry, entry_id.input.index, entry_id.index)); }
+        },
+        _ => return Err(model.fail(Code.Entry, entry_id.input.index, entry_id.index))
+    }
+    Vec<Vec<SymbolId>> targets = Vec.new();
+    for (i in 0..inputs.len()) {
+        Vec<SymbolId> row = Vec.new();
+        if (*selected.get(i).unwrap()) {
+            var object = inputs.get(i).unwrap();
+            for (j in 0..object.symbols.len()) {
+                var symbol = object.symbols.get(j).unwrap();
+                match symbol.binding {
+                    Local => row.push(SymbolId { input: InputId { index: i }, index: j }),
+                    _ => row.push(*state.definitions.get(model.key(symbol.name)).unwrap())
+                }
+            }
+        }
+        targets.push(row);
+    }
+    return Ok(Resolution { selected: selected, targets: targets, entry: entry_id });
+}

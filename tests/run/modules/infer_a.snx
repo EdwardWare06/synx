@@ -1,0 +1,3 @@
+const VALUE = 20;
+pub int first() { return helper(); }
+helper() { return VALUE; }

@@ -1,0 +1,3 @@
+const VALUE = 30;
+pub int second() { return helper(); }
+helper() { return VALUE; }

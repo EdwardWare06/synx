@@ -1,0 +1,43 @@
+/// CLI byte transport and host metadata. Native adapters: synx_driver.c.
+/// Inspection data can contain zero or malformed UTF-8 bytes.
+import bytes;
+import target.{Target, TargetOs};
+extern "C" {
+    int synx_rt_driver_host();
+    void synx_rt_driver_init();
+    int synx_rt_driver_write(int fd, *const byte data, usize length);
+    usize synx_rt_driver_float(double value, *byte output, usize capacity);
+}
+pub const &const str VERSION = "0.1.0";
+pub void init() { unsafe { synx_rt_driver_init(); } }
+pub Target host_target() {
+    int host = unsafe { synx_rt_driver_host() };
+    match host { 0 => return Target.new(TargetOs.Linux), 1 => return Target.new(TargetOs.Windows),
+        2 => return Target.new(TargetOs.MacOs), _ => panic("unsupported compiler host") }
+}
+pub &const str host_name() {
+    int host = unsafe { synx_rt_driver_host() };
+    match host { 0 => return "linux", 1 => return "windows", 2 => return "macos", _ => return "unknown" }
+}
+pub bool write(int fd, &const Vec<byte> data) { return unsafe { synx_rt_driver_write(fd, data.as_ptr(), data.len()) } == 0; }
+pub bool text(int fd, &const str text) { return unsafe { synx_rt_driver_write(fd, text.as_ptr(), text.len()) } == 0; }
+/// C++ inspection commands use printf("%s") or fputs, which stop at zero.
+pub bool cstring(int fd, &const Vec<byte> data) {
+    usize length = 0; while (length < data.len() && bytes.at(data, length) != 0) { length += 1; }
+    return unsafe { synx_rt_driver_write(fd, data.as_ptr(), length) } == 0;
+}
+pub Vec<byte> float_text(double value) {
+    Vec<byte> data = Vec.new(); for (i in 0..64) { data.push(0); }
+    usize length = unsafe { synx_rt_driver_float(value, data.as_mut_ptr(), data.len()) };
+    if (length == 0 || length >= 64) { panic("compiler float formatting failed"); }
+    while (data.len() > length) { var removed = data.pop(); } return data;
+}
+pub String hex(ulong value) {
+    Vec<byte> digits = Vec.new();
+    while (true) {
+        byte digit = (value & 15) as byte; digits.push(if (digit < 10) { 48 + digit } else { 97 + digit - 10 });
+        value >>= 4; if (value == 0) { break; }
+    }
+    String out = String.new(); usize i = digits.len();
+    while (i > 0) { i -= 1; out.push(bytes.at(digits, i) as char); } return out;
+}

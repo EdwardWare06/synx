@@ -1,0 +1,59 @@
+/// SHA-256 over a checked byte-vector subrange. Arithmetic reduces modulo 2^32.
+/// Used for Mach-O CodeDirectory page hashes; no native crypto boundary.
+ulong rotate(ulong x, ulong n) { return ((x >> n) | (x << (32 - n))) & 4294967295; }
+pub Vec<byte> digest(&const Vec<byte> input, usize start, usize size) {
+    if (start > input.len() || size > input.len() - start) { panic("SHA-256 range"); }
+    var constants = [
+        0x428a2f98 as ulong,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    ];
+    var state = [0x6a09e667 as ulong,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+    usize blocks = (size + 9 + 63) / 64;
+    ulong mask = 4294967295;
+    for (block in 0..blocks) {
+        Vec<ulong> words = Vec.new();
+        for (i in 0..16) {
+            ulong word = 0;
+            for (j in 0..4) {
+                usize at = block * 64 + i * 4 + j;
+                byte ch = 0;
+                if (at < size) { ch = *input.get(start + at).unwrap(); }
+                else if (at == size) { ch = 128; }
+                else if (at >= blocks * 64 - 8) { ch = (((size as ulong * 8) >> ((blocks * 64 - 1 - at) * 8)) & 255) as byte; }
+                word = (word << 8) | ch as ulong;
+            }
+            words.push(word);
+        }
+        for (i in 16..64) {
+            ulong a = *words.get(i - 15).unwrap(); ulong b = *words.get(i - 2).unwrap();
+            ulong s0 = rotate(a, 7) ^ rotate(a, 18) ^ (a >> 3);
+            ulong s1 = rotate(b, 17) ^ rotate(b, 19) ^ (b >> 10);
+            words.push((*words.get(i - 16).unwrap() + s0 + *words.get(i - 7).unwrap() + s1) & mask);
+        }
+        ulong a = state[0]; ulong b = state[1]; ulong c = state[2]; ulong d = state[3];
+        ulong e = state[4]; ulong f = state[5]; ulong g = state[6]; ulong h = state[7];
+        for (i in 0..64) {
+            ulong s1 = rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25);
+            ulong choice = (e & f) ^ ((~e & mask) & g);
+            ulong t1 = (h + s1 + choice + constants[i] + *words.get(i).unwrap()) & mask;
+            ulong s0 = rotate(a, 2) ^ rotate(a, 13) ^ rotate(a, 22);
+            ulong majority = (a & b) ^ (a & c) ^ (b & c);
+            ulong t2 = (s0 + majority) & mask;
+            h = g; g = f; f = e; e = (d + t1) & mask;
+            d = c; c = b; b = a; a = (t1 + t2) & mask;
+        }
+        state[0] = (state[0] + a) & mask; state[1] = (state[1] + b) & mask;
+        state[2] = (state[2] + c) & mask; state[3] = (state[3] + d) & mask;
+        state[4] = (state[4] + e) & mask; state[5] = (state[5] + f) & mask;
+        state[6] = (state[6] + g) & mask; state[7] = (state[7] + h) & mask;
+    }
+    Vec<byte> out = Vec.new();
+    for (i in 0..8) { for (j in 0..4) { out.push(((state[i] >> ((3 - j) * 8)) & 255) as byte); } }
+    return out;
+}

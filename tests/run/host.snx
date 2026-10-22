@@ -1,0 +1,135 @@
+import std.env;
+import std.thread;
+import std.task.pool;
+import std.fs;
+import std.path.Path;
+import std.process.{Command};
+import std.path.{host_style, Style};
+
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("host operation failed") } }
+void require(bool value) { if (!value) { panic("host assertion"); } }
+bool missing(fs.IoError error) {
+    match error.kind { NotFound => return true, _ => return false }
+}
+bool invalid(fs.IoError error) {
+    match error.kind { InvalidInput => return true, _ => return false }
+}
+int main() {
+    var args = env.args();
+    if (args.len() > 1) {
+        if (args[1] == String.from("--child")) {
+            require(args.len() == 11);
+            require(args[2] == String.from(""));
+            require(args[3] == String.from("two words"));
+            require(args[4] == String.from("quote\"inside"));
+            require(args[5] == String.from("trailing\\"));
+            require(args[6] == String.from("slash\\\"quote"));
+            require(args[7] == String.from("café λ"));
+            require(args[8] == String.from("$HOME & | ; > < %PATH% ! * ?"));
+            require(args[9] == String.from("line\nnext"));
+            var long_arg = String.new(); for (i in 0..8192) { long_arg.push('z'); }
+            require(args[10] == long_arg);
+            return 37;
+        }
+        if (args[1] == String.from("--environment")) {
+            var text = ok(env.get("SYNX_HOST_TEST_VALUE")).unwrap();
+            var expected = String.from("café λ ");
+            for (i in 0..5000) { expected.push('x'); }
+            require(text == expected);
+            require(ok(env.get("SYNX_HOST_CAFÉ_λ")).unwrap() == String.from("unicode name"));
+            require(ok(env.get("SYNX_HOST_TEST_EMPTY")).unwrap().is_empty());
+            require(ok(env.get("SYNX_HOST_TEST_ABSENT_793141")).is_none());
+            require(ok(fs.same_file("identity-a", "identity-b")));
+            require(ok(fs.same_file("identity-a", "identity-link")));
+            require(ok(fs.canonicalize("identity-a")) == ok(fs.canonicalize("./identity-a")));
+            if (ok(env.get("SYNX_HOST_TEST_SYMLINK")).is_some()) {
+                require(ok(fs.canonicalize("identity-a")) == ok(fs.canonicalize("identity-link")));
+            }
+            print("environment and file identity complete");
+            return 0;
+        }
+        if (args[1] == String.from("--invalid-utf8")) {
+            match env.get("SYNX_HOST_TEST_BAD") {
+                Err(error) => match error.kind { InvalidUtf8 => {}, _ => panic("expected invalid UTF-8") },
+                Ok(_) => panic("accepted invalid UTF-8"),
+            }
+            return 0;
+        }
+        if (args[1] == String.from("--noop")) { return 0; }
+        if (args[1] == String.from("--large-exit")) { return -1; }
+        panic("unknown host test argument");
+    }
+    require(ok(fs.same_file(".", "./")));
+    require(ok(fs.canonicalize(".")) == ok(fs.canonicalize("./")));
+    var missing_absolute = ok(fs.absolute("synx-nonexistent/../missing-target"));
+    require(Path.from(missing_absolute).is_absolute());
+    var dot_absolute = ok(fs.absolute("."));
+    require(ok(fs.same_file(dot_absolute, ".")));
+    match fs.absolute("") { Err(error) => match error.kind { InvalidInput => {}, _ => panic("absolute path error kind") }, Ok(_) => panic("empty absolute path") }
+    match fs.absolute("a\0b") { Err(error) => match error.kind { InvalidInput => {}, _ => panic("absolute zero byte error kind") }, Ok(_) => panic("absolute zero byte") }
+    var executable = ok(env.exe_path());
+    var path = Path.from(executable);
+    require(path.is_absolute());
+    require(ok(fs.metadata(executable)).is_file);
+    require(ok(fs.same_file(executable, executable)));
+    var absolute = ok(fs.canonicalize(executable));
+    require(ok(fs.same_file(executable, absolute)));
+    var command = Command.new(executable);
+    command.arg("--child");
+    command.arg(""); command.arg("two words"); command.arg("quote\"inside");
+    command.arg("trailing\\"); command.arg("slash\\\"quote"); command.arg("café λ");
+    command.arg("$HOME & | ; > < %PATH% ! * ?"); command.arg("line\nnext");
+    var long_arg = String.new(); for (i in 0..8192) { long_arg.push('z'); } command.arg(long_arg);
+    var status = ok(command.status());
+    require(!status.success()); require(status.code.unwrap() == 37); require(status.signal.is_none());
+    // A second call retains the command and all its arguments.
+    require(ok(command.status()).code.unwrap() == 37);
+    match host_style() {
+        Unix => {
+            var shell = Command.new("sh"); shell.arg("-c"); shell.arg("exit 0");
+            require(ok(shell.status()).success());
+            var killed = Command.new("sh"); killed.arg("-c"); killed.arg("kill -TERM $$");
+            var status = ok(killed.status());
+            require(status.code.is_none()); require(status.signal.unwrap() == 15);
+        }
+        Windows => {
+            var shell = Command.new("where.exe"); shell.arg("/q"); shell.arg("cmd.exe");
+            require(ok(shell.status()).success());
+            var large = Command.new(executable); large.arg("--large-exit");
+            require(ok(large.status()).code.unwrap() == (4294967295 as ulong));
+        }
+    }
+    var workers = Vec<std.thread.JoinHandle<bool>>.new();
+    for (i in 0..2) {
+        var program = String.from(executable);
+        workers.push(ok(std.thread.spawn(send once || { var child = Command.new(program); child.arg("--noop"); return ok(child.status()).success(); })));
+    }
+    while (!workers.is_empty()) { require(workers.pop().unwrap().join()); }
+    var pool = ok(std.task.pool.BlockingPool.new(1));
+    var program = String.from(executable);
+    var job = ok(pool.spawn(send once || { var child = Command.new(program); child.arg("--noop"); return ok(child.status()).success(); }));
+    require(ok(job.join())); pool.wait();
+    var directory = Command.new("."); require(directory.status().is_err());
+    var nul_program = Command.new("bad\0program"); require(nul_program.status().is_err());
+    match host_style() {
+        Windows => {
+            ok(fs.write_text("synx-no-shell.cmd", "@echo off\r\necho unexpected > synx-shell-ran.txt\r\n"));
+            var batch = Command.new(".\\synx-no-shell.cmd"); require(batch.status().is_err());
+            require(!ok(fs.exists("synx-shell-ran.txt"))); ok(fs.remove("synx-no-shell.cmd"));
+        }
+        Unix => {}
+    }
+    var absent = Command.new("synx-absent-executable-793141");
+    match absent.status() { Err(error) => require(missing(error)), Ok(_) => panic("missing executable accepted") }
+    var empty = Command.new("");
+    match empty.status() { Err(error) => require(invalid(error)), Ok(_) => panic("empty executable accepted") }
+    var bad = Command.new(executable); bad.arg("a\0b");
+    match bad.status() { Err(error) => require(invalid(error)), Ok(_) => panic("NUL argument accepted") }
+    match env.get("bad=name") { Err(error) => require(invalid(error)), Ok(_) => panic("invalid environment name") }
+    match env.get("") { Err(error) => require(invalid(error)), Ok(_) => panic("empty environment name") }
+    match env.get("bad\0name") { Err(error) => require(invalid(error)), Ok(_) => panic("NUL environment name") }
+    match fs.canonicalize("synx-missing-file-793141") { Err(error) => require(missing(error)), Ok(_) => panic("missing canonical path") }
+    match fs.same_file(executable, "synx-missing-file-793141") { Err(error) => require(missing(error)), Ok(_) => panic("missing identity") }
+    print("process arguments and host paths complete");
+    return 0;
+}

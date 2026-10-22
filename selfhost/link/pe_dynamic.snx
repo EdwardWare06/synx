@@ -1,0 +1,115 @@
+/// PE import synthesis. Import names identify function exports; each export gets
+/// a RIP-relative jump thunk and an __imp_ address-table alias. The catalog must
+/// exclude data exports. All source records remain owned by the caller.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
+import link.model;
+import link.imports.Import;
+import link.buffer.{Buffer, align, LIMIT};
+import std.utf8;
+import std.collections.HashMap;
+
+struct Library { String name; Vec<usize> members; }
+pub struct Prepared { pub Vec<Object> inputs; pub ulong directory_size; pub ulong iat_size; }
+
+Vec<byte> bytes(&const Vec<byte> source) {
+    Vec<byte> out = Vec.new(); for (ch in source) { out.push(*ch); } return out;
+}
+Object copy_object(&const Object source) {
+    var out = Object.new(source.name.as_str(), source.archive_member);
+    for (section in &const source.sections) {
+        out.sections.push(Section { kind: section.kind, alignment: section.alignment,
+            data: bytes(section.data), size: section.size });
+    }
+    for (symbol in &const source.symbols) {
+        out.symbols.push(Symbol { name: bytes(symbol.name), binding: symbol.binding, definition: symbol.definition });
+    }
+    for (relocation in &const source.relocations) { out.relocations.push(*relocation); }
+    return out;
+}
+usize local(&Object object, usize section, ulong offset) {
+    usize index = object.symbols.len();
+    object.symbols.push(Symbol.new("pe-local", Binding.Local, Definition.Section(section, offset)));
+    return index;
+}
+void relocation(&Object object, usize section, ulong offset, usize symbol, RelocKind kind, long addend) {
+    object.relocations.push(Relocation { section: section, offset: offset, symbol: symbol, kind: kind, addend: addend });
+}
+/// Builds one mandatory object containing descriptors, lookup/name tables, a
+/// writable IAT, and function thunks. Reserved globals locate PE data directories
+/// after ordinary image layout. Empty catalogs produce no synthetic sections.
+pub Result<Prepared, Failure> prepare(&const Vec<Object> inputs, &const Vec<Import> catalog) {
+    Vec<Library> libraries = Vec.new();
+    HashMap<String, bool> seen = HashMap.new(); HashMap<String, usize> groups = HashMap.new();
+    // Bound aggregate metadata before allocating any import buffers.
+    ulong budget = 20;
+    for (i in 0..catalog.len()) {
+        var item = catalog.get(i).unwrap();
+        if (item.name.is_empty() || item.library.is_empty()) { return Err(model.fail(Code.Invalid, 0, i)); }
+        for (ch in &const item.name) { if (*ch == 0) { return Err(model.fail(Code.Invalid, 0, i)); } }
+        var library_bytes = utf8.encode(item.library.as_str());
+        for (ch in &const library_bytes) {
+            // These are simple DLL filenames, never filesystem search paths.
+            if (*ch < 33 || *ch > 126 || *ch == 47 || *ch == 92 || *ch == 58) { return Err(model.fail(Code.Unsupported, 0, i)); }
+        }
+        if (item.name.len() as ulong > LIMIT || library_bytes.len() as ulong > LIMIT) { return Err(model.fail(Code.Range, 0, i)); }
+        ulong cost = item.name.len() as ulong + library_bytes.len() as ulong + 96;
+        if (cost > LIMIT - budget) { return Err(model.fail(Code.Range, 0, i)); }
+        budget += cost;
+        var key = model.key(item.name);
+        if (seen.contains_key(key)) { return Err(model.fail(Code.Duplicate, 0, i)); }
+        seen.insert(key, true);
+        usize group = libraries.len();
+        match groups.get(item.library) { Some(index) => { group = *index; }, None => {} }
+        if (group == libraries.len()) {
+            groups.insert(String.from(item.library.as_str()), group);
+            libraries.push(Library { name: String.from(item.library.as_str()), members: Vec.new() });
+        }
+        libraries.get_mut(group).unwrap().members.push(i);
+    }
+    Vec<Object> owned = Vec.new();
+    for (object in inputs) { owned.push(copy_object(object)); }
+    if (catalog.is_empty()) { return Ok(Prepared { inputs: owned, directory_size: 0, iat_size: 0 }); }
+    var object = Object.new("<pe-imports>", false);
+    var text = Buffer.new(); var names = Buffer.new(); var iat = Buffer.new();
+    ulong directory_size = (libraries.len() as ulong + 1) * 20;
+    var descriptors = names.pad(directory_size)?;
+    object.symbols.push(Symbol.new("__synx_pe_import_directory", Binding.Global, Definition.Section(1, 0)));
+    object.symbols.push(Symbol.new("__synx_pe_iat_start", Binding.Global, Definition.Section(2, 0)));
+    for (g in 0..libraries.len()) {
+        var library = libraries.get(g).unwrap();
+        ulong descriptor = g as ulong * 20;
+        usize dll_symbol = local(&object, 1, names.data.len() as ulong);
+        var dll_bytes = utf8.encode(library.name.as_str()); names.append(dll_bytes); names.word(0, 1);
+        relocation(&object, 1, descriptor + 12, dll_symbol, RelocKind.Rva32, 0);
+        ulong aligned = align(names.data.len() as ulong, 8)?; var padding = names.pad(aligned)?;
+        ulong lookup_start = names.data.len() as ulong;
+        usize lookup_symbol = local(&object, 1, lookup_start);
+        var lookup_space = names.pad(lookup_start + (library.members.len() as ulong + 1) * 8)?;
+        relocation(&object, 1, descriptor, lookup_symbol, RelocKind.Rva32, 0);
+        usize iat_symbol = local(&object, 2, iat.data.len() as ulong);
+        relocation(&object, 1, descriptor + 16, iat_symbol, RelocKind.Rva32, 0);
+        for (j in 0..library.members.len()) {
+            var item = catalog.get(*library.members.get(j).unwrap()).unwrap();
+            ulong even = align(names.data.len() as ulong, 2)?; var hint_padding = names.pad(even)?;
+            usize hint_symbol = local(&object, 1, names.data.len() as ulong);
+            names.word(0, 2); names.append(item.name); names.word(0, 1);
+            relocation(&object, 1, lookup_start + j as ulong * 8, hint_symbol, RelocKind.Rva32, 0);
+            ulong slot = iat.data.len() as ulong; iat.word(0, 8);
+            relocation(&object, 2, slot, hint_symbol, RelocKind.Rva32, 0);
+            usize slot_symbol = local(&object, 2, slot);
+            Vec<byte> alias = utf8.encode("__imp_"); for (ch in &const item.name) { alias.push(*ch); }
+            object.symbols.push(Symbol { name: alias, binding: Binding.Global, definition: Definition.Section(2, slot) });
+            object.symbols.push(Symbol { name: bytes(item.name), binding: Binding.Global, definition: Definition.Section(0, text.data.len() as ulong) });
+            // jmp qword ptr [rip + disp32]. Function addresses refer to this thunk.
+            text.word(0xff, 1); text.word(0x25, 1);
+            relocation(&object, 0, text.data.len() as ulong, slot_symbol, RelocKind.Pc32, -4); text.word(0, 4);
+        }
+        iat.word(0, 8);
+    }
+    ulong iat_size = iat.data.len() as ulong;
+    object.sections.push(Section.new(SectionKind.Text, 16, text.data));
+    object.sections.push(Section.new(SectionKind.ReadOnly, 8, names.data));
+    object.sections.push(Section.new(SectionKind.Data, 8, iat.data));
+    owned.push(object);
+    return Ok(Prepared { inputs: owned, directory_size: directory_size, iat_size: iat_size });
+}

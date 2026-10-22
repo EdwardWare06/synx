@@ -1,0 +1,83 @@
+/// Independent Windows import fixture. Runs on either compiler host; only the
+/// emitted PE is Windows-specific. No system linker is called by this probe.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure};
+import link.model;
+import link.imports.Import;
+import link.pe;
+import link.buffer.Buffer;
+import std.env;
+import std.fs;
+import std.path.Path;
+import std.utf8;
+
+void require(bool value) { if (!value) { panic("PE dynamic fixture failed"); } }
+T expect<T>(Result<T, Failure> result) { match result { Ok(value) => return value, Err(_) => panic("PE dynamic writer failed") } }
+void fix(&Object object, &Buffer text, usize symbol, RelocKind kind, long addend) {
+    object.relocations.push(Relocation { section: 0, offset: text.data.len() as ulong, symbol: symbol, kind: kind, addend: addend });
+    text.word(0, model.width(kind) as usize);
+}
+void emit(&Buffer text, &const str hex) {
+    for (i in 0..hex.len() / 2) {
+        byte a = unsafe { *((hex.as_ptr() as usize + i * 2) as *const byte) };
+        byte b = unsafe { *((hex.as_ptr() as usize + i * 2 + 1) as *const byte) };
+        a = if (a <= 57) { a - 48 } else { a - 87 }; b = if (b <= 57) { b - 48 } else { b - 87 };
+        text.data.push((a << 4) | b);
+    }
+}
+Vec<Object> fixture(bool pic) {
+    var object = Object.new("PE import fixture", false);
+    object.symbols.push(Symbol.new("entry", Binding.Global, Definition.Section(0, 0)));
+    object.symbols.push(Symbol.new("__imp_GetCurrentProcessId", Binding.Global, Definition.Undefined));
+    object.symbols.push(Symbol.new("abs", Binding.Global, Definition.Undefined));
+    object.symbols.push(Symbol.new("ExitProcess", Binding.Global, Definition.Undefined));
+    object.symbols.push(Symbol.new("zero", Binding.Local, Definition.Section(1, 0)));
+    object.symbols.push(Symbol.new("failure", Binding.Local, Definition.Section(0, 0)));
+    var text = Buffer.new();
+    emit(&text, "4883ec28ff15"); fix(&object, &text, 1, RelocKind.Pc32, -4);
+    emit(&text, "85c00f84"); fix(&object, &text, 5, RelocKind.Pc32, -4);
+    emit(&text, "48833d"); fix(&object, &text, 4, RelocKind.Pc32, -5); emit(&text, "000f85"); fix(&object, &text, 5, RelocKind.Pc32, -4);
+    emit(&text, "b9d6ffffff");
+    if (pic) { emit(&text, "488d05"); fix(&object, &text, 2, RelocKind.Pc32, -4); }
+    else { emit(&text, "48b8"); fix(&object, &text, 2, RelocKind.Abs64, 0); }
+    emit(&text, "ffd089c1e8"); fix(&object, &text, 3, RelocKind.Pc32, -4); emit(&text, "cc");
+    object.symbols.get_mut(5).unwrap().definition = Definition.Section(0, text.data.len() as ulong);
+    emit(&text, "b907000000e8"); fix(&object, &text, 3, RelocKind.Pc32, -4); emit(&text, "cc");
+    object.sections.push(Section.new(SectionKind.Text, 16, text.data)); object.sections.push(Section.bss(8, 8));
+    Vec<Object> objects = Vec.new(); objects.push(object); return objects;
+}
+Vec<Import> catalog() {
+    Vec<Import> out = Vec.new();
+    out.push(Import { name: utf8.encode("GetCurrentProcessId"), library: String.from("kernel32.dll") });
+    out.push(Import { name: utf8.encode("abs"), library: String.from("msvcrt.dll") });
+    out.push(Import { name: utf8.encode("ExitProcess"), library: String.from("kernel32.dll") });
+    return out;
+}
+void negative_checks() {
+    var objects = fixture(false); var imports = catalog();
+    imports.push(Import { name: utf8.encode("abs"), library: String.from("kernel32.dll") });
+    match pe.write_dynamic(objects, "entry", imports) { Err(error) => require(match error.code { Duplicate => true, _ => false }), Ok(_) => panic("duplicate import accepted") }
+    var duplicate = imports.pop();
+    imports.get_mut(0).unwrap().library = String.from("../kernel32.dll");
+    match pe.write_dynamic(objects, "entry", imports) { Err(error) => require(match error.code { Unsupported => true, _ => false }), Ok(_) => panic("import path accepted") }
+    imports.get_mut(0).unwrap().library = String.from("kernel32.dll");
+    imports.get_mut(0).unwrap().name.push(0);
+    match pe.write_dynamic(objects, "entry", imports) { Err(error) => require(match error.code { Invalid => true, _ => false }), Ok(_) => panic("NUL import accepted") }
+}
+pub void run() {
+    negative_checks(); var args = env.args(); require(args.len() == 2);
+    var objects = fixture(false); var imports = catalog();
+    var first = expect(pe.write_dynamic(objects, "entry", imports));
+    var second = expect(pe.write_dynamic(objects, "entry", imports));
+    require(first.len() == second.len());
+    for (i in 0..first.len()) { require(*first.get(i).unwrap() == *second.get(i).unwrap()); }
+    require(*objects.get(0).unwrap().sections.get(0).unwrap().data.get(6).unwrap() == 0);
+    var directory = Path.from(args.get(1).unwrap().as_str());
+    match fs.write(directory.join("dynamic.exe").as_str(), first) { Ok(_) => {}, Err(_) => panic("cannot write dynamic PE") }
+    var pic_objects = fixture(true); var pic = expect(pe.write_dynamic(pic_objects, "entry", imports));
+    match fs.write(directory.join("dynamic-pic.exe").as_str(), pic) { Ok(_) => {}, Err(_) => panic("cannot write PIC PE") }
+    // A zero-sized BSS group still reserves a page in image layout. Its PE
+    // placeholder must precede .reloc so the loader sees adjacent section RVAs.
+    pic_objects.get_mut(0).unwrap().sections.get_mut(1).unwrap().size = 0;
+    var empty = expect(pe.write_dynamic(pic_objects, "entry", imports));
+    match fs.write(directory.join("dynamic-empty.exe").as_str(), empty) { Ok(_) => {}, Err(_) => panic("cannot write empty-BSS PE") }
+}

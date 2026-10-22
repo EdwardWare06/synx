@@ -1,0 +1,23 @@
+/// Build native fixture executables through the built-in writers, with no
+/// external linker invocation in this program. Native checks run before output.
+import link.native_checks;
+import link.pe;
+import link.elf;
+import link.model.Failure;
+import std.env;
+import std.fs;
+import std.path.Path;
+
+T expect<T>(Result<T, Failure> value) { match value { Ok(item) => return item, Err(_) => panic("native writer failed") } }
+pub void run() {
+    native_checks.run();
+    var args = env.args(); if (args.len() != 2) { panic("usage: native_probe <output-directory>"); }
+    var directory = Path.from(args.get(1).unwrap().as_str());
+    var windows = native_checks.fixture(true); var linux = native_checks.fixture(false);
+    var pe_bytes = expect(pe.write(windows, "entry")); var elf_bytes = expect(elf.write(linux, "entry"));
+    // Both writers must preserve the caller's relocation fields.
+    if (*windows.get(2).unwrap().sections.get(0).unwrap().data.get(2).unwrap() != 0 ||
+        *linux.get(2).unwrap().sections.get(0).unwrap().data.get(2).unwrap() != 0) { panic("linker changed input"); }
+    match fs.write(directory.join("linked.exe").as_str(), pe_bytes) { Ok(_) => {}, Err(_) => panic("cannot write PE fixture") }
+    match fs.write(directory.join("linked.elf").as_str(), elf_bytes) { Ok(_) => {}, Err(_) => panic("cannot write ELF fixture") }
+}

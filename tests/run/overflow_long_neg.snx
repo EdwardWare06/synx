@@ -1,0 +1,1 @@
+main() { long value = -9223372036854775808; long result = -value; if (result != -9223372036854775808) { panic("wrong release negation"); } }

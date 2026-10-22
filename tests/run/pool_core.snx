@@ -1,0 +1,36 @@
+import std.task.pool.{Executor,Spawner,Join};
+import std.task.yield_now;
+import std.sync.{Arc,AtomicUsize,Cell};
+import std.thread;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("pool error") } }
+void require(bool value) { if (!value) { panic("pool assertion failed"); } }
+async send int work(int n, Arc<AtomicUsize> count) {
+    var cell = Cell.new(n);
+    var reference = &const cell;
+    usize pinned = (&const cell as *const Cell<int>) as usize;
+    for (i in 0..8) { await yield_now(); count.get().fetch_add(1); }
+    require(pinned == ((&const cell as *const Cell<int>) as usize));
+    return reference.get();
+}
+async send int parent(Spawner spawner, Arc<AtomicUsize> count) { var child = ok(spawner.spawn(work(9,count))); return ok(await child) + 1; }
+async send fn once send() -> String callback() { await yield_now(); var text = String.from("moved callback"); return send once || text; }
+main() {
+    var executor = ok(Executor.new(4));
+    var count = Arc.new(AtomicUsize.new(0));
+    var handles = Vec<Join<int>>.new();
+    for (i in 0..128) { handles.push(ok(executor.spawn(work(i,count.clone())))); }
+    int total = 0;
+    while (!handles.is_empty()) { total += ok(handles.pop().unwrap().join()); }
+    print("{total} {count.get().load()}");
+    print("{ok(ok(executor.spawn(parent(executor.spawner(),count.clone()))).join())}");
+    var callable = ok(ok(executor.spawn(callback())).join());
+    String text = callable(); print(text);
+    var task = work(5,count.clone());
+    var native = ok(thread.spawn(send once || task));
+    print("{ok(ok(executor.spawn(native.join())).join())}");
+    executor.wait();
+    executor.shutdown();
+    require(executor.spawn(work(0,count.clone())).is_err());
+    require(Executor.new(0).is_err());
+    print("pool complete");
+}

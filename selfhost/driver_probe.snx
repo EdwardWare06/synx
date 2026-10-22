@@ -1,0 +1,46 @@
+/// Stage 7 host-independent records. Tests supply paths through environment.
+/// The native CLI/build tests use main.snx after Axon integration.
+import driver_options;
+import driver_paths;
+import target.{Target, TargetOs};
+import prelude_source;
+import std.fs;
+import std.env;
+import std.binary;
+import bytes;
+void put(&Vec<byte> out, ulong value, usize width) { if (!binary.write_uint(&*out, value, width, true)) { panic("driver probe integer"); } }
+void string(&Vec<byte> out, &const str text) { put(&*out, text.len() as ulong, 8); bytes.text(&*out, text); }
+void blob(&Vec<byte> out, &const Vec<byte> data) { put(&*out, data.len() as ulong, 8); bytes.append(&*out, data); }
+main() {
+    var args = env.args(); if (args.len() != 2) { panic("usage: driver_probe <report>"); }
+    Vec<byte> out = Vec.new(); blob(&out, prelude_source.source());
+    Vec<TargetOs> systems = Vec.new(); systems.push(TargetOs.Linux); systems.push(TargetOs.Windows); systems.push(TargetOs.MacOs);
+    Vec<String> sources = Vec.new(); sources.push(String.from("main.snx")); sources.push(String.from("dir/with space.snx"));
+    sources.push(String.from("dir/.hidden")); sources.push(String.from("dir/name.")); sources.push(String.from("café/λ.snx"));
+    for (os in &const systems) {
+        for (source in &const sources) {
+            var opts = driver_options.BuildOptions.new(Target.new(*os)); opts.input = String.from(source);
+            var output = driver_paths.output_path(opts); string(&out, output); string(&out, driver_paths.object_path(output, opts.target));
+        }
+        var command = driver_paths.link_command(Target.new(*os), "objects/a quote' &.o", "runtime/lib café.a", "outputs/λ $(literal)");
+        string(&out, command.program); put(&out, command.arguments.len() as ulong, 8);
+        for (arg in &const command.arguments) { string(&out, arg); }
+        for (variant in 0..7) {
+            Vec<String> flags = Vec.new(); flags.push(String.from("synx")); flags.push(String.from("build"));
+            if (variant == 0) { flags.push(String.from("test.snx")); }
+            if (variant == 1) { flags.push(String.from("--release")); flags.push(String.from("--no-regalloc")); flags.push(String.from("--keep-obj")); flags.push(String.from("-v")); flags.push(String.from("first.snx")); flags.push(String.from("last.snx")); flags.push(String.from("-o")); flags.push(String.from("literal & output")); }
+            if (variant == 2) { flags.push(String.from("--unknown")); }
+            if (variant == 3) { flags.push(String.from("-o")); }
+            if (variant == 4) { flags.push(String.from("-o")); flags.push(String.from("output")); }
+            if (variant == 5) { flags.push(String.from("")); }
+            if (variant == 6) { flags.push(String.from("--verbose")); flags.push(String.from("-o")); flags.push(String.from("--release")); flags.push(String.from("main.snx")); }
+            match driver_options.parse(flags, Target.new(*os)) {
+                Err(message) => { put(&out, 0, 1); string(&out, message); },
+                Ok(options) => { put(&out, 1, 1); string(&out, options.input); string(&out, options.output);
+                    put(&out, if (options.keep_object) { 1 } else { 0 }, 1); put(&out, if (options.verbose) { 1 } else { 0 }, 1);
+                    put(&out, if (options.target.register_allocation) { 1 } else { 0 }, 1); put(&out, if (options.target.checked_arithmetic) { 1 } else { 0 }, 1); },
+            }
+        }
+    }
+    match fs.write(args.get(1).unwrap().as_str(), out) { Ok(_) => {}, Err(_) => panic("driver report I/O failed") }
+}

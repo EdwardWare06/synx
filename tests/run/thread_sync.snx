@@ -1,0 +1,44 @@
+import std.thread;
+import std.sync.{Arc, Mutex, AtomicUsize, AtomicLong, AtomicBool, Cell, Condvar};
+import std.mem;
+thread.JoinHandle<T> started<T: Send + Owned>(Result<thread.JoinHandle<T>, thread.ThreadError> result) {
+    match result { Ok(handle) => return handle, Err(_) => panic("spawn failed") }
+}
+struct State { Mutex<int> value; Condvar ready; }
+main() {
+    var state = Arc.new(State { value: Mutex.new(0), ready: Condvar.new() });
+    var other = state.clone();
+    var worker = started(thread.spawn(send once || {
+        thread.sleep_ms(1);
+        var guard = other.get().value.lock();
+        *guard.get_mut() = 9;
+        other.get().ready.notify_one();
+    }));
+    {
+        var shared = state.get();
+        var guard = shared.value.lock();
+        while (*guard.get() == 0) { shared.ready.wait(&guard); }
+        print("{*guard.get()}");
+        print("{shared.value.try_lock().is_none()}");
+    }
+    worker.join();
+    var atomic = AtomicUsize.new(18446744073709551615 as usize);
+    print("{atomic.fetch_add(1)} {atomic.load()} {atomic.fetch_sub(1)} {atomic.load()}");
+    atomic.store(3); print("{atomic.swap(4)}");
+    match atomic.compare_exchange(3, 8) { Err(old) => print("miss {old}"), Ok(_) => panic("cas should fail") }
+    match atomic.compare_exchange(4, 8) { Ok(old) => print("hit {old}"), Err(_) => panic("cas should succeed") }
+    var signed = AtomicLong.new(9223372036854775807 as long);
+    signed.fetch_add(1); print("{signed.load()}");
+    var flag = AtomicBool.new(false);
+    flag.store(true); print("{flag.load()} {flag.swap(false)}");
+    match flag.compare_exchange(false, true) { Ok(old) => print("flag {old}"), Err(_) => panic("flag cas failed") }
+    var cell = Cell.new(1);
+    print("{cell.replace(2)} {cell.get()}");
+    var job = started(thread.spawn(send once || { cell.set(7); return cell.get(); }));
+    print("{job.join()}");
+    var protected = Arc.new(Mutex.new(Cell.new(10)));
+    var clone = protected.clone();
+    started(thread.spawn(send once || { var guard = clone.get().lock(); guard.get().set(11); })).join();
+    { var guard = protected.get().lock(); print("{guard.get().get()}"); }
+    thread.yield_now();
+}

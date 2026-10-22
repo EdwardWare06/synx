@@ -1,0 +1,2 @@
+import link.pe_dynamic_probe;
+main() { pe_dynamic_probe.run(); }

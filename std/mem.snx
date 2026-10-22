@@ -1,0 +1,23 @@
+/// Consume a value and run its cleanup when this function returns.
+pub void drop<T>(T value) {}
+
+/// Replace a value without dropping it; return its previous owner.
+pub T replace<T>(&T place, T value) {
+    unsafe {
+        var pointer = place as *T;
+        T previous = *pointer;
+        *pointer = value;
+        return previous;
+    }
+}
+
+/// Exchange two values without copying or dropping either value.
+pub void swap<T>(&T left, &T right) {
+    unsafe {
+        var a = left as *T;
+        var b = right as *T;
+        T temporary = *a;
+        *a = *b;
+        *b = temporary;
+    }
+}

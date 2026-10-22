@@ -1,0 +1,63 @@
+// Structs, traits, enums, generics, and match.
+
+import std.math.sqrt;
+
+trait Shape {
+    double area(&const self);
+    &const str name(&const self);
+}
+
+struct Circle {
+    double r;
+}
+
+struct Rect {
+    double w;
+    double h;
+
+    Rect square(double side) {
+        return Rect { w: side, h: side };
+    }
+}
+
+impl Shape for Circle {
+    double area(&const self) { return 3.14159 * self.r * self.r; }
+    &const str name(&const self) { return "circle"; }
+}
+
+impl Shape for Rect {
+    double area(&const self) { return self.w * self.h; }
+    &const str name(&const self) { return "rect"; }
+}
+
+/// Returns the larger of two shapes by area.
+&const T bigger<T: Shape>(&const T a, &const T b) {
+    if (a.area() > b.area()) { return a; } else { return b; }
+}
+
+enum Token {
+    Number(int),
+    Plus,
+    End,
+}
+
+describe(&const Token t) {
+    return match t {
+        Token.Number(n) => "number {n}",
+        Token.Plus => String.from("plus"),
+        Token.End => String.from("end"),
+    };
+}
+
+int main() {
+    var a = Rect.square(2.0);
+    var b = Rect { w: 1.0, h: 5.0 };
+    var big = bigger(&const a, &const b);
+    print("{big.name()} with area {big.area()}");
+
+    Token[3] tokens = [Token.Number(4), Token.Plus, Token.End];
+    for (t in &const tokens) {
+        print(describe(t));
+    }
+    return 0;
+}

@@ -1,0 +1,32 @@
+void require(bool value) { if (!value) { panic("integer limit test failed"); } }
+main() {
+    long minimum = -9223372036854775808L;
+    require(minimum == -9223372036854775807L - 1L);
+    require((9223372036854775807L + 0L) == 9223372036854775807L);
+    require((minimum - 0L) == minimum && (minimum * 1L) == minimum);
+    ulong big = 18446744073709551615;
+    require(big * 1 == big && big / 1 == big && big % 1 == 0);
+    require((4294967295 as ulong) * (4294967295 as ulong) == 18446744065119617025);
+    require(((1 as ulong) << 63) == 9223372036854775808);
+    byte bits = 255; require((bits << 7) == (128 as byte));
+    require((-8 >> 1) == -4);
+    uint product = 65535; product *= 65535; require(product == 4294836225);
+    int count = 0;
+    for (i in 2147483646..=2147483647) { count += 1; continue; }
+    require(count == 2);
+    count = 0;
+    for (i in (254 as byte)..=(255 as byte)) { count += 1; }
+    require(count == 2);
+    count = 0;
+    for (i in (18446744073709551615 as ulong)..=(18446744073709551615 as ulong)) { count += 1; continue; }
+    require(count == 1);
+    var single = 9223372036854775807L..=9223372036854775807L;
+    count = 0;
+    for (i in single) { count += 1; break; }
+    require(count == 1);
+    count = 0;
+    for (i in -3..=-1) { count += 1; }
+    require(count == 3);
+    for (i in 3..=2) { panic("reversed range ran"); }
+    print("integer limits ok");
+}

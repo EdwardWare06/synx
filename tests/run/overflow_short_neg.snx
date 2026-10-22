@@ -1,0 +1,1 @@
+main() { short value = -32768; short result = -value; if (result != -32768) { panic("wrong release negation"); } }

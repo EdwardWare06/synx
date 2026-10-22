@@ -1,0 +1,33 @@
+import link.coff;
+import link.macho_object;
+import link.model.Failure;
+import link.model.Object;
+import link.startup;
+import link.imports;
+import link.pe;
+import link.macho;
+import link.capsule;
+import std.env;
+import std.fs;
+import std.path.Path;
+T expect<T>(Result<T, Failure> value) {
+    return match value { Ok(value) => value, Err(error) => panic("link failure input={error.input} record={error.record}") };
+}
+T io<T>(Result<T, fs.IoError> value) { return match value { Ok(value) => value, Err(_) => panic("file IO failed") }; }
+main() {
+    var args = env.args();
+    if (args.len() != 5) { panic("usage: probe windows|macos object output runtime"); }
+    int os = if (args.get(1).unwrap().as_str() == "windows") { 1 } else { 2 };
+    var data = io(fs.read(args.get(2).unwrap().as_str()));
+    var object = if (os == 1) { expect(coff.read(data, "input", false)) } else { expect(macho_object.read(data, "input", false)) };
+    Vec<Object> inputs = Vec.new(); inputs.push(object); inputs.push(startup.make(os));
+    var imports = expect(imports.collect(inputs, if (os == 1) { "synx_rt.dll" } else { "@rpath/libsynx_rt.dylib" }, os));
+    if (os == 1) { var runtime = io(fs.read(args.get(4).unwrap().as_str())); var checked = expect(capsule.validate(runtime, imports, os)); }
+    var output = if (os == 1) { expect(pe.write_dynamic(inputs, "__synx_start", imports)) } else { expect(macho.write_dynamic(inputs, "__synx_start", imports)) };
+    var written = io(fs.write(args.get(3).unwrap().as_str(), output));
+    if (os == 1) {
+        var destination = Path.from(args.get(3).unwrap().as_str()).parent().unwrap_or(Path.from(".")).join("synx_rt.dll");
+        var runtime = io(fs.read(args.get(4).unwrap().as_str()));
+        var copied = io(fs.write(destination.as_str(), runtime));
+    }
+}

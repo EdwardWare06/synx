@@ -1,0 +1,80 @@
+/// Source-to-executable orchestration. Source: compiler/src/build.cpp.
+/// Compilation owns every source, semantic record and IR value until Axon ends.
+/// The system linker inherits standard streams; no shell parses path arguments.
+import driver_options.BuildOptions;
+import driver_paths;
+import driver_io;
+import compile.Compilation;
+import prelude_source;
+import axon.Axon;
+import objfile.{ObjectFile, write_object};
+import std.fs;
+import std.mem;
+import link.linker;
+import link.model;
+
+pub struct BuildResult {
+    pub bool ok;
+    pub String executable;
+    pub String object;
+    pub BuildResult failed() { return BuildResult { ok: false, executable: String.new(), object: String.new() }; }
+}
+pub void report(&const Compilation compilation) {
+    driver_io.cstring(2, compilation.diagnostics());
+    usize errors = compilation.lowerer.ck.r.sink.errors;
+    var suffix = if (errors == 1) { "" } else { "s" };
+    driver_io.text(2, "{errors} error{suffix}\n");
+}
+pub bool prelude_error(&const Compilation compilation) {
+    if (!compilation.prelude_sink.has_errors()) { return false; }
+    driver_io.text(2, "internal error: the prelude does not check\n");
+    driver_io.cstring(2, compilation.prelude_diagnostics()); return true;
+}
+pub BuildResult program(&const BuildOptions options) {
+    var loaded = Compilation.load(options.input, prelude_source.source(), "", 5, true);
+    match loaded {
+        Err(_) => { driver_io.text(2, "cannot read file: {options.input}\n"); return BuildResult.failed(); },
+        Ok(compilation) => {
+            if (prelude_error(compilation)) { return BuildResult.failed(); }
+            var ax = Axon.new(options.target);
+            if (compilation.ok) {
+                compilation.ok = ax.generate(&compilation.lowerer.ck, &const compilation.trees, &compilation.lowerer.module);
+            }
+            if (!compilation.ok) { report(compilation); return BuildResult.failed(); }
+            var obj = mem.replace(&ax.obj, ObjectFile.new());
+            var executable = driver_paths.output_path(options);
+            var object = driver_paths.object_path(executable, options.target);
+            var data = write_object(obj, options.target.format());
+            match fs.write(object, data) {
+                Err(_) => { driver_io.text(2, "cannot write {object}\n"); return BuildResult.failed(); }, Ok(_) => {}
+            }
+            if (options.verbose) {
+                usize functions = compilation.lowerer.module.functions.len(); usize code = obj.text.len();
+                var target_name = options.target.name();
+                driver_io.text(2, "Dendrite IR: {functions} functions\nAxon code generator: {target_name}, {code} bytes of code\n");
+            }
+            if (driver_paths.selected_linker(options) == 0) {
+                var capsule = driver_paths.runtime_capsule(options.target);
+                if (capsule.is_empty()) { driver_io.text(2, "cannot find the Synx runtime capsule (set SYNX_RUNTIME_SHARED)\n"); return BuildResult.failed(); }
+                int os = match options.target.os { Linux => 0, Windows => 1, MacOs => 2 };
+                if (options.verbose) { driver_io.text(2, "link: built-in linker\n"); }
+                match linker.file(object, executable, capsule, os) {
+                    Err(error) => { var description = model.description(error.code); driver_io.text(2, "built-in linker: {description} {error.symbol} (input {error.input}, record {error.record})\n"); return BuildResult.failed(); }, Ok(_) => {}
+                }
+            } else {
+            var runtime = driver_paths.runtime_library(options.target);
+            if (runtime.is_empty()) { driver_io.text(2, "cannot find the Synx runtime library (set SYNX_RUNTIME_LIB)\n"); return BuildResult.failed(); }
+            if (options.verbose) { var text = driver_paths.link_text(options.target, object, runtime, executable); driver_io.text(2, "link: {text}\n"); }
+            var command = driver_paths.link_command(options.target, object, runtime, executable);
+            match command.status() {
+                Err(_) => { driver_io.text(2, "linking failed (cannot start linker)\n"); return BuildResult.failed(); },
+                Ok(status) => { if (!status.success()) {
+                    int code = driver_paths.exit_code(status); driver_io.text(2, "linking failed (exit {code})\n"); return BuildResult.failed();
+                } }
+            }
+            }
+            if (!options.keep_object) { var removed = fs.remove(object); }
+            return BuildResult { ok: true, executable: executable, object: object };
+        }
+    }
+}

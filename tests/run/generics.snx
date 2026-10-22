@@ -1,0 +1,38 @@
+trait Shape {
+    double area(&const self);
+    &const str name(&const self) { return "shape"; }
+}
+
+struct Circle { double r; }
+struct Rect { double w; double h; }
+
+impl Shape for Circle {
+    double area(&const self) { return 3.0 * self.r * self.r; }
+}
+
+impl Shape for Rect {
+    double area(&const self) { return self.w * self.h; }
+    &const str name(&const self) { return "rect"; }
+}
+
+&const T bigger<T: Shape>(&const T a, &const T b) {
+    if (a.area() > b.area()) { return a; } else { return b; }
+}
+
+T first<T: Copy>(&const T[] items) { return items[0]; }
+
+struct V { int x; }
+impl Add for V { V add(self, V o) { return V { x: self.x + o.x }; } }
+impl Display for V { String to_string(&const self) { return "V({self.x})"; } }
+
+main() {
+    var a = Rect { w: 2.0, h: 3.0 };
+    var b = Rect { w: 1.0, h: 1.0 };
+    var big = bigger(&const a, &const b);
+    var c = Circle { r: 1.0 };
+    print("{big.name()} {big.area()} {c.name()} {c.area()}");
+    int[2] xs = [7, 8];
+    print("{first(&const xs)}");
+    var v = V { x: 1 } + V { x: 2 };
+    print("{v}");
+}

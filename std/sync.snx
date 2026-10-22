@@ -1,0 +1,163 @@
+/// Thread synchronization. Atomic operations use sequential consistency.
+extern "C" {
+    usize synx_rt_atomic_load(*usize value);
+    usize synx_rt_atomic_swap(*usize value, usize next);
+    usize synx_rt_atomic_add(*usize value, usize amount);
+    usize synx_rt_atomic_sub(*usize value, usize amount);
+    usize synx_rt_atomic_cas(*usize value, usize expected, usize next);
+    *byte synx_rt_mutex_new();
+    void synx_rt_mutex_lock(*byte lock);
+    int synx_rt_mutex_try_lock(*byte lock);
+    void synx_rt_mutex_unlock(*byte lock);
+    void synx_rt_mutex_free(*byte lock);
+    *byte synx_rt_condvar_new();
+    void synx_rt_condvar_wait(*byte condition, *byte lock);
+    int synx_rt_condvar_wait_for(*byte condition, *byte lock, usize milliseconds);
+    void synx_rt_condvar_notify(*byte condition, int all);
+    void synx_rt_condvar_free(*byte condition);
+}
+
+pub struct AtomicUsize {
+    usize value;
+    pub AtomicUsize new(usize value) { return AtomicUsize { value: value }; }
+    pub usize load(&const self) { return unsafe { synx_rt_atomic_load((&const self.value as *const usize) as *usize) }; }
+    pub void store(&const self, usize value) { unsafe { synx_rt_atomic_swap((&const self.value as *const usize) as *usize, value); } }
+    pub usize swap(&const self, usize value) { return unsafe { synx_rt_atomic_swap((&const self.value as *const usize) as *usize, value) }; }
+    pub usize fetch_add(&const self, usize value) { return unsafe { synx_rt_atomic_add((&const self.value as *const usize) as *usize, value) }; }
+    pub usize fetch_sub(&const self, usize value) { return unsafe { synx_rt_atomic_sub((&const self.value as *const usize) as *usize, value) }; }
+    pub Result<usize, usize> compare_exchange(&const self, usize expected, usize next) {
+        usize previous = unsafe { synx_rt_atomic_cas((&const self.value as *const usize) as *usize, expected, next) };
+        if (previous == expected) { return Ok(previous); }
+        return Err(previous);
+    }
+}
+// An atomic must never be copied through an ordinary shared-memory load.
+impl Drop for AtomicUsize { void drop(&self) {} }
+
+pub struct AtomicBool {
+    AtomicUsize value;
+    pub AtomicBool new(bool value) { return AtomicBool { value: AtomicUsize.new(value as usize) }; }
+    pub bool load(&const self) { return self.value.load() != 0; }
+    pub void store(&const self, bool value) { self.value.store(value as usize); }
+    pub bool swap(&const self, bool value) { return self.value.swap(value as usize) != 0; }
+    pub Result<bool, bool> compare_exchange(&const self, bool expected, bool next) {
+        match self.value.compare_exchange(expected as usize, next as usize) {
+            Ok(previous) => return Ok(previous != 0),
+            Err(previous) => return Err(previous != 0),
+        }
+    }
+}
+
+pub struct AtomicLong {
+    AtomicUsize value;
+    pub AtomicLong new(long value) { return AtomicLong { value: AtomicUsize.new(value as usize) }; }
+    pub long load(&const self) { return self.value.load() as long; }
+    pub void store(&const self, long value) { self.value.store(value as usize); }
+    pub long swap(&const self, long value) { return self.value.swap(value as usize) as long; }
+    pub long fetch_add(&const self, long value) { return self.value.fetch_add(value as usize) as long; }
+    pub long fetch_sub(&const self, long value) { return self.value.fetch_sub(value as usize) as long; }
+    pub Result<long, long> compare_exchange(&const self, long expected, long next) {
+        match self.value.compare_exchange(expected as usize, next as usize) {
+            Ok(previous) => return Ok(previous as long),
+            Err(previous) => return Err(previous as long),
+        }
+    }
+}
+
+struct ArcNode<T: Owned> { AtomicUsize refs; T value; }
+/// Atomic shared ownership. get returns a shared reference to the value.
+pub struct Arc<T: Owned> {
+    *ArcNode<T> node;
+    pub Arc<T> new(T value) {
+        var node = unsafe { synx_rt_alloc(size_of<ArcNode<T>>()) as *ArcNode<T> };
+        unsafe { *node = ArcNode { refs: AtomicUsize.new(1), value: value }; }
+        return Arc { node: node };
+    }
+    pub Arc<T> clone(&const self) {
+        usize previous = unsafe { (*self.node).refs.fetch_add(1) };
+        if (previous >= 9223372036854775807 as usize) { panic("Arc reference count overflow"); }
+        return Arc { node: self.node };
+    }
+    pub &const T get(&const self) { return unsafe { &const (*self.node).value }; }
+    pub usize strong_count(&const self) { return unsafe { (*self.node).refs.load() }; }
+}
+impl<T: Owned> Drop for Arc<T> {
+    void drop(&self) {
+        unsafe {
+            if ((*self.node).refs.fetch_sub(1) == 1) {
+                drop_in_place<ArcNode<T>>(self.node);
+                synx_rt_free(self.node as *byte);
+            }
+        }
+    }
+}
+unsafe impl<T: Owned + Send + Sync> Send for Arc<T> {}
+unsafe impl<T: Owned + Send + Sync> Sync for Arc<T> {}
+unsafe impl<T: Owned> Owned for Arc<T> {}
+
+/// A nonrecursive lock. A guard unlocks when it is dropped.
+pub struct Mutex<T> {
+    *byte lock;
+    *T data;
+    pub Mutex<T> new(T value) {
+        var data = unsafe { synx_rt_alloc(size_of<T>()) as *T };
+        unsafe { *data = value; }
+        return Mutex { lock: unsafe { synx_rt_mutex_new() }, data: data };
+    }
+    pub MutexGuard<T> lock(&const self) {
+        unsafe { synx_rt_mutex_lock(self.lock); }
+        return MutexGuard { owner: self, thread_bound: 0 as *byte };
+    }
+    pub MutexGuard<T>? try_lock(&const self) {
+        if (unsafe { synx_rt_mutex_try_lock(self.lock) } == 0) { return None; }
+        return Some(MutexGuard { owner: self, thread_bound: 0 as *byte });
+    }
+}
+impl<T> Drop for Mutex<T> {
+    void drop(&self) {
+        unsafe { drop_in_place<T>(self.data); synx_rt_free(self.data as *byte); synx_rt_mutex_free(self.lock); }
+    }
+}
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
+unsafe impl<T: Owned> Owned for Mutex<T> {}
+
+pub struct MutexGuard<T> {
+    &const Mutex<T> owner;
+    // Raw storage also prevents structural Send/Sync derivation for the guard.
+    *byte thread_bound;
+    pub &const T get(&const self) { return unsafe { &const *self.owner.data }; }
+    pub &T get_mut(&self) { return unsafe { &*self.owner.data }; }
+}
+impl<T> Drop for MutexGuard<T> { void drop(&self) { unsafe { synx_rt_mutex_unlock(self.owner.lock); } } }
+
+/// A condition variable binds to the first mutex used for wait.
+/// Always test the predicate in a loop; wakeups can be spurious.
+pub struct Condvar {
+    *byte condition;
+    pub Condvar new() { return Condvar { condition: unsafe { synx_rt_condvar_new() } }; }
+    pub void wait<T>(&const self, &MutexGuard<T> guard) { unsafe { synx_rt_condvar_wait(self.condition, guard.owner.lock); } }
+    pub bool wait_for<T>(&const self, &MutexGuard<T> guard, usize milliseconds) { return unsafe { synx_rt_condvar_wait_for(self.condition, guard.owner.lock, milliseconds) != 0 }; }
+    pub void notify_one(&const self) { unsafe { synx_rt_condvar_notify(self.condition, 0); } }
+    pub void notify_all(&const self) { unsafe { synx_rt_condvar_notify(self.condition, 1); } }
+}
+impl Drop for Condvar { void drop(&self) { unsafe { synx_rt_condvar_free(self.condition); } } }
+unsafe impl Send for Condvar {}
+unsafe impl Sync for Condvar {}
+unsafe impl Owned for Condvar {}
+
+/// Interior mutation on one thread. Cell is Send when T is Send, and never Sync.
+pub struct Cell<T: Copy + Owned> {
+    *T data;
+    pub Cell<T> new(T value) {
+        var data = unsafe { synx_rt_alloc(size_of<T>()) as *T };
+        unsafe { *data = value; }
+        return Cell { data: data };
+    }
+    pub T get(&const self) { return unsafe { *self.data }; }
+    pub void set(&const self, T value) { unsafe { *self.data = value; } }
+    pub T replace(&const self, T value) { T old = self.get(); self.set(value); return old; }
+}
+impl<T: Copy + Owned> Drop for Cell<T> { void drop(&self) { unsafe { synx_rt_free(self.data as *byte); } } }
+unsafe impl<T: Copy + Owned + Send> Send for Cell<T> {}
+unsafe impl<T: Copy + Owned> Owned for Cell<T> {}

@@ -1,0 +1,5 @@
+import std.task.pool.{Executor,Join};
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("pool error") } }
+async send int value() { return 2; }
+async send int bad(Join<int> child) { return ok(child.join()); }
+main() { var a=ok(Executor.new(1)); var b=ok(Executor.new(1)); var child=ok(b.spawn(value())); var job=ok(a.spawn(bad(child))); job.join(); }

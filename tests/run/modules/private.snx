@@ -1,0 +1,3 @@
+pub struct Hidden { int n; int read(&const self) { return self.n; } }
+int secret() { return 1; }
+pub Hidden make() { return Hidden { n: 2 }; }

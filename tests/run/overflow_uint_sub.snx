@@ -1,0 +1,1 @@
+main() { uint a = 0; uint b = 1; uint result = a - b; if (result != 4294967295) { panic("wrong release result"); } }

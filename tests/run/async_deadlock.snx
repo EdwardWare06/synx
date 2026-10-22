@@ -1,0 +1,5 @@
+import std.task.block_on;
+struct Idle {}
+impl Future<void> for Idle { Poll<void> poll(&self,Waker wake) { return Poll.Pending; } }
+async void wait() { await Idle {}; }
+main() { block_on(wait()); }

@@ -1,0 +1,338 @@
+/// Signature resolution. Source: Resolver::resolve_signatures, resolve_type,
+/// resolve_bound, lookup_path, and resolve_function_signature in compiler/src/resolve.cpp.
+/// Parity: tests/selfhost_modules_test.cpp (signatures mode).
+/// Runs once after declaration and import binding succeed. Order: struct fields,
+/// enum payloads, trait bounds, impl headers, function signatures, impl/trait
+/// method sets, then const types. Each definition resolves in its own module.
+/// Syntax trees are indexed by file ID; the resolver retains no references to them.
+import ast;
+import ids.{TypeId, DefId, DefKind, ModuleId, NONE};
+import defs.{Symbol, TraitRef, FieldDef, ParamDef, FnOwner};
+import defs;
+import types;
+import declare.Resolver;
+import source.Span;
+
+/// Generic lookup scope. Layers are definitions whose generic parameters are
+/// visible, innermost first. self_type is the innermost Self, or none.
+pub struct Scope {
+    pub Vec<DefId> layers;
+    pub TypeId self_type;
+    pub Scope root() { return Scope { layers: Vec.new(), self_type: TypeId.none() }; }
+    /// A scope inside this one. A none self_type keeps the outer Self.
+    pub Scope nested(&const self, DefId owner, TypeId self_type) {
+        Vec<DefId> layers = Vec.new(); layers.push(owner); for (l in &const self.layers) { layers.push(*l); }
+        return Scope { layers: layers, self_type: if (self_type.index != NONE) { self_type } else { self.self_type } };
+    }
+}
+
+/// First generic parameter with this name, innermost layer first; none if absent.
+TypeId find_generic(&const Resolver r, &const Scope scope, &const str name) {
+    for (layer in &const scope.layers) {
+        for (g in &const r.program.def(*layer).generics) { if (g.name == String.from(name)) { return g.type; } }
+    }
+    return TypeId.none();
+}
+
+/// Resolves a module path from the active module. Segments after the first
+/// must name module members; a private member reports SNX0304 and fails.
+pub Symbol? lookup_path(&Resolver r, &const ast.Path path) { return lookup_prefix(&*r, path, path.segments.len()); }
+
+/// Resolves the first count segments of path, as lookup_path(path, count) in C++.
+pub Symbol? lookup_prefix(&Resolver r, &const ast.Path path, usize limit) {
+    usize count = if (limit < path.segments.len()) { limit } else { path.segments.len() };
+    if (count == 0) { return None; }
+    var first = defs.name(path.segments.get(0).unwrap().name);
+    Symbol symbol = Symbol.new(0);
+    match r.program.find(first) { Some(s) => { symbol = s; }, None => return None }
+    ModuleId active = r.program.active_module;
+    for (i in 1..count) {
+        if (symbol.kind != 6) { return None; }
+        var module = ModuleId { index: symbol.module_def };
+        var segment = path.segments.get(i).unwrap(); var name = defs.name(segment.name);
+        match r.program.module_find(module, name) {
+            None => return None,
+            Some(found) => {
+                if (found.owner.index != active.index && r.program.module(found.owner).namespace_owner.index != active.index && !found.symbol.is_pub) {
+                    var owner = String.from(r.program.module(module).name);
+                    r.sink.error(segment.span, "'{name}' is private to module '{owner}'", "SNX0304"); return None;
+                }
+                symbol = found.symbol;
+            }
+        }
+    }
+    return Some(symbol);
+}
+
+/// Interns Name<args> for a struct, enum, or trait (as dyn) definition.
+TypeId nominal(&Resolver r, DefId def, Vec<TypeId> args) {
+    var name = r.program.qualified_name(r.program.def(def).module, r.program.def(def).name);
+    match def.kind {
+        DefKind.Struct => return r.types.nominal(types.TypeKind.Struct, def, name, args),
+        DefKind.Enum => return r.types.nominal(types.TypeKind.Enum, def, name, args),
+        _ => return r.types.nominal(types.TypeKind.Dyn, def, name, args),
+    }
+}
+
+String last_name(&const ast.Path path) { return defs.name(path.segments.get(path.segments.len() - 1).unwrap().name); }
+
+/// Resolves a type expression. Failures report and return the error type.
+pub TypeId resolve_type(&Resolver r, &const ast.Ast tree, uint id, &const Scope scope) {
+    var t = tree.type(id);
+    match t.kind {
+        ast.TypeKind.Primitive => return r.types.prim(t.prim),
+        ast.TypeKind.SelfType => {
+            if (scope.self_type.index == NONE) {
+                r.sink.error(t.span, "Self is only valid inside a struct, enum, trait, or impl", ""); return r.types.error();
+            }
+            return scope.self_type;
+        }
+        ast.TypeKind.Ref => { var inner = resolve_type(&*r, tree, t.a, scope); return r.types.ref_type(inner, t.flag); }
+        ast.TypeKind.Ptr => { var inner = resolve_type(&*r, tree, t.a, scope); return r.types.ptr(inner, t.flag); }
+        ast.TypeKind.Array => {
+            var elem = resolve_type(&*r, tree, t.a, scope); var size = tree.expr(t.b);
+            match size.kind {
+                ast.ExprKind.IntLit => return r.types.array(elem, size.number),
+                _ => { r.sink.error(size.span, "array length must be an integer literal", ""); return r.types.error(); }
+            }
+        }
+        ast.TypeKind.Slice => { var elem = resolve_type(&*r, tree, t.a, scope); return r.types.slice(elem); }
+        ast.TypeKind.Optional => {
+            var inner = resolve_type(&*r, tree, t.a, scope);
+            if (r.program.option_def.index == NONE) { r.sink.error(t.span, "Option is not available", ""); return r.types.error(); }
+            Vec<TypeId> args = Vec.new(); args.push(inner); DefId option = r.program.option_def; return nominal(&*r, option, args);
+        }
+        ast.TypeKind.Tuple => {
+            Vec<TypeId> elems = Vec.new(); for (e in &const t.items) { elems.push(resolve_type(&*r, tree, *e, scope)); }
+            return r.types.tuple(elems);
+        }
+        ast.TypeKind.Fn => {
+            Vec<TypeId> params = Vec.new(); for (e in &const t.items) { params.push(resolve_type(&*r, tree, *e, scope)); }
+            TypeId ret = if (t.a == ast.NONE) { r.types.prim(ast.PrimKind.Void) } else { resolve_type(&*r, tree, t.a, scope) };
+            return r.types.fn_type(params, ret, t.mode, t.flag);
+        }
+        ast.TypeKind.Dyn => {
+            var bound = resolve_bound(&*r, tree, &const t.bound, scope);
+            if (bound.trait_def.index == NONE) { return r.types.error(); }
+            if (bound.args.len() != r.program.def(bound.trait_def).generics.len()) { return r.types.error(); }
+            return nominal(&*r, bound.trait_def, bound.args);
+        }
+        ast.TypeKind.Path => return resolve_path_type(&*r, tree, t, scope),
+    }
+}
+
+TypeId resolve_path_type(&Resolver r, &const ast.Ast tree, &const ast.Type t, &const Scope scope) {
+    var name = last_name(&const t.path);
+    if (t.path.segments.len() == 1) {
+        if (name == String.from("str")) {
+            if (!t.items.is_empty()) { r.sink.error(t.span, "str takes no type arguments", ""); }
+            return r.types.str();
+        }
+        var g = find_generic(&*r, scope, name);
+        if (g.index != NONE) {
+            if (!t.items.is_empty()) { r.sink.error(t.span, "type parameter '{name}' takes no arguments", ""); }
+            return g;
+        }
+    }
+    Symbol symbol = Symbol.new(0);
+    match lookup_path(&*r, &const t.path) {
+        Some(s) => { symbol = s; }
+        None => { r.sink.error(t.path.span, "unknown type '{name}'", "SNX0301"); return r.types.error(); }
+    }
+    Vec<TypeId> args = Vec.new(); for (a in &const t.items) { args.push(resolve_type(&*r, tree, *a, scope)); }
+    DefId def = DefId.none();
+    if (symbol.kind == 0) { def = DefId { kind: DefKind.Struct, index: symbol.struct_def }; }
+    else if (symbol.kind == 1) { def = DefId { kind: DefKind.Enum, index: symbol.enum_def }; }
+    else { r.sink.error(t.path.span, "'{name}' is not a type", ""); return r.types.error(); }
+    usize want = r.program.def(def).generics.len(); usize got = args.len();
+    if (got != want) {
+        var plural = if (want == 1) { String.new() } else { String.from("s") };
+        r.sink.error(t.span, "'{name}' expects {want} type argument{plural}, got {got}", ""); return r.types.error();
+    }
+    return nominal(&*r, def, args);
+}
+
+/// Resolves Trait<args>. An unknown trait returns a none trait without
+/// resolving arguments; an arity mismatch reports and keeps the arguments.
+pub TraitRef resolve_bound(&Resolver r, &const ast.Ast tree, &const ast.Bound b, &const Scope scope) {
+    var name = last_name(&const b.path);
+    var out = TraitRef { trait_def: DefId.none(), args: Vec.new() };
+    match lookup_path(&*r, &const b.path) {
+        Some(s) => { if (s.kind == 2) { out.trait_def = DefId { kind: DefKind.Trait, index: s.trait_def }; } }
+        None => {}
+    }
+    if (out.trait_def.index == NONE) { r.sink.error(b.path.span, "unknown trait '{name}'", ""); return out; }
+    for (a in &const b.args) { out.args.push(resolve_type(&*r, tree, *a, scope)); }
+    usize want = r.program.def(out.trait_def).generics.len(); usize got = out.args.len();
+    if (got != want) { r.sink.error(b.span, "trait '{name}' expects {want} type arguments, got {got}", ""); }
+    return out;
+}
+
+/// Appends resolved bounds to the owner's already declared generic parameters.
+void generic_bounds(&Resolver r, &const ast.Ast tree, &const Vec<ast.GenericParam> gs, DefId owner, &const Scope scope) {
+    for (i in 0..gs.len()) {
+        for (b in &const gs.get(i).unwrap().bounds) {
+            var bound = resolve_bound(&*r, tree, b, scope);
+            r.program.def_mut(owner).generics.get_mut(i).unwrap().bounds.push(bound);
+        }
+    }
+}
+
+bool unsized(&const Resolver r, TypeId id) { return r.types.get(id).is_unsized(); }
+
+bool is_trait(FnOwner owner) { match owner { FnOwner.Trait => return true, _ => return false } }
+bool is_extern(FnOwner owner) { match owner { FnOwner.Extern => return true, _ => return false } }
+
+/// True when a definition's method list has a function with this name.
+bool has_method(&const Resolver r, DefId owner, &const str name) {
+    for (m in &const r.program.def(owner).methods) { if (r.program.def(*m).name == String.from(name)) { return true; } }
+    return false;
+}
+
+/// Syntax locations are copied out so tree borrows stay independent of the resolver.
+usize file_of(&const Resolver r, DefId def) { return r.program.def(def).ast_file as usize; }
+usize node_of(&const Resolver r, DefId def) { return r.program.def(def).ast_index as usize; }
+
+/// Declares the function's own generics, then resolves bounds, parameters,
+/// and the return type. Owner generics and Self come from outer.
+void resolve_function(&Resolver r, &const Vec<ast.Ast> trees, DefId f, &const Scope outer) {
+    var tree = trees.get(file_of(&*r, f)).unwrap(); var func = tree.function(node_of(&*r, f) as uint);
+    var generics = r.declare_generics(&const func.generics, f); r.program.def_mut(f).generics = generics;
+    TypeId self_type = r.program.def(f).self_type;
+    var scope = outer.nested(f, self_type);
+    generic_bounds(&*r, tree, &const func.generics, f, &scope);
+    for (p in &const func.params) {
+        var name = defs.name(p.name); TypeId ty = TypeId.none();
+        match p.self_kind {
+            ast.SelfKind.None => {
+                ty = resolve_type(&*r, tree, p.type, &scope);
+                if (unsized(&*r, ty)) {
+                    var shown = r.types.to_string(ty);
+                    r.sink.error(p.span, "parameter of type '{shown}' must be a reference, write &const {shown}", "");
+                }
+            }
+            _ => {
+                var base = self_type;
+                if (base.index == NONE) { r.sink.error(p.span, "self parameter outside a type", ""); base = r.types.error(); }
+                match p.self_kind {
+                    ast.SelfKind.Value => { ty = base; }
+                    ast.SelfKind.Ref => { ty = r.types.ref_type(base, false); }
+                    _ => { ty = r.types.ref_type(base, true); }
+                }
+            }
+        }
+        usize duplicates = 0; for (prev in &const r.program.def(f).params) { if (prev.name == name) { duplicates += 1; } }
+        for (k in 0..duplicates) { r.sink.error(p.span, "duplicate parameter '{name}'", ""); }
+        r.program.def_mut(f).params.push(ParamDef { name: name, span: p.span, type: ty, self_kind: p.self_kind });
+    }
+    FnOwner owner = r.program.def(f).owner; Span span = r.program.def(f).span;
+    if (func.ret != ast.NONE) {
+        var ret = resolve_type(&*r, tree, func.ret, &scope); r.program.def_mut(f).ret = ret;
+    } else if (r.program.def(f).is_pub && !is_trait(owner)) {
+        r.sink.error(span, "a pub function must write its return type", "");
+        var failed = r.types.error(); r.program.def_mut(f).ret = failed; r.program.def_mut(f).ret_declared = true;
+    } else if (is_trait(owner) || is_extern(owner)) {
+        if (func.body == ast.NONE) {
+            r.sink.error(span, "a function without a body must write its return type", "");
+            var failed = r.types.error(); r.program.def_mut(f).ret = failed; r.program.def_mut(f).ret_declared = true;
+        }
+    }
+}
+
+/// Resolves every pending declaration in C++ order. Restores the active module.
+pub void signatures(&Resolver r, &const Vec<ast.Ast> trees) {
+    ModuleId saved = r.program.active_module;
+    var root = Scope.root();
+    for (k in 0..r.pending_structs.len()) {
+        DefId s = *r.pending_structs.get(k).unwrap();
+        ModuleId scope_module = r.program.def(s).module; r.program.active_module = scope_module;
+        var tree = trees.get(file_of(&*r, s)).unwrap(); var item = tree.items.get(node_of(&*r, s)).unwrap();
+        var scope = root.nested(s, r.program.def(s).self_type);
+        generic_bounds(&*r, tree, &const item.generics, s, &scope);
+        for (f in &const item.fields) {
+            var name = defs.name(f.name); var ty = resolve_type(&*r, tree, f.type, &scope);
+            if (unsized(&*r, ty)) { var shown = r.types.to_string(ty); r.sink.error(f.span, "field cannot have unsized type '{shown}'", ""); }
+            usize duplicates = 0; for (prev in &const r.program.def(s).fields) { if (prev.name == name) { duplicates += 1; } }
+            for (n in 0..duplicates) { r.sink.error(f.span, "duplicate field '{name}'", ""); }
+            r.program.def_mut(s).fields.push(FieldDef { name: name, span: f.span, type: ty, is_pub: f.is_pub });
+        }
+    }
+    for (k in 0..r.pending_enums.len()) {
+        DefId e = *r.pending_enums.get(k).unwrap();
+        ModuleId scope_module = r.program.def(e).module; r.program.active_module = scope_module;
+        var tree = trees.get(file_of(&*r, e)).unwrap(); var item = tree.items.get(node_of(&*r, e)).unwrap();
+        var scope = root.nested(e, r.program.def(e).self_type);
+        generic_bounds(&*r, tree, &const item.generics, e, &scope);
+        for (i in 0..item.variants.len()) {
+            var variant = item.variants.get(i).unwrap();
+            for (t in &const variant.tuple_types) {
+                var ty = resolve_type(&*r, tree, *t, &scope); r.program.def_mut(e).variants.get_mut(i).unwrap().tuple_types.push(ty);
+            }
+            for (f in &const variant.fields) {
+                var ty = resolve_type(&*r, tree, f.type, &scope);
+                r.program.def_mut(e).variants.get_mut(i).unwrap().fields.push(FieldDef { name: defs.name(f.name), span: f.span, type: ty, is_pub: false });
+            }
+        }
+    }
+    for (k in 0..r.pending_traits.len()) {
+        DefId t = *r.pending_traits.get(k).unwrap();
+        ModuleId scope_module = r.program.def(t).module; r.program.active_module = scope_module;
+        var tree = trees.get(file_of(&*r, t)).unwrap(); var item = tree.items.get(node_of(&*r, t)).unwrap();
+        var scope = root.nested(t, r.program.def(t).self_type);
+        generic_bounds(&*r, tree, &const item.generics, t, &scope);
+    }
+    for (k in 0..r.pending_impls.len()) {
+        DefId i = *r.pending_impls.get(k).unwrap();
+        ModuleId scope_module = r.program.def(i).module; r.program.active_module = scope_module;
+        var tree = trees.get(file_of(&*r, i)).unwrap(); var item = tree.items.get(node_of(&*r, i)).unwrap();
+        var header = root.nested(i, TypeId.none());
+        generic_bounds(&*r, tree, &const item.generics, i, &header);
+        var target = resolve_type(&*r, tree, item.a, &header); r.program.def_mut(i).self_type = target;
+        var scope = root.nested(i, target);
+        var bound = resolve_bound(&*r, tree, &const item.bound, &scope); r.program.def_mut(i).trait_ref = bound;
+        for (n in 0..r.program.def(i).methods.len()) {
+            DefId m = *r.program.def(i).methods.get(n).unwrap(); r.program.def_mut(m).self_type = target;
+        }
+    }
+    for (k in 0..r.pending_functions.len()) {
+        DefId f = *r.pending_functions.get(k).unwrap();
+        ModuleId scope_module = r.program.def(f).module; r.program.active_module = scope_module;
+        TypeId self_type = r.program.def(f).self_type;
+        var owner = Scope.root();
+        match r.program.def(f).owner {
+            FnOwner.Struct => { owner = root.nested(r.program.def(f).owner_struct, self_type); }
+            FnOwner.Enum => { owner = root.nested(r.program.def(f).owner_enum, self_type); }
+            FnOwner.Trait => { owner = root.nested(r.program.def(f).owner_trait, self_type); }
+            FnOwner.Impl => { owner = root.nested(r.program.def(f).owner_impl, self_type); }
+            _ => {}
+        }
+        resolve_function(&*r, trees, f, &owner);
+    }
+    for (k in 0..r.pending_impls.len()) {
+        DefId i = *r.pending_impls.get(k).unwrap();
+        ModuleId scope_module = r.program.def(i).module; r.program.active_module = scope_module;
+        DefId implemented = r.program.def(i).trait_ref.trait_def;
+        if (implemented.index == NONE) { continue; }
+        var trait_name = String.from(r.program.def(implemented).name); Span span = r.program.def(i).span;
+        for (n in 0..r.program.def(implemented).methods.len()) {
+            DefId tm = *r.program.def(implemented).methods.get(n).unwrap(); var name = String.from(r.program.def(tm).name);
+            bool required = trees.get(file_of(&*r, tm)).unwrap().function(node_of(&*r, tm) as uint).body == ast.NONE;
+            if (!has_method(&*r, i, name) && required) {
+                r.sink.error(span, "impl is missing method '{name}' required by trait '{trait_name}'", "");
+            }
+        }
+        for (n in 0..r.program.def(i).methods.len()) {
+            DefId m = *r.program.def(i).methods.get(n).unwrap(); var name = String.from(r.program.def(m).name);
+            if (!has_method(&*r, implemented, name)) {
+                Span at = r.program.def(m).span; r.sink.error(at, "method '{name}' is not a member of trait '{trait_name}'", "");
+            }
+        }
+    }
+    for (k in 0..r.pending_consts.len()) {
+        DefId c = *r.pending_consts.get(k).unwrap();
+        ModuleId scope_module = r.program.def(c).module; r.program.active_module = scope_module;
+        var tree = trees.get(file_of(&*r, c)).unwrap(); var item = tree.items.get(node_of(&*r, c)).unwrap();
+        if (item.a != ast.NONE) { var ty = resolve_type(&*r, tree, item.a, &root); r.program.def_mut(c).ret = ty; }
+    }
+    r.program.active_module = saved;
+}

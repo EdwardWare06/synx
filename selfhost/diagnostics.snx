@@ -1,0 +1,63 @@
+/// Diagnostic storage and byte rendering. Source: compiler/src/diagnostics.cpp.
+/// Parity: tests/selfhost_lexer_test.cpp.
+import source.{Span, SourceFile};
+import bytes;
+
+pub enum Severity { Error, Warning, Note }
+pub struct Diagnostic {
+    pub Severity severity;
+    pub Span span;
+    pub Vec<byte> message;
+    pub String code;
+}
+pub struct DiagnosticSink {
+    pub Vec<Diagnostic> items;
+    pub usize errors;
+    pub DiagnosticSink new() { return DiagnosticSink { items: Vec.new(), errors: 0 }; }
+    pub void add(&self, Severity severity, Span span, Vec<byte> message, String code) {
+        match severity { Severity.Error => { self.errors += 1; }, _ => {} }
+        self.items.push(Diagnostic { severity: severity, span: span, message: message, code: code });
+    }
+    pub void error(&self, Span span, &const str message, &const str code) {
+        Vec<byte> data = Vec.new(); bytes.text(&data, message);
+        self.add(Severity.Error, span, data, String.from(code));
+    }
+    pub bool has_errors(&const self) { return self.errors > 0; }
+    /// Sources are resolved by file ID. Unregistered IDs use fallback.
+    pub Vec<byte> render(&const self, &const SourceFile fallback, &const Vec<SourceFile> sources) {
+        Vec<byte> output = Vec.new();
+        for (item in &const self.items) {
+            bool found = false; usize selected = 0;
+            for (i in 0..sources.len()) {
+                if (sources.get(i).unwrap().id == item.span.file) { selected = i; found = true; }
+            }
+            if (found) {
+                var rendered = render_one(item, sources.get(selected).unwrap()); bytes.append(&output, rendered);
+            } else { var rendered = render_one(item, fallback); bytes.append(&output, rendered); }
+        }
+        return output;
+    }
+}
+pub Vec<byte> render_one(&const Diagnostic item, &const SourceFile file) {
+    var lc = file.line_col(item.span.start);
+    Vec<byte> output = Vec.new();
+    bytes.text(&output, file.path());
+    bytes.text(&output, ":{lc.line}:{lc.col}: ");
+    match item.severity {
+        Severity.Error => bytes.text(&output, "error"),
+        Severity.Warning => bytes.text(&output, "warning"),
+        Severity.Note => bytes.text(&output, "note"),
+    }
+    if (!item.code.is_empty()) { bytes.text(&output, "["); bytes.text(&output, item.code.as_str()); bytes.text(&output, "]"); }
+    bytes.text(&output, ": "); bytes.append(&output, item.message); output.push(10);
+    var line = file.line_text(lc.line); var number = "{lc.line}";
+    bytes.text(&output, number); bytes.text(&output, " | "); bytes.append(&output, line); output.push(10);
+    for (i in 0..number.len()) { output.push(32); } bytes.text(&output, " | ");
+    for (i in 1..lc.col) { output.push(if ((i - 1) as usize < line.len() && bytes.at(line, (i - 1) as usize) == 9) { 9 } else { 32 }); }
+    uint width = item.span.length();
+    var end = file.line_col(item.span.end);
+    if (end.line != lc.line) { width = line.len() as uint - (lc.col - 1); }
+    if (width == 0) { width = 1; }
+    for (i in 0..width) { output.push(94); } output.push(10);
+    return output;
+}

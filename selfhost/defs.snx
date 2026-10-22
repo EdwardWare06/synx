@@ -1,0 +1,208 @@
+/// Semantic definition arenas. Source: compiler/include/synx/defs.hpp.
+/// Parity: tests/selfhost_modules_test.cpp.
+/// Program owns records. DefId and ModuleId survive vector growth.
+/// Definitions retain AST file/node indexes, with no references into syntax arenas.
+import ids.{TypeId, DefId, DefKind, ModuleId, NONE};
+import types;
+import ast.{SelfKind, VariantKind};
+import source.Span;
+
+pub String name(&const Vec<byte> data) { return String.from(unsafe { str_from_raw(data.as_ptr(), data.len()) }); }
+pub Span zero_span() { return Span { start: 0, end: 0, file: 0 }; }
+/// Unsigned byte order matches std::map<string, ...> on all bootstrap hosts.
+pub bool less(&const str a, &const str b) {
+    usize n = if (a.len() < b.len()) { a.len() } else { b.len() };
+    for (i in 0..n) {
+        byte x = unsafe { *((a.as_ptr() as usize + i) as *const byte) };
+        byte y = unsafe { *((b.as_ptr() as usize + i) as *const byte) };
+        if (x != y) { return x < y; }
+    }
+    return a.len() < b.len();
+}
+pub bool equal(&const str a, &const str b) {
+    if (a.len() != b.len()) { return false; }
+    for (i in 0..a.len()) {
+        byte x = unsafe { *((a.as_ptr() as usize + i) as *const byte) };
+        byte y = unsafe { *((b.as_ptr() as usize + i) as *const byte) };
+        if (x != y) { return false; }
+    }
+    return true;
+}
+pub struct NameIndex { pub String name; pub uint index; }
+pub struct IndexMap {
+    pub Vec<NameIndex> entries;
+    pub IndexMap new() { return IndexMap { entries: Vec.new() }; }
+    usize position(&const self, &const str name) {
+        usize lo = 0; usize hi = self.entries.len();
+        while (lo < hi) { usize mid = lo + (hi - lo) / 2; if (less(self.entries.get(mid).unwrap().name, name)) { lo = mid + 1; } else { hi = mid; } }
+        return lo;
+    }
+    pub uint get(&const self, &const str name) {
+        usize lo = self.position(name);
+        if (lo < self.entries.len() && equal(self.entries.get(lo).unwrap().name, name)) { return self.entries.get(lo).unwrap().index; }
+        return NONE;
+    }
+    pub void put(&self, &const str name, uint index) {
+        usize position = self.position(name);
+        if (position < self.entries.len() && equal(self.entries.get(position).unwrap().name, name)) { self.entries.get_mut(position).unwrap().index = index; return; }
+        self.entries.push(NameIndex { name: String.from(name), index: index });
+        usize i = self.entries.len() - 1;
+        while (i > position) { self.entries.swap(i, i - 1); i -= 1; }
+    }
+}
+/// Symbol kind numbers match SymbolKind in defs.hpp. All unused IDs are NONE.
+/// 0 struct, 1 enum, 2 trait, 3 function, 4 const, 5 variant, 6 module.
+pub struct Symbol {
+    pub uint kind;
+    pub uint struct_def;
+    pub uint enum_def;
+    pub uint trait_def;
+    pub uint fn_def;
+    pub uint const_def;
+    pub uint variant;
+    pub uint module_def;
+    pub bool is_pub;
+    pub Span span;
+    pub Symbol new(uint kind) { return Symbol { kind: kind, struct_def: NONE, enum_def: NONE, trait_def: NONE,
+        fn_def: NONE, const_def: NONE, variant: NONE, module_def: NONE, is_pub: true, span: zero_span() }; }
+    pub Symbol module(ModuleId id) { var s = Symbol.new(6); s.module_def = id.index; return s; }
+    pub bool same(&const self, Symbol other) {
+        return self.kind == other.kind && self.struct_def == other.struct_def && self.enum_def == other.enum_def &&
+            self.trait_def == other.trait_def && self.fn_def == other.fn_def && self.const_def == other.const_def &&
+            self.variant == other.variant && self.module_def == other.module_def;
+    }
+}
+pub struct Binding { pub String name; pub Symbol symbol; }
+pub struct SymbolTable {
+    pub Vec<Binding> entries;
+    pub SymbolTable new() { return SymbolTable { entries: Vec.new() }; }
+    usize position(&const self, &const str name) {
+        usize lo = 0; usize hi = self.entries.len();
+        while (lo < hi) { usize mid = lo + (hi - lo) / 2; if (less(self.entries.get(mid).unwrap().name, name)) { lo = mid + 1; } else { hi = mid; } }
+        return lo;
+    }
+    pub Symbol? get(&const self, &const str name) {
+        usize lo = self.position(name);
+        if (lo < self.entries.len() && equal(self.entries.get(lo).unwrap().name, name)) { return Some(self.entries.get(lo).unwrap().symbol); }
+        return None;
+    }
+    pub void put(&self, &const str name, Symbol symbol) {
+        usize position = self.position(name);
+        if (position < self.entries.len() && equal(self.entries.get(position).unwrap().name, name)) { self.entries.get_mut(position).unwrap().symbol = symbol; return; }
+        self.entries.push(Binding { name: String.from(name), symbol: symbol });
+        usize i = self.entries.len() - 1;
+        while (i > position) { self.entries.swap(i, i - 1); i -= 1; }
+    }
+    pub SymbolTable copy(&const self) {
+        var out = SymbolTable.new(); for (entry in &const self.entries) { out.entries.push(Binding { name: String.from(entry.name), symbol: entry.symbol }); } return out;
+    }
+}
+pub struct TraitRef { pub DefId trait_def; pub Vec<TypeId> args; }
+pub struct GenericParamDef { pub String name; pub Span span; pub TypeId type; pub Vec<TraitRef> bounds; }
+pub struct ParamDef { pub String name; pub Span span; pub TypeId type; pub SelfKind self_kind; }
+pub struct FieldDef { pub String name; pub Span span; pub TypeId type; pub bool is_pub; }
+pub struct VariantDef {
+    pub String name; pub Span span; pub uint index; pub VariantKind kind;
+    pub Vec<TypeId> tuple_types; pub Vec<FieldDef> fields; pub DefId owner;
+}
+pub enum FnOwner { Module, Struct, Enum, Trait, Impl, Extern }
+/// Tagged by its containing arena. The common record keeps pass access uniform.
+/// Fields/variants/params stay empty until the corresponding resolution pass.
+pub struct Definition {
+    pub ModuleId module;
+    pub String name;
+    pub Span span;
+    pub uint ast_file;
+    pub uint ast_index;
+    pub bool is_pub;
+    pub bool is_builtin;
+    pub bool is_prelude;
+    pub bool is_builtin_string;
+    pub bool is_builtin_vec;
+    pub FnOwner owner;
+    pub DefId owner_struct;
+    pub DefId owner_enum;
+    pub DefId owner_trait;
+    pub DefId owner_impl;
+    pub TypeId self_type;
+    pub Vec<GenericParamDef> generics;
+    pub Vec<ParamDef> params;
+    pub TypeId ret;
+    pub bool ret_declared;
+    pub bool checked;
+    pub bool checking;
+    pub Vec<FieldDef> fields;
+    pub Vec<VariantDef> variants;
+    pub Vec<DefId> methods;
+    pub TraitRef trait_ref;
+    pub Definition new() {
+        return Definition { module: ModuleId.none(), name: String.new(), span: zero_span(), ast_file: NONE, ast_index: NONE,
+            is_pub: false, is_builtin: false, is_prelude: false, is_builtin_string: false, is_builtin_vec: false,
+            owner: FnOwner.Module, owner_struct: DefId.none(), owner_enum: DefId.none(), owner_trait: DefId.none(), owner_impl: DefId.none(),
+            self_type: TypeId.none(), generics: Vec.new(), params: Vec.new(), ret: TypeId.none(), ret_declared: false,
+            checked: false, checking: false, fields: Vec.new(), variants: Vec.new(), methods: Vec.new(),
+            trait_ref: TraitRef { trait_def: DefId.none(), args: Vec.new() } };
+    }
+}
+pub struct ModuleDef {
+    pub String name; pub uint file; pub bool is_prelude;
+    pub SymbolTable symbols; pub ModuleId base_module; pub ModuleId namespace_owner;
+    pub ModuleDef new(&const str name) { return ModuleDef { name: String.from(name), file: 0, is_prelude: false,
+        symbols: SymbolTable.new(), base_module: ModuleId.none(), namespace_owner: ModuleId.none() }; }
+}
+pub struct Found { pub Symbol symbol; pub ModuleId owner; }
+pub struct Program {
+    pub Vec<Definition> structs;
+    pub Vec<Definition> enums;
+    pub Vec<Definition> traits;
+    pub Vec<Definition> impls;
+    pub Vec<Definition> functions;
+    pub Vec<Definition> consts;
+    pub SymbolTable globals;
+    pub Vec<ModuleDef> modules;
+    pub ModuleId root_module;
+    pub ModuleId active_module;
+    pub DefId option_def;
+    pub DefId result_def;
+    pub DefId string_def;
+    pub DefId vec_def;
+    pub DefId range_def;
+    pub DefId range_inclusive_def;
+    pub DefId task_def;
+    pub DefId send_task_def;
+    pub DefId waker_def;
+    pub DefId poll_def;
+    pub IndexMap core_traits;
+    pub Program new() { return Program { structs: Vec.new(), enums: Vec.new(), traits: Vec.new(), impls: Vec.new(),
+        functions: Vec.new(), consts: Vec.new(), globals: SymbolTable.new(), modules: Vec.new(), root_module: ModuleId.none(),
+        active_module: ModuleId.none(), option_def: DefId.none(), result_def: DefId.none(), string_def: DefId.none(),
+        vec_def: DefId.none(), range_def: DefId.none(), range_inclusive_def: DefId.none(), task_def: DefId.none(),
+        send_task_def: DefId.none(), waker_def: DefId.none(), poll_def: DefId.none(), core_traits: IndexMap.new() }; }
+    pub &const Definition def(&const self, DefId id) {
+        match id.kind { DefKind.Struct => return self.structs.get(id.index as usize).unwrap(), DefKind.Enum => return self.enums.get(id.index as usize).unwrap(),
+            DefKind.Trait => return self.traits.get(id.index as usize).unwrap(), DefKind.Impl => return self.impls.get(id.index as usize).unwrap(),
+            DefKind.Function => return self.functions.get(id.index as usize).unwrap(), DefKind.Const => return self.consts.get(id.index as usize).unwrap() }
+    }
+    pub &Definition def_mut(&self, DefId id) {
+        match id.kind { DefKind.Struct => return self.structs.get_mut(id.index as usize).unwrap(), DefKind.Enum => return self.enums.get_mut(id.index as usize).unwrap(),
+            DefKind.Trait => return self.traits.get_mut(id.index as usize).unwrap(), DefKind.Impl => return self.impls.get_mut(id.index as usize).unwrap(),
+            DefKind.Function => return self.functions.get_mut(id.index as usize).unwrap(), DefKind.Const => return self.consts.get_mut(id.index as usize).unwrap() }
+    }
+    pub &const ModuleDef module(&const self, ModuleId id) { return self.modules.get(id.index as usize).unwrap(); }
+    pub &ModuleDef module_mut(&self, ModuleId id) { return self.modules.get_mut(id.index as usize).unwrap(); }
+    pub Found? module_find(&const self, ModuleId id, &const str name) {
+        var module = self.module(id);
+        match module.symbols.get(name) { Some(symbol) => return Some(Found { symbol: symbol, owner: id }), None => {} }
+        if (module.base_module.index != NONE) { return self.module_find(module.base_module, name); } return None;
+    }
+    pub Symbol? find(&const self, &const str name) {
+        ModuleId scope = if (self.active_module.index != NONE) { self.active_module } else { self.root_module };
+        if (scope.index != NONE) { match self.module(scope).symbols.get(name) { Some(s) => return Some(s), None => {} } }
+        return self.globals.get(name);
+    }
+    pub String qualified_name(&const self, ModuleId module, &const str name) {
+        if (module.index == NONE) { return String.from(name); }
+        var m = self.module(module); if (m.is_prelude || m.name.is_empty()) { return String.from(name); }
+        return "{m.name}.{name}";
+    }
+}

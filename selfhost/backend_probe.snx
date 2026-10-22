@@ -1,0 +1,160 @@
+/// Backend byte parity probe. Input and output are little-endian records.
+/// Driver and fixture generator: tests/selfhost_backend_test.cpp.
+import x64.{Assembler, RelocKind};
+import objfile.{ObjectFile, ObjSymbol, ObjReloc, ObjectFormat, write_object};
+import target.{Target, TargetOs, symbol_for};
+import bytes;
+import std.binary;
+import std.env;
+import std.fs;
+import std.utf8;
+
+struct Reader {
+    Vec<byte> data; usize offset;
+    ulong word(&self, usize width) {
+        ulong value = binary.read_uint(self.data, self.offset, width, true).unwrap();
+        self.offset += width; return value;
+    }
+    Vec<byte> blob(&self) {
+        usize length = self.word(8) as usize;
+        var data = bytes.copy(self.data, self.offset, self.offset + length);
+        self.offset += length; return data;
+    }
+    String string(&self) { return utf8.decode(self.blob()).unwrap(); }
+}
+void put(&Vec<byte> out, ulong value, usize width) {
+    if (!binary.write_uint(&*out, value, width, true)) { panic("invalid backend report integer"); }
+}
+void blob(&Vec<byte> out, &const Vec<byte> data) { put(&*out, data.len() as ulong, 8); bytes.append(&*out, data); }
+void string(&Vec<byte> out, &const str text) { put(&*out, text.len() as ulong, 8); bytes.text(&*out, text); }
+byte reloc_index(RelocKind kind) { match kind { Call32 => return 0, Pc32 => return 1, Abs64 => return 2 } }
+RelocKind reloc_kind(byte kind) { match kind { 0 => return RelocKind.Call32, 1 => return RelocKind.Pc32, 2 => return RelocKind.Abs64, _ => panic("invalid relocation kind") } }
+
+void instructions(&Reader input, &Vec<byte> out) {
+    usize count = input.word(8) as usize; put(&*out, count as ulong, 8);
+    for (program in 0..count) {
+        var asm = Assembler.new();
+        usize labels = input.word(8) as usize;
+        for (i in 0..labels) { put(&*out, asm.new_label() as ulong, 8); }
+        for (i in 0..labels) { put(&*out, if (asm.is_bound(i as int)) { 1 } else { 0 }, 1); put(&*out, asm.label_pos(i as int) as ulong, 8); }
+        usize operations = input.word(8) as usize;
+        for (i in 0..operations) {
+            byte opcode = input.word(1) as byte;
+            byte a = input.word(1) as byte; byte b = input.word(1) as byte;
+            byte c = input.word(1) as byte; byte d = input.word(1) as byte;
+            long imm = input.word(8) as long;
+            String symbol = input.string();
+            match opcode {
+                0 => asm.bind(imm as int),
+                1 => asm.finish(),
+                2 => asm.mov_rr(a, b),
+                3 => asm.mov_ri(a, imm),
+                4 => asm.load(a, b, imm as int, c, d != 0),
+                5 => asm.store(a, imm as int, b, c),
+                6 => asm.lea(a, b, imm as int),
+                7 => asm.lea_rip(a, symbol, imm),
+                8 => asm.lea_label(a, imm as int),
+                9 => asm.alu_rr(a, b, c),
+                10 => asm.alu_ri(a, b, imm as int),
+                11 => asm.imul_rr(a, b),
+                12 => asm.cqo(),
+                13 => asm.mul(a),
+                14 => asm.idiv(a),
+                15 => asm.div(a),
+                16 => asm.neg(a),
+                17 => asm.not_(a),
+                18 => asm.shl_cl(a),
+                19 => asm.shr_cl(a),
+                20 => asm.sar_cl(a),
+                21 => asm.test_rr(a, b),
+                22 => asm.setcc(a, b),
+                23 => asm.movzx8(a, b),
+                24 => asm.movzx16(a, b),
+                25 => asm.movsx8(a, b),
+                26 => asm.movsx16(a, b),
+                27 => asm.movsx32(a, b),
+                28 => asm.mov32(a, b),
+                29 => asm.jmp(imm as int),
+                30 => asm.jcc(a, imm as int),
+                31 => asm.call_sym(symbol),
+                32 => asm.call_reg(a),
+                33 => asm.ret(),
+                34 => asm.push(a),
+                35 => asm.pop(a),
+                36 => asm.ud2(),
+                37 => asm.rep_movsb(),
+                38 => asm.movsd_load(a, b, imm as int),
+                39 => asm.movsd_store(a, imm as int, b),
+                40 => asm.movss_load(a, b, imm as int),
+                41 => asm.movss_store(a, imm as int, b),
+                42 => asm.movq_xr(a, b),
+                43 => asm.movq_rx(a, b),
+                44 => asm.addsd(a, b),
+                45 => asm.subsd(a, b),
+                46 => asm.mulsd(a, b),
+                47 => asm.divsd(a, b),
+                48 => asm.ucomisd(a, b),
+                49 => asm.xorpd(a, b),
+                50 => asm.movsd_rr(a, b),
+                51 => asm.cvtss2sd(a, b),
+                52 => asm.cvtsd2ss(a, b),
+                53 => asm.cvtsi2sd(a, b),
+                54 => asm.cvttsd2si(a, b),
+                _ => panic("invalid encoder operation"),
+            }
+        }
+        asm.finish(); blob(&*out, asm.code); put(&*out, asm.relocs.len() as ulong, 8);
+        for (r in &const asm.relocs) { put(&*out, r.offset as ulong, 8); string(&*out, r.symbol); put(&*out, reloc_index(r.kind) as ulong, 1); put(&*out, r.addend as ulong, 8); }
+        for (i in 0..labels) { put(&*out, if (asm.is_bound(i as int)) { 1 } else { 0 }, 1); put(&*out, asm.label_pos(i as int) as ulong, 8); }
+    }
+}
+void objects(&Reader input, &Vec<byte> out) {
+    usize count = input.word(8) as usize; put(&*out, count as ulong, 8);
+    for (i in 0..count) {
+        var obj = ObjectFile.new(); obj.text = input.blob(); obj.rodata = input.blob();
+        usize symbols = input.word(8) as usize;
+        for (j in 0..symbols) {
+            String name = input.string(); ulong offset = input.word(8);
+            bool is_text = input.word(1) != 0; bool global = input.word(1) != 0; bool defined = input.word(1) != 0;
+            obj.symbols.push(ObjSymbol { name: name, offset: offset, is_text: is_text, global: global, defined: defined });
+        }
+        usize relocs = input.word(8) as usize;
+        for (j in 0..relocs) {
+            usize offset = input.word(8) as usize; String symbol = input.string(); RelocKind kind = reloc_kind(input.word(1) as byte);
+            long addend = input.word(8) as long; bool is_text = input.word(1) != 0;
+            obj.relocs.push(ObjReloc { offset: offset, symbol: symbol, kind: kind, addend: addend, is_text: is_text });
+        }
+        blob(&*out, write_object(obj, ObjectFormat.Elf));
+        blob(&*out, write_object(obj, ObjectFormat.Coff));
+        blob(&*out, write_object(obj, ObjectFormat.MachO));
+        // Include unchanged inputs after all writers to detect in-place patches.
+        blob(&*out, obj.text); blob(&*out, obj.rodata);
+    }
+}
+void targets(&Reader input, &Vec<byte> out) {
+    Vec<TargetOs> systems = Vec.new(); systems.push(TargetOs.Linux); systems.push(TargetOs.Windows); systems.push(TargetOs.MacOs);
+    for (os in &const systems) {
+        for (flags in 0..4) {
+            var target = Target.new(*os);
+            put(&*out, if (target.register_allocation) { 1 } else { 0 }, 1);
+            put(&*out, if (target.checked_arithmetic) { 1 } else { 0 }, 1);
+            target.register_allocation = (flags & 1) != 0; target.checked_arithmetic = (flags & 2) != 0;
+            string(&*out, target.name()); put(&*out, if (target.win64_abi()) { 1 } else { 0 }, 1);
+            byte format = match target.format() { Elf => 0, Coff => 1, MachO => 2 };
+            put(&*out, format as ulong, 1);
+            put(&*out, if (target.register_allocation) { 1 } else { 0 }, 1);
+            put(&*out, if (target.checked_arithmetic) { 1 } else { 0 }, 1);
+        }
+    }
+    usize names = input.word(8) as usize; put(&*out, names as ulong, 8);
+    for (i in 0..names) { String name = input.string(); string(&*out, symbol_for(name)); }
+}
+main() {
+    var args = env.args(); if (args.len() != 3) { panic("usage: backend_probe <input> <report>"); }
+    Vec<byte> data = match fs.read(args.get(1).unwrap().as_str()) { Ok(value) => value, Err(_) => panic("backend input I/O failed") };
+    var input = Reader { data: data, offset: 0 };
+    Vec<byte> out = Vec.new(); instructions(&input, &out); objects(&input, &out); targets(&input, &out);
+    if (input.offset != input.data.len()) { panic("backend input has trailing bytes"); }
+    match fs.write(args.get(2).unwrap().as_str(), out) { Ok(_) => {}, Err(_) => panic("backend report I/O failed") }
+}
+

@@ -1,0 +1,42 @@
+import std.task.pool.{Executor,BlockingPool,BlockingSpawner};
+import std.task.block_on_send;
+import std.asyncio;
+import std.fs;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("I/O error") } }
+void require(bool value) { if (!value) { panic("async I/O assertion failed"); } }
+async send void add(asyncio.AsyncFile file) { ok(await file.write_text(String.from("x"))); }
+async send String line(BlockingSpawner pool) { return ok(await asyncio.read_line(pool)).unwrap(); }
+main() {
+    var blocking = ok(BlockingPool.new(2));
+    var executor = ok(Executor.new(2));
+    ok(block_on_send(asyncio.write_text(blocking.spawner(),String.from("async-roundtrip.txt"),String.from("async data"))));
+    var task = ok(executor.spawn(asyncio.read_text(blocking.spawner(),String.from("async-roundtrip.txt"))));
+    String text = ok(ok(task.join())); print(text);
+    var file = ok(block_on_send(asyncio.AsyncFile.open_read_write(blocking.spawner(),String.from("async-roundtrip.txt"))));
+    require(ok(block_on_send(file.position())) == 0);
+    ok(block_on_send(file.seek(6,fs.SeekFrom.Start)));
+    ok(block_on_send(file.write_text(String.from("file"))));
+    ok(block_on_send(file.flush()));
+    ok(block_on_send(file.seek(0,fs.SeekFrom.Start)));
+    String changed = ok(block_on_send(file.read_text())); print(changed);
+    var alias = file.clone();
+    ok(block_on_send(file.close()));
+    require(block_on_send(alias.read(1)).is_err());
+    var output = ok(block_on_send(asyncio.AsyncFile.create(blocking.spawner(),String.from("async-count.txt"))));
+    var jobs = Vec.new();
+    for (i in 0..32) { jobs.push(ok(executor.spawn(add(output.clone())))); }
+    while (!jobs.is_empty()) { ok(jobs.pop().unwrap().join()); }
+    ok(block_on_send(output.close()));
+    var bytes = ok(block_on_send(asyncio.read(blocking.spawner(),String.from("async-count.txt"))));
+    require(bytes.len() == 32); for (i in 0..bytes.len()) { require(bytes[i] == 120); }
+    var one = ok(executor.spawn(line(blocking.spawner())));
+    var two = ok(executor.spawn(line(blocking.spawner())));
+    String first = ok(one.join()); String second = ok(two.join());
+    &const str a = first; &const str b = second;
+    require((a == "alpha" && b == "beta") || (a == "beta" && b == "alpha"));
+    print("files and input complete");
+    ok(fs.remove("async-roundtrip.txt")); ok(fs.remove("async-count.txt"));
+    executor.wait(); blocking.wait();
+    blocking.shutdown();
+    require(block_on_send(asyncio.read_text(blocking.spawner(),String.from("closed"))).is_err());
+}

@@ -1,0 +1,171 @@
+struct Ticket {
+    int id;
+    bool positive(&const self) { return self.id > 0; }
+    void bump(&self) { self.id += 1; }
+}
+impl Drop for Ticket {
+    void drop(&self) { print("drop {self.id}"); }
+}
+
+struct Pair { int left; int right; }
+struct Handler { fn(int) -> int callback; }
+struct Owner { fn(int) -> int callback; Ticket ticket; }
+
+const global_increment = |int x| { int amount = 1; return x + amount; };
+int constant_user() { return global_increment(10); }
+int generic_constant_user<T: Copy>(T unused) { return global_increment(11); }
+
+int double_it(int x) { return x * 2; }
+int apply(fn(int) -> int f, int x) { return f(x); }
+
+fn(int) -> int offset(int base) {
+    return |int x| x + base;
+}
+
+fn(int) -> int ticket_closure(int id) {
+    var ticket = Ticket { id: id };
+    return |int x| ticket.id + x;
+}
+
+fn(int) -> int named_closure() { return double_it; }
+Handler handler_factory(int id) { return Handler { callback: ticket_closure(id) }; }
+
+fn() -> String text_closure(String text) {
+    return || String.from(text);
+}
+
+int early_argument() {
+    ticket_closure(180)({ return 9; });
+    return 0;
+}
+
+int? missing_argument() { return None; }
+int? try_argument() { return Some(ticket_closure(190)(missing_argument()?)); }
+
+fn(T) -> T generic_offset<T: Copy + Add>(T base) {
+    return |T x| x + base;
+}
+
+main() {
+    var increment = |int x| x + 1;
+    print("empty {increment(4)} {increment(7)}");
+    print("apply {apply(|int x| x * 3, 5)}");
+    print("named {apply(double_it, 6)}");
+    var named = named_closure();
+    print("named returned {named(7)} {named(8)}");
+
+    int counter = 10;
+    var count = |int amount| { counter += amount; counter };
+    print("counter {count(2)} {count(3)} outer {counter}");
+    print("nested call {count(count(1))}");
+    print("constant {global_increment(8)}");
+    print("constant users {constant_user()} {generic_constant_user<int>(0)} {generic_constant_user<long>(0)}");
+
+    var add = offset(20);
+    print("returned {add(2)} {add(4)}");
+    print("temporary {offset(30)(5)}");
+    var generic = generic_offset<int>(40);
+    print("generic {generic(2)}");
+    var generic_long = generic_offset<long>(400);
+    print("generic long {generic_long(3)}");
+
+    int base = 50;
+    var nested = |int x| { var inner = |int y| base + x + y; inner(3) };
+    print("nested {nested(2)}");
+    var factory = |int x| |int y| x + y;
+    var product = factory(5);
+    print("nested returned {product(6)}");
+
+    int left = 60;
+    var shorthand = |int x| { var pair = Pair { left, right: x }; pair.left + pair.right };
+    print("shorthand {shorthand(4)}");
+
+    String text = String.from("hello");
+    var length = |int extra| (text.len() as int) + extra;
+    print("string {length(1)} {length(2)}");
+    var text_copy = text_closure(String.from("owned"));
+    print(text_copy());
+    print(text_copy());
+    var floating = |double a, double b| a + b;
+    print("float {floating(1.5, 2.5)}");
+    var no_result = |String value| { print(value); };
+    no_result(String.from("void argument"));
+
+    {
+        var callbacks = [ticket_closure(140), ticket_closure(150)];
+        print("array {callbacks[0](1)} {callbacks[1](2)}");
+    }
+    {
+        var callback = Some(ticket_closure(160));
+        match callback {
+            Some(f) => { print("option {f(3)}"); }
+            None => { }
+        }
+    }
+
+    {
+        var owned = ticket_closure(70);
+        print("ticket {owned(1)} {owned(2)}");
+    }
+    print("temporary ticket {ticket_closure(80)(3)}");
+    print("applied ticket {apply(ticket_closure(90), 4)}");
+    {
+        var moved = ticket_closure(100);
+        var owner = moved;
+        print("moved {owner(5)}");
+    }
+    {
+        var replaced = ticket_closure(110);
+        replaced = ticket_closure(120);
+        print("replaced {replaced(6)}");
+    }
+    {
+        var conditional = ticket_closure(130);
+        if (true) { var owner = conditional; print("branch {owner(7)}"); }
+    }
+    {
+        var inner = ticket_closure(170);
+        var outer = |int x| inner(x) + 1;
+        print("nested owned {outer(8)}");
+    }
+    {
+        var handler = Handler { callback: ticket_closure(210) };
+        var reference = &handler;
+        print("field {reference.callback(1)}");
+        var tuple = (ticket_closure(220), 0);
+        print("tuple {tuple.0(2)}");
+        Vec<fn(int) -> int> callbacks = Vec.new();
+        callbacks.push(ticket_closure(230));
+        callbacks.push(ticket_closure(240));
+        match callbacks.pop() {
+            Some(callback) => print("vector {callback(3)}"),
+            None => { }
+        }
+    }
+    print("early {early_argument()}");
+    print("try {try_argument().is_none()}");
+    print("temporary field {handler_factory(270).callback(4)}");
+    for (i in 0..3) { ticket_closure(200 + i)({ continue; }); }
+    loop { ticket_closure(203)({ break; }); }
+    {
+        var first = Ticket { id: 250 };
+        var second = Ticket { id: 260 };
+        var both = || first.id + second.id;
+        print("captures {both()}");
+    }
+    {
+        bool flag = false;
+        bool skipped = flag && Ticket { id: 280 }.positive();
+        bool taken = !flag && Ticket { id: 281 }.positive();
+        bool skipped_call = !flag || ticket_closure(282)(1) > 0;
+        bool taken_call = flag || ticket_closure(283)(1) > 0;
+        print("branches {skipped} {taken} {skipped_call} {taken_call}");
+        var changed = Ticket { id: 284 };
+        changed.bump();
+    }
+    {
+        var owner = Owner { callback: ticket_closure(290), ticket: Ticket { id: 291 } };
+        var r = &owner;
+        print("owner {r.callback(2)}");
+    }
+}

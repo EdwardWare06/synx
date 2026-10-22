@@ -1,0 +1,60 @@
+/// Isolated linker reader probe. No compiler-driver integration.
+/// Usage: probe <archive> <report>. Report bytes are deterministic and owned.
+import link.archive;
+import link.reader.{ErrorKind, ReadError};
+import link.reader;
+import std.env;
+import std.fs;
+import std.utf8;
+
+void text(&Vec<byte> out, &const str value) {
+    var encoded = utf8.encode(value); for (ch in &const encoded) { out.push(*ch); }
+}
+void hex(&Vec<byte> out, &const Vec<byte> data, usize offset, usize size) {
+    for (i in 0..size) {
+        byte ch = *data.get(offset + i).unwrap();
+        byte high = ch >> 4; byte low = ch & 15;
+        out.push(if (high < 10) { high + 48 } else { high + 87 });
+        out.push(if (low < 10) { low + 48 } else { low + 87 });
+    }
+}
+T expect<T>(Result<T, ReadError> value) {
+    match value { Ok(item) => return item, Err(_) => panic("linker reader check failed") }
+}
+void require(bool value) { if (!value) { panic("linker reader assertion failed"); } }
+void checks() {
+    Vec<byte> data = Vec.new(); data.push(1); data.push(2);
+    require(expect(reader.word(data, 0, 2, true)) == 513);
+    require(expect(reader.word(data, 0, 2, false)) == 258);
+    require(reader.word(data, 0, 0, true).is_err());
+    require(reader.word(data, 0, 9, true).is_err());
+    require(reader.word(data, 1, 2, true).is_err());
+    require(reader.range(data, 18446744073709551615 as usize, 2).is_err());
+    require(expect(reader.range(data, 2, 0)) == 2);
+    var maximum = utf8.encode("18446744073709551615");
+    require(expect(reader.decimal(maximum, 0, maximum.len())) == 18446744073709551615 as usize);
+    var overflow = utf8.encode("18446744073709551616");
+    require(reader.decimal(overflow, 0, overflow.len()).is_err());
+}
+pub void run() {
+    checks();
+    var args = env.args(); if (args.len() != 3) { panic("usage: linker_probe <archive> <report>"); }
+    var data = match fs.read(args.get(1).unwrap().as_str()) { Ok(value) => value, Err(_) => panic("cannot read archive") };
+    Vec<byte> report = Vec.new();
+    match archive.parse(data) {
+        Err(error) => {
+            var kind = match error.kind { Truncated => "truncated", Invalid => "invalid", Unsupported => "unsupported", Overflow => "overflow" };
+            text(&report, "error {kind} {error.offset}\n");
+        },
+        Ok(members) => {
+            text(&report, "ok\n");
+            for (member in &const members) {
+                int metadata = if (member.metadata) { 1 } else { 0 };
+                text(&report, "{member.header} {member.offset} {member.size} {metadata} ");
+                hex(&report, member.name, 0, member.name.len()); text(&report, " ");
+                hex(&report, data, member.offset, member.size); text(&report, "\n");
+            }
+        }
+    }
+    match fs.write(args.get(2).unwrap().as_str(), report) { Ok(_) => {}, Err(_) => panic("cannot write linker report") }
+}

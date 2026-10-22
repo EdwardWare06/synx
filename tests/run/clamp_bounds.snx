@@ -1,0 +1,2 @@
+import std.math.clamp;
+main() { clamp(0.0, 2.0, 1.0); }

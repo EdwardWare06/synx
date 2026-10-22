@@ -1,0 +1,141 @@
+import std.utf8;
+byte at(&const str text, usize index) { return unsafe { *((text.as_ptr() as usize + index) as *const byte) }; }
+String copy(&const str text, usize start, usize end) {
+    if (start == end) { return String.new(); }
+    return String.from(unsafe { str_from_raw((text.as_ptr() as usize + start) as *const byte, end - start) });
+}
+pub bool is_boundary(&const str text, usize index) {
+    if (index > text.len()) { return false; }
+    if (index == 0 || index == text.len()) { return true; }
+    return (at(text, index) & 192) != 128;
+}
+/// Byte offsets must be in order, in bounds, and on UTF-8 boundaries.
+pub String? slice(&const str text, usize start, usize end) {
+    if (start > end || !is_boundary(text, start) || !is_boundary(text, end)) { return None; }
+    return Some(copy(text, start, end));
+}
+bool matches(&const str text, usize start, &const str needle) {
+    for (i in 0..needle.len()) { if (at(text, start + i) != at(needle, i)) { return false; } }
+    return true;
+}
+pub usize? find(&const str text, &const str needle) {
+    if (needle.len() == 0) { return Some(0); }
+    if (needle.len() > text.len()) { return None; }
+    for (i in 0..=(text.len() - needle.len())) { if (matches(text, i, needle)) { return Some(i); } }
+    return None;
+}
+pub usize? rfind(&const str text, &const str needle) {
+    if (needle.len() > text.len()) { return None; }
+    usize i = text.len() - needle.len();
+    while (true) {
+        if (matches(text, i, needle)) { return Some(i); }
+        if (i == 0) { return None; }
+        i -= 1;
+    }
+    return None;
+}
+pub bool starts_with(&const str text, &const str prefix) { return prefix.len() <= text.len() && matches(text, 0, prefix); }
+pub bool ends_with(&const str text, &const str suffix) { return suffix.len() <= text.len() && matches(text, text.len() - suffix.len(), suffix); }
+pub String replace(&const str text, &const str needle, &const str replacement) {
+    if (needle.len() == 0) { panic("replace requires a nonempty search string"); }
+    var result = String.new(); usize at = 0; usize start = 0;
+    while (needle.len() <= text.len() - at) {
+        if (matches(text, at, needle)) {
+            var prefix = copy(text, start, at); result.push_str(prefix);
+            result.push_str(replacement); at += needle.len(); start = at;
+        } else { at += 1; }
+    }
+    var tail = copy(text, start, text.len()); result.push_str(tail); return result;
+}
+String ascii_case(&const str text, bool upper) {
+    var bytes = utf8.encode(text);
+    for (i in 0..bytes.len()) {
+        match bytes.get_mut(i) {
+            Some(b) => {
+                if (upper && *b >= 97 && *b <= 122) { *b -= 32; }
+                else if (!upper && *b >= 65 && *b <= 90) { *b += 32; }
+            }
+            None => {}
+        }
+    }
+    match utf8.decode(bytes) { Some(result) => return result, None => panic("invalid UTF-8 text") }
+}
+pub String to_ascii_lowercase(&const str text) { return ascii_case(text, false); }
+pub String to_ascii_uppercase(&const str text) { return ascii_case(text, true); }
+pub String join(&const Vec<String> parts, &const str separator) {
+    var result = String.new(); bool first = true;
+    for (part in parts) {
+        if (!first) { result.push_str(separator); }
+        result.push_str(part.as_str()); first = false;
+    }
+    return result;
+}
+/// LF-separated lines, including empty fields and a final empty field.
+/// A CR immediately before an LF is removed.
+pub Vec<String> lines(&const str text) {
+    Vec<String> result = Vec.new(); usize start = 0;
+    for (i in 0..text.len()) {
+        if (at(text, i) == 10) {
+            usize end = i;
+            if (end > start && at(text, end - 1) == 13) { end -= 1; }
+            result.push(copy(text, start, end)); start = i + 1;
+        }
+    }
+    result.push(copy(text, start, text.len())); return result;
+}
+pub Vec<uint> code_points(&const str text) {
+    Vec<uint> points = Vec.new(); usize i = 0;
+    while (i < text.len()) {
+        byte first = at(text, i);
+        usize count = 1; uint point = first as uint;
+        if (first >= 240) { count = 4; point = (first & 7) as uint; }
+        else if (first >= 224) { count = 3; point = (first & 15) as uint; }
+        else if (first >= 192) { count = 2; point = (first & 31) as uint; }
+        for (j in 1..count) { point = (point << 6) | ((at(text, i + j) & 63) as uint); }
+        points.push(point); i += count;
+    }
+    return points;
+}
+pub String? from_code_point(uint point) {
+    if (point > 1114111 || (point >= 55296 && point <= 57343)) { return None; }
+    Vec<byte> bytes = Vec.new();
+    if (point < 128) { bytes.push(point as byte); }
+    else if (point < 2048) { bytes.push((192 | (point >> 6)) as byte); bytes.push((128 | (point & 63)) as byte); }
+    else if (point < 65536) {
+        bytes.push((224 | (point >> 12)) as byte); bytes.push((128 | ((point >> 6) & 63)) as byte); bytes.push((128 | (point & 63)) as byte);
+    } else {
+        bytes.push((240 | (point >> 18)) as byte); bytes.push((128 | ((point >> 12) & 63)) as byte);
+        bytes.push((128 | ((point >> 6) & 63)) as byte); bytes.push((128 | (point & 63)) as byte);
+    }
+    return utf8.decode(bytes);
+}
+ulong? parse_digits(&const str text, usize start, ulong limit) {
+    if (start == text.len()) { return None; }
+    ulong value = 0;
+    for (i in start..text.len()) {
+        byte b = at(text, i);
+        if (b < 48 || b > 57) { return None; }
+        ulong digit = (b - 48) as ulong;
+        if (value > (limit - digit) / 10) { return None; }
+        value = value * 10 + digit;
+    }
+    return Some(value);
+}
+/// Strict decimal parsing; an optional leading + is allowed.
+pub ulong? parse_ulong(&const str text) {
+    usize start = if (text.len() > 0 && at(text, 0) == 43) { 1 } else { 0 };
+    return parse_digits(text, start, 18446744073709551615);
+}
+/// Strict decimal parsing; a leading + or - is allowed.
+pub long? parse_long(&const str text) {
+    bool negative = text.len() > 0 && at(text, 0) == 45;
+    usize start = if (text.len() > 0 && (negative || at(text, 0) == 43)) { 1 } else { 0 };
+    ulong limit = if (negative) { 9223372036854775808 } else { 9223372036854775807 };
+    match parse_digits(text, start, limit) {
+        None => return None,
+        Some(value) => {
+            if (negative && value == 9223372036854775808) { return Some(-9223372036854775807 - 1); }
+            return Some(if (negative) { -(value as long) } else { value as long });
+        }
+    }
+}

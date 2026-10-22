@@ -1,0 +1,4 @@
+/// Adversarial reader checks; no object extraction or external linker invocation.
+import link.object_checks;
+import std.io;
+main() { var count = object_checks.run(); print("object readers: {count} cases passed"); }

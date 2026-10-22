@@ -1,0 +1,6 @@
+import std.env;
+main() {
+    var arguments = env.args();
+    match arguments.get(1) { Some(arg) => { if (*arg != String.from("héllo 🧠")) { panic("argument changed"); } } None => panic("missing argument") }
+    print("Unicode arguments ok");
+}

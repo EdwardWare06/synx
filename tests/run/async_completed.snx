@@ -1,0 +1,6 @@
+async int done() { return 1; }
+main() {
+    var task=done(); var wake=Waker.new();
+    match task.poll(wake.clone()) { Poll.Ready(n) => print("ready {n}"), Poll.Pending => panic("expected ready") }
+    task.poll(wake.clone());
+}

@@ -1,0 +1,60 @@
+import std.path.{Path, Style};
+import std.fs;
+import std.fs.IoError;
+void require(bool value) { if (!value) { panic("path test failed"); } }
+void equals(&const str got, &const str want) { require(String.from(got) == String.from(want)); }
+T ok<T>(Result<T, IoError> result) { match result { Ok(value) => return value, Err(_) => panic("path I/O failed") } }
+void normalized(&const str text, Style style, &const str want) {
+    var result = Path.with_style(text, style).normalize(); equals(result.as_str(), want);
+}
+main() {
+    normalized("a//b/./c/../d/", Style.Unix, "a/b/d");
+    normalized("/../../a", Style.Unix, "/a");
+    normalized("a/../../b", Style.Unix, "../b");
+    normalized("a/..", Style.Unix, ".");
+    normalized("", Style.Unix, "");
+    normalized("a\\b", Style.Unix, "a\\b");
+    normalized("C:\\a\\..\\é\\b", Style.Windows, "C:/é/b");
+    normalized("C:a\\..\\..\\b", Style.Windows, "C:../b");
+    normalized("C:\\..\\..", Style.Windows, "C:/");
+    normalized("\\\\sérver\\sharé\\a\\..\\..", Style.Windows, "//sérver/sharé");
+    normalized("\\a\\..\\b", Style.Windows, "/b");
+    {
+        var base = Path.with_style("C:\\base", Style.Windows);
+        var child = base.join("next"); equals(child.as_str(), "C:\\base/next");
+        var rooted = base.join("\\root"); equals(rooted.as_str(), "C:\\root");
+        var drive = base.join("D:other"); equals(drive.as_str(), "D:other");
+        require(base.is_absolute());
+        require(!Path.with_style("C:relative", Style.Windows).is_absolute());
+        require(!Path.with_style("\\rooted", Style.Windows).is_absolute());
+        require(Path.with_style("\\\\server\\share", Style.Windows).is_absolute());
+    }
+    {
+        var path = Path.with_style("/folder/café.snx/", Style.Unix);
+        match path.file_name() { Some(name) => equals(name, "café.snx"), None => panic("no file name") }
+        match path.extension() { Some(ext) => equals(ext, "snx"), None => panic("no extension") }
+        match path.parent() { Some(parent) => equals(parent.as_str(), "/folder"), None => panic("no parent") }
+        require(Path.with_style("/", Style.Unix).parent().is_none());
+        require(Path.with_style("/", Style.Unix).file_name().is_none());
+        require(Path.from(".hidden").extension().is_none());
+        match Path.from("file").parent() { Some(parent) => equals(parent.as_str(), ""), None => panic("no relative parent") }
+        var absolute = path.join("/other"); equals(absolute.as_str(), "/other");
+    }
+    require(!ok(fs.exists("missing-path")));
+    ok(fs.create_dir("path-é"));
+    require(fs.create_dir("path-é").is_err());
+    require(ok(fs.exists("path-é")));
+    { var info = ok(fs.metadata("path-é")); require(info.is_dir && !info.is_file); }
+    var file = Path.from("path-é").join("input.txt");
+    ok(fs.write_text(file.as_str(), "abc"));
+    { var info = ok(fs.metadata(file.as_str())); require(info.is_file && !info.is_dir && info.len == 3); }
+    require(fs.remove_dir("path-é").is_err());
+    var target = Path.from("path-é").join("moved.txt");
+    ok(fs.rename(file.as_str(), target.as_str()));
+    require(!ok(fs.exists(file.as_str())) && ok(fs.exists(target.as_str())));
+    require(fs.rename(file.as_str(), target.as_str()).is_err());
+    ok(fs.remove(target.as_str())); ok(fs.remove_dir("path-é"));
+    { var cwd = ok(fs.current_dir()); require(Path.from(cwd).is_absolute()); }
+    require(fs.metadata("bad\0path").is_err());
+    print("paths ok");
+}

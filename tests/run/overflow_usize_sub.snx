@@ -1,0 +1,1 @@
+main() { usize a = 0; usize b = 1; usize result = a - b; if (result != 18446744073709551615) { panic("wrong release result"); } }

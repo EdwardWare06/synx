@@ -1,0 +1,443 @@
+/// Stable declaration serialization. Source: compiler/src/module_dump.cpp.
+/// Parity: tests/selfhost_modules_test.cpp. ASCII byte escaping, creation-order IDs.
+import ids.{DefId, DefKind, ModuleId, TypeId, NONE};
+import defs;
+import types;
+import declare.Resolver;
+import check.Checker;
+import check_data;
+import layout.{Layout, LayoutTable};
+import regalloc;
+import axon;
+import target.{Target, TargetOs};
+import ir;
+import ast;
+import bytes;
+import source.Span;
+import diagnostics.Severity;
+
+String flag(bool value) { return String.from(if (value) { "1" } else { "0" }); }
+String did(DefId id) {
+    if (id.index == NONE) { return String.from("nil"); }
+    match id.kind { DefKind.Struct => return "struct#{id.index}", DefKind.Enum => return "enum#{id.index}",
+        DefKind.Trait => return "trait#{id.index}", DefKind.Impl => return "impl#{id.index}",
+        DefKind.Function => return "fn#{id.index}", DefKind.Const => return "const#{id.index}" }
+}
+String mid(ModuleId id) { return if (id.index == NONE) { String.from("nil") } else { "module#{id.index}" }; }
+String index(&const str kind, uint id) { return if (id == NONE) { String.from("nil") } else { "{kind}#{id}" }; }
+/// Parameter identities in pre-order (inner, elems, ret): names alone cannot
+/// distinguish a method's T from its owner's T.
+void params(&const Resolver r, TypeId id, &String text) {
+    if (id.index == NONE) { return; }
+    var t = r.types.get(id);
+    match t.kind {
+        types.TypeKind.Param => { if (!text.is_empty()) { text.push(' '); } var owner = did(t.owner); text.push_str("{owner}:{t.index}"); return; }
+        _ => {}
+    }
+    params(r, t.inner, &*text);
+    for (e in &const t.elems) { params(r, *e, &*text); }
+    params(r, t.ret, &*text);
+}
+struct Dump {
+    Vec<byte> out;
+    Dump new() { return Dump { out: Vec.new() }; }
+    void text(&self, &const str value) { bytes.text(&self.out, value); }
+    void quoted(&self, &const str value) {
+        self.out.push(34);
+        for (i in 0..value.len()) {
+            byte b = unsafe { *((value.as_ptr() as usize + i) as *const byte) };
+            if (b < 32 || b > 126 || b == 34 || b == 92) {
+                self.out.push(92); self.out.push(120);
+                byte hi = b / 16; byte lo = b % 16;
+                self.out.push(if (hi < 10) { 48 + hi } else { 65 + hi - 10 });
+                self.out.push(if (lo < 10) { 48 + lo } else { 65 + lo - 10 });
+            } else { self.out.push(b); }
+        }
+        self.out.push(34);
+    }
+    void span(&self, Span s) { self.text(" @{s.start}-{s.end}:{s.file}"); }
+    void type(&self, &const Resolver r, TypeId id) {
+        self.text(" "); if (id.index == NONE) { self.text("nil"); } else { var name = r.types.to_string(id); self.quoted(name); }
+        var identities = String.new(); params(r, id, &identities);
+        if (!identities.is_empty()) { self.text("{{{identities}}}"); }
+    }
+    /// A bound prints as (trait type...); an unresolved trait prints nil.
+    void bound(&self, &const Resolver r, &const defs.TraitRef b) {
+        var owner = did(b.trait_def); self.text("({owner}"); for (a in &const b.args) { self.type(r, *a); } self.text(")");
+    }
+    void generics(&self, &const Resolver r, &const Vec<defs.GenericParamDef> gs) {
+        self.text(" [");
+        for (g in gs) {
+            self.text("("); self.quoted(g.name); self.span(g.span); self.type(r, g.type);
+            self.text(" ["); for (b in &const g.bounds) { self.bound(r, b); } self.text("])");
+        }
+        self.text("]");
+    }
+    void types(&self, &const Resolver r, &const Vec<TypeId> ts) { self.text(" ["); for (t in ts) { self.type(r, *t); } self.text("]"); }
+    void fields(&self, &const Resolver r, &const Vec<defs.FieldDef> fs) {
+        self.text(" [");
+        for (f in fs) { self.text("("); self.quoted(f.name); self.span(f.span); self.type(r, f.type); var public = flag(f.is_pub); self.text(" {public})"); }
+        self.text("]");
+    }
+    void methods(&self, &const Vec<DefId> ms) { self.text(" ["); for (m in ms) { var id = did(*m); self.text("{id} "); } self.text("]"); }
+    void symbols(&self, &const defs.SymbolTable table) {
+        self.text(" [\n");
+        for (entry in &const table.entries) {
+            var s = &const entry.symbol; self.text("  "); self.quoted(entry.name);
+            var sd = index("struct", s.struct_def); var ed = index("enum", s.enum_def); var td = index("trait", s.trait_def);
+            var fd = index("fn", s.fn_def); var cd = index("const", s.const_def); var md = index("module", s.module_def);
+            var vd = if (s.variant == NONE) { String.from("nil") } else { "enum#{s.enum_def}.variant#{s.variant}" }; var public = flag(s.is_pub);
+            self.text(" {s.kind} {sd} {ed} {td} {fd} {cd} {vd} {md} {public}"); self.span(s.span); self.text("\n");
+        }
+        self.text("]\n");
+    }
+    void nominal(&self, &const Resolver r, &const Vec<defs.Definition> values, DefKind kind) {
+        for (i in 0..values.len()) {
+            var d = values.get(i).unwrap(); var id = did(DefId { kind: kind, index: i as uint }); var module = mid(d.module); var public = flag(d.is_pub);
+            self.text("{id} "); self.quoted(d.name); self.span(d.span); self.text(" {module} {public}");
+            match kind { DefKind.Struct => { var string = flag(d.is_builtin_string); var vec = flag(d.is_builtin_vec); self.text(" {string} {vec}"); }, _ => {} }
+            self.type(r, d.self_type); self.generics(r, d.generics); self.methods(d.methods);
+            match kind { DefKind.Struct => { self.fields(r, d.fields); }, _ => {} }
+            self.text("\n");
+            match kind { DefKind.Enum => {
+                for (v in &const d.variants) {
+                    self.text("{id}.variant#{v.index} "); self.quoted(v.name); self.span(v.span);
+                    uint vk = 0; match v.kind { ast.VariantKind.Tuple => { vk = 1; }, ast.VariantKind.Struct => { vk = 2; }, _ => {} }
+                    var owner = did(v.owner); self.text(" {vk} {owner}"); self.types(r, v.tuple_types); self.fields(r, v.fields); self.text("\n");
+                }
+            }, _ => {} }
+        }
+    }
+    void pending(&self, &const str name, &const Vec<DefId> values) {
+        self.text("pending {name}"); self.methods(values); self.text("\n");
+    }
+    void run(&self, &const Resolver r) {
+        var p = &const r.program; var root = mid(p.root_module); var active = mid(p.active_module); self.text("modules {root} {active}\n");
+        for (i in 0..p.modules.len()) {
+            var m = p.modules.get(i).unwrap(); var public = flag(m.is_prelude); var owner = mid(m.namespace_owner); var base = mid(m.base_module);
+            self.text("module#{i} "); self.quoted(m.name); self.text(" {m.file} {public} {owner} {base}"); self.symbols(m.symbols);
+        }
+        self.nominal(r, p.structs, DefKind.Struct); self.nominal(r, p.enums, DefKind.Enum); self.nominal(r, p.traits, DefKind.Trait);
+        for (i in 0..p.impls.len()) {
+            var d = p.impls.get(i).unwrap(); self.text("impl#{i}"); self.span(d.span); var module = mid(d.module); self.text(" {module}");
+            self.type(r, d.self_type); self.text(" "); self.bound(r, d.trait_ref); self.generics(r, d.generics); self.methods(d.methods); self.text("\n");
+        }
+        for (i in 0..p.functions.len()) {
+            var d = p.functions.get(i).unwrap(); self.text("fn#{i} "); self.quoted(d.name); self.span(d.span);
+            var module = mid(d.module); var public = flag(d.is_pub); var builtin = flag(d.is_builtin); var prelude = flag(d.is_prelude);
+            uint owner = 0; match d.owner { defs.FnOwner.Struct => { owner = 1; }, defs.FnOwner.Enum => { owner = 2; }, defs.FnOwner.Trait => { owner = 3; }, defs.FnOwner.Impl => { owner = 4; }, defs.FnOwner.Extern => { owner = 5; }, _ => {} }
+            var os = did(d.owner_struct); var oe = did(d.owner_enum); var ot = did(d.owner_trait); var oi = did(d.owner_impl);
+            var ret = flag(d.ret_declared); var checked = flag(d.checked); var checking = flag(d.checking);
+            self.text(" {module} {public} {builtin} {prelude} {owner} {os} {oe} {ot} {oi} {ret} {checked} {checking}");
+            self.type(r, d.self_type); self.type(r, d.ret); self.generics(r, d.generics); self.text(" [");
+            for (a in &const d.params) {
+                self.text("("); self.quoted(a.name); self.span(a.span); uint sk = 0;
+                match a.self_kind { ast.SelfKind.Value => { sk = 1; }, ast.SelfKind.Ref => { sk = 2; }, ast.SelfKind.ConstRef => { sk = 3; }, _ => {} }
+                self.text(" {sk}"); self.type(r, a.type); self.text(")");
+            }
+            self.text("]\n");
+        }
+        for (i in 0..p.consts.len()) {
+            var d = p.consts.get(i).unwrap(); var module = mid(d.module); var public = flag(d.is_pub); var checked = flag(d.checked); var checking = flag(d.checking);
+            self.text("const#{i} "); self.quoted(d.name); self.span(d.span); self.text(" {module} {public} {checked} {checking}"); self.type(r, d.ret); self.text("\n");
+        }
+        self.text("globals"); self.symbols(p.globals);
+        var option = did(p.option_def); var result = did(p.result_def); var string = did(p.string_def); var vec = did(p.vec_def);
+        var range = did(p.range_def); var inclusive = did(p.range_inclusive_def); var task = did(p.task_def); var send = did(p.send_task_def); var waker = did(p.waker_def); var poll = did(p.poll_def);
+        self.text("prelude {option} {result} {string} {vec} {range} {inclusive} {task} {send} {waker} {poll}\n");
+        for (entry in &const p.core_traits.entries) { self.text("core "); self.quoted(entry.name); self.text(" trait#{entry.index}\n"); }
+        if (!p.modules.is_empty() || !p.functions.is_empty()) {
+            self.pending("structs", r.pending_structs); self.pending("enums", r.pending_enums);
+            self.pending("traits", r.pending_traits); self.pending("impls", r.pending_impls);
+            self.pending("functions", r.pending_functions); self.pending("consts", r.pending_consts);
+            self.pending("str_methods", r.builtin_str_methods);
+        }
+        self.text("diagnostics {r.sink.errors}\n");
+        for (d in &const r.sink.items) {
+            uint severity = 0; match d.severity { Severity.Warning => { severity = 1; }, Severity.Note => { severity = 2; }, _ => {} }
+            self.text("{severity}"); self.span(d.span); self.text(" "); self.quoted(d.code); self.text(" "); var message = defs.name(d.message); self.quoted(message); self.text("\n");
+        }
+    }
+}
+pub Vec<byte> dump(&const Resolver resolver) { var d = Dump.new(); d.run(resolver); return d.out; }
+
+uint expr_kind(ast.ExprKind kind) {
+    match kind {
+        ast.ExprKind.IntLit => return 0, ast.ExprKind.FloatLit => return 1, ast.ExprKind.CharLit => return 2, ast.ExprKind.StringLit => return 3,
+        ast.ExprKind.BoolLit => return 4, ast.ExprKind.Interp => return 5, ast.ExprKind.Name => return 6, ast.ExprKind.Field => return 7,
+        ast.ExprKind.Call => return 8, ast.ExprKind.Index => return 9, ast.ExprKind.Unary => return 10, ast.ExprKind.Binary => return 11,
+        ast.ExprKind.Cast => return 12, ast.ExprKind.Try => return 13, ast.ExprKind.OptChain => return 14, ast.ExprKind.Coalesce => return 15,
+        ast.ExprKind.Range => return 16, ast.ExprKind.Ref => return 17, ast.ExprKind.StructLit => return 18, ast.ExprKind.Tuple => return 19,
+        ast.ExprKind.Array => return 20, ast.ExprKind.ArrayRepeat => return 21, ast.ExprKind.Block => return 22, ast.ExprKind.If => return 23,
+        ast.ExprKind.Match => return 24, ast.ExprKind.Closure => return 25, ast.ExprKind.Unsafe => return 26, ast.ExprKind.Await => return 27,
+        ast.ExprKind.Return => return 28, ast.ExprKind.Break => return 29, ast.ExprKind.Continue => return 30,
+    }
+}
+uint pattern_kind(ast.PatternKind kind) {
+    match kind {
+        ast.PatternKind.Wildcard => return 0, ast.PatternKind.Literal => return 1, ast.PatternKind.Binding => return 2, ast.PatternKind.Path => return 3,
+        ast.PatternKind.TupleStruct => return 4, ast.PatternKind.Struct => return 5, ast.PatternKind.Tuple => return 6, ast.PatternKind.Or => return 7,
+        ast.PatternKind.Range => return 8,
+    }
+}
+uint capture_kind(ast.CaptureMode mode) { match mode { ast.CaptureMode.Move => return 0, ast.CaptureMode.Shared => return 1, ast.CaptureMode.Writable => return 2 } }
+/// Checker tables in insertion order; matches dump_check in compiler/src/module_dump.cpp.
+struct CheckDump {
+    Dump d;
+    void expr(&self, &const Vec<ast.Ast> t, ulong key) {
+        var e = t.get(check_data.key_file(key) as usize).unwrap().expr(check_data.key_index(key)); uint k = expr_kind(e.kind);
+        self.d.text("{k}"); self.d.span(e.span);
+    }
+    void pattern(&self, &const Vec<ast.Ast> t, ulong key) {
+        var p = t.get(check_data.key_file(key) as usize).unwrap().pattern(check_data.key_index(key)); uint k = pattern_kind(p.kind);
+        self.d.text("{k}"); self.d.span(p.span);
+    }
+    void locals(&self, &const Resolver r, &const Vec<check_data.LocalVar> values) {
+        self.d.text(" [");
+        for (l in values) { self.d.text("("); self.d.quoted(l.name); self.d.type(r, l.type); var c = flag(l.is_const); self.d.text(" {c}"); self.d.span(l.span); self.d.text(")"); }
+        self.d.text("]");
+    }
+    void numbers(&self, &const Vec<uint> values) { self.d.text(" ["); for (v in values) { uint n = *v; self.d.text("{n} "); } self.d.text("]"); }
+    void header(&self, &const str name, usize count) { self.d.text("{name} {count}\n"); }
+    void run(&self, &const Checker c, &const Vec<ast.Ast> t) {
+        var r = &const c.r; var res = &const c.result;
+        self.d.text("check\n");
+        self.header("expr_types", res.expr_types.len());
+        for (i in 0..res.expr_types.len()) { self.d.text("  "); self.expr(t, *res.expr_types.keys.get(i).unwrap()); self.d.type(r, *res.expr_types.values.get(i).unwrap()); self.d.text("\n"); }
+        self.header("refs", res.refs.len());
+        for (i in 0..res.refs.len()) {
+            self.d.text("  "); self.expr(t, *res.refs.keys.get(i).unwrap()); var x = res.refs.values.get(i).unwrap();
+            uint kind = check_data.ref_kind_index(x.kind); var fd = did(x.fn_def); var im = did(x.impl_def); var tr = did(x.trait_def);
+            var vd = String.from("nil"); if (x.variant != NONE) { var en = did(x.variant_enum); vd = "{en}.variant#{x.variant}"; }
+            var cd = did(x.const_def); var sd = did(x.struct_def); var ed = did(x.enum_def);
+            self.d.text(" {kind} {x.local_id} {fd} {im} {tr} {vd} {cd} {sd} {ed} {x.field_index} {x.auto_derefs}");
+            self.d.types(r, &const x.type_args); self.d.types(r, &const x.owner_args); self.d.text("\n");
+        }
+        self.header("coercions", res.coercions.len());
+        for (i in 0..res.coercions.len()) {
+            self.d.text("  "); self.expr(t, *res.coercions.keys.get(i).unwrap()); var x = res.coercions.values.get(i).unwrap();
+            uint kind = check_data.coercion_index(x.kind); var first = flag(x.borrow_first); self.d.text(" {kind} {first}"); self.d.type(r, x.target); self.d.text("\n");
+        }
+        self.header("decl_locals", res.decl_locals.len());
+        for (i in 0..res.decl_locals.len()) {
+            ulong key = *res.decl_locals.keys.get(i).unwrap(); var s = t.get(check_data.key_file(key) as usize).unwrap().stmt(check_data.key_index(key));
+            self.d.text("  "); self.d.span(s.span); uint v = *res.decl_locals.values.get(i).unwrap(); self.d.text(" {v}\n");
+        }
+        self.header("pattern_locals", res.pattern_locals.len());
+        for (i in 0..res.pattern_locals.len()) { self.d.text("  "); self.pattern(t, *res.pattern_locals.keys.get(i).unwrap()); uint v = *res.pattern_locals.values.get(i).unwrap(); self.d.text(" {v}\n"); }
+        self.header("pattern_derefs", res.pattern_derefs.len());
+        for (i in 0..res.pattern_derefs.len()) { self.d.text("  "); self.pattern(t, *res.pattern_derefs.keys.get(i).unwrap()); int v = *res.pattern_derefs.values.get(i).unwrap(); self.d.text(" {v}\n"); }
+        self.header("fn_locals", res.fn_locals.len());
+        for (i in 0..res.fn_locals.len()) { ulong k = *res.fn_locals.keys.get(i).unwrap(); self.d.text("  fn#{k}"); self.locals(r, res.fn_locals.values.get(i).unwrap()); self.d.text("\n"); }
+        self.header("const_locals", res.const_locals.len());
+        for (i in 0..res.const_locals.len()) { ulong k = *res.const_locals.keys.get(i).unwrap(); self.d.text("  const#{k}"); self.locals(r, res.const_locals.values.get(i).unwrap()); self.d.text("\n"); }
+        self.header("closure_params", res.closure_params.len());
+        for (i in 0..res.closure_params.len()) { self.d.text("  "); self.expr(t, *res.closure_params.keys.get(i).unwrap()); self.numbers(res.closure_params.values.get(i).unwrap()); self.d.text("\n"); }
+        self.header("closure_captures", res.closure_captures.len());
+        for (i in 0..res.closure_captures.len()) { self.d.text("  "); self.expr(t, *res.closure_captures.keys.get(i).unwrap()); self.numbers(res.closure_captures.values.get(i).unwrap()); self.d.text("\n"); }
+        self.header("closure_capture_modes", res.closure_capture_modes.len());
+        for (i in 0..res.closure_capture_modes.len()) {
+            self.d.text("  "); self.expr(t, *res.closure_capture_modes.keys.get(i).unwrap()); self.d.text(" [");
+            for (m in res.closure_capture_modes.values.get(i).unwrap()) { uint mode = capture_kind(m.mode); uint local = m.local; self.d.text("({local} {mode})"); }
+            self.d.text("]\n");
+        }
+        self.header("closure_locals", res.closure_locals.len());
+        for (i in 0..res.closure_locals.len()) { self.d.text("  "); self.expr(t, *res.closure_locals.keys.get(i).unwrap()); self.locals(r, res.closure_locals.values.get(i).unwrap()); self.d.text("\n"); }
+        self.header("shorthand_locals", res.shorthand_locals.len());
+        for (i in 0..res.shorthand_locals.len()) {
+            ulong key = *res.shorthand_locals.keys.get(i).unwrap();
+            uint file = (key >> 48) as uint; uint expr = ((key >> 16) & 4294967295) as uint; usize position = (key & 65535) as usize;
+            var init = t.get(file as usize).unwrap().expr(expr).fields.get(position).unwrap();
+            self.d.text("  "); self.d.span(init.span); uint v = *res.shorthand_locals.values.get(i).unwrap(); self.d.text(" {v}\n");
+        }
+    }
+}
+/// Checker oracle text; matches dump_check in C++.
+pub Vec<byte> dump_check(&const Checker c, &const Vec<ast.Ast> trees) { var d = CheckDump { d: Dump.new() }; d.run(c, trees); return d.d.out; }
+
+/// Dendrite dump; matches the Dendrite section of compiler/src/module_dump.cpp.
+/// Functions are f#index and vtables v#index. Places print as _local then
+/// .fN field, [_N] index, .* deref, .vN downcast.
+struct IrDump {
+    Dump d;
+    String fid(&const self, uint index) { return if (index == NONE) { String.from("nil") } else { "f#{index}" }; }
+    String vid(&const self, uint index) { return if (index == NONE) { String.from("nil") } else { "v#{index}" }; }
+    void place(&self, &const ir.Place p) {
+        if (p.is_none()) { self.d.text("none"); return; }
+        self.d.text("_{p.local}");
+        for (pr in &const p.proj) {
+            match pr.kind {
+                ir.ProjKind.Field => { uint i = pr.index; self.d.text(".f{i}"); }
+                ir.ProjKind.Index => { uint i = pr.index; self.d.text("[_{i}]"); }
+                ir.ProjKind.Deref => { self.d.text(".*"); }
+                ir.ProjKind.Downcast => { uint i = pr.index; self.d.text(".v{i}"); }
+            }
+        }
+    }
+    void constant(&self, &const Resolver r, &const ir.Constant k) {
+        double value = k.float_value;
+        ulong bits = unsafe { *(((&const value) as *const double) as *const ulong) };
+        Vec<byte> hex = Vec.new(); ulong rest = bits;
+        for (i in 0..16) { byte nibble = (rest & 15) as byte; hex.push(if (nibble < 10) { 48 + nibble } else { 87 + nibble }); rest = rest >> 4; }
+        uint kind = ir.constant_index(k.kind); ulong int_value = k.int_value;
+        self.d.text("(k{kind} {int_value} ");
+        usize i = 16; while (i > 0) { i -= 1; self.d.out.push(*hex.get(i).unwrap()); }
+        self.d.text(" "); var text = defs.name(k.str_value); self.d.quoted(text); var f = self.fid(k.fn_index); self.d.text(" {f}");
+        self.d.type(r, k.type); self.d.text(")");
+    }
+    void operand(&self, &const Resolver r, &const ir.Operand o) {
+        match o.kind {
+            ir.OperandKind.Copy => { self.d.text("copy "); self.place(&const o.place); }
+            ir.OperandKind.Move => { self.d.text("move "); self.place(&const o.place); }
+            ir.OperandKind.Const => { self.d.text("const "); self.constant(r, &const o.constant); }
+        }
+    }
+    void operands(&self, &const Resolver r, &const Vec<ir.Operand> values) {
+        self.d.text(" ["); for (o in values) { self.d.text("("); self.operand(r, o); self.d.text(")"); } self.d.text("]");
+    }
+    void rvalue(&self, &const Resolver r, &const ir.Rvalue v) {
+        uint kind = ir.rvalue_index(v.kind); self.d.text("rv{kind} a=("); self.operand(r, &const v.a); self.d.text(") b=("); self.operand(r, &const v.b);
+        self.d.text(") place="); self.place(&const v.place);
+        var c = flag(v.is_const); uint bop = ir.binary_index(v.bop); uint uop = ir.unary_index(v.uop);
+        self.d.text(" const={c} bop={bop} uop={uop} type="); self.d.type(r, v.type);
+        uint agg = ir.aggregate_index(v.agg); uint variant = v.variant;
+        self.d.text(" agg={agg} variant={variant} elems="); self.operands(r, &const v.elems);
+        self.d.text(" captures="); self.operands(r, &const v.captures); var vt = self.vid(v.vtable); self.d.text(" vtable={vt}");
+    }
+    void terminator(&self, &const Resolver r, &const ir.Terminator t) {
+        uint kind = ir.terminator_index(t.kind); uint target = t.target;
+        self.d.text("    term{kind} target={target} discr=("); self.operand(r, &const t.discr); self.d.text(") cases=[");
+        for (c in &const t.cases) { ulong v = c.value; uint b = c.block; self.d.text("({v} {b})"); }
+        uint otherwise = t.otherwise; uint ck = ir.callee_index(t.callee.kind); var f = self.fid(t.callee.fn_index);
+        self.d.text("] otherwise={otherwise} callee=({ck} {f} "); self.d.quoted(t.callee.builtin);
+        self.d.types(r, &const t.callee.type_args); self.d.text(" ("); self.operand(r, &const t.callee.fn_operand);
+        uint slot = t.callee.vtable_slot; self.d.text(") {slot}) args="); self.operands(r, &const t.args);
+        self.d.text(" dest="); self.place(&const t.dest);
+        var diverges = flag(t.diverges); self.d.text(" diverges={diverges} cond=("); self.operand(r, &const t.cond);
+        self.d.text(") message="); self.d.quoted(t.message); self.d.span(t.span); self.d.text("\n");
+    }
+    void numbers(&self, &const Vec<uint> values) { self.d.text(" ["); for (v in values) { uint n = *v; self.d.text("{n} "); } self.d.text("]"); }
+    void function(&self, &const Resolver r, &const Vec<ast.Ast> trees, uint index, &const ir.Function f) {
+        var id = self.fid(index); self.d.text("{id} "); self.d.quoted(f.name); var def = did(f.def); self.d.text(" def={def} owner=");
+        self.d.types(r, &const f.owner_args); self.d.text(" args="); self.d.types(r, &const f.type_args); self.d.text(" ret="); self.d.type(r, f.ret);
+        uint argc = f.arg_count; var lowered = flag(f.lowered); self.d.text(" argc={argc} lowered={lowered} closure=");
+        if (f.closure == check_data.NO_KEY) { self.d.text("nil"); }
+        else { var e = trees.get(check_data.key_file(f.closure) as usize).unwrap().expr(check_data.key_index(f.closure)); uint k = expr_kind(e.kind); self.d.text("{k}"); self.d.span(e.span); }
+        self.d.text(" closure_type="); self.d.type(r, f.closure_type); self.d.text(" env="); self.d.type(r, f.environment_type);
+        var body = flag(f.async_body); var poll = self.fid(f.async_poll); var cancel = self.fid(f.async_cancel); uint waker = f.async_waker;
+        self.d.text(" async={body} {poll} {cancel} {waker}\n");
+        self.d.text("  suspends ["); for (p in &const f.async_suspends) { uint a = p.key; uint b = p.value; self.d.text("({a} {b})"); } self.d.text("]\n");
+        self.d.text("  drop_locals"); self.numbers(&const f.async_drop_locals); self.d.text("\n");
+        self.d.text("  drop_flags ["); for (p in &const f.async_drop_flags) { uint a = p.key; uint b = p.value; self.d.text("({a} {b})"); } self.d.text("]\n");
+        self.d.text("  live ["); for (l in &const f.async_live) { uint b = l.block; self.d.text("({b}"); self.numbers(&const l.locals); self.d.text(")"); } self.d.text("]\n");
+        self.d.text("  borrows [");
+        for (bs in &const f.async_borrows) {
+            uint b = bs.block; self.d.text("({b} [");
+            for (p in &const bs.pairs) { uint x = p.key; uint y = p.value; self.d.text("({x} {y})"); }
+            self.d.text("])");
+        }
+        self.d.text("]\n");
+        for (i in 0..f.locals.len()) {
+            var l = f.locals.get(i).unwrap(); self.d.text("  _{i}"); self.d.type(r, l.type); self.d.text(" "); self.d.quoted(l.name);
+            var arg = flag(l.is_arg); var escape = flag(l.escape_boundary); self.d.text(" arg={arg} escape={escape}"); self.d.span(l.span); self.d.text("\n");
+        }
+        for (b in 0..f.blocks.len()) {
+            self.d.text("  bb{b}\n");
+            var block = f.blocks.get(b).unwrap();
+            for (s in &const block.stmts) {
+                uint kind = ir.statement_index(s.kind); self.d.text("    s{kind} "); self.place(&const s.place);
+                match s.kind {
+                    ir.StatementKind.Assign => { self.d.text(" = "); self.rvalue(r, &const s.rvalue); }
+                    ir.StatementKind.DropIf => { uint flag_local = s.flag_local; self.d.text(" if _{flag_local}"); }
+                    _ => {}
+                }
+                self.d.span(s.span); self.d.text("\n");
+            }
+            self.terminator(r, &const block.term);
+        }
+    }
+    void run(&self, &const Resolver r, &const Vec<ast.Ast> trees, &const ir.Module m) {
+        usize count = m.functions.len(); var entry = self.fid(m.entry);
+        self.d.text("ir {count} entry={entry}\n");
+        for (i in 0..m.functions.len()) { self.function(r, trees, i as uint, m.functions.get(i).unwrap()); }
+        for (i in 0..m.vtables.len()) {
+            var v = m.vtables.get(i).unwrap(); var id = self.vid(i as uint); self.d.text("{id} "); self.d.quoted(v.name);
+            self.d.type(r, v.concrete); self.d.type(r, v.dyn_type); self.d.text(" [");
+            for (f in &const v.methods) { var fid = self.fid(*f); self.d.text("{fid} "); }
+            self.d.text("]\n");
+        }
+        Vec<String> impl_types = Vec.new(); Vec<String> impl_fns = Vec.new();
+        for (di in &const m.drop_impls) { impl_types.push(r.types.to_string(di.type)); impl_fns.push(self.fid(di.fn_index)); }
+        sort_pairs(&impl_types, &impl_fns);
+        for (i in 0..impl_types.len()) { self.d.text("drop_impl "); self.d.quoted(impl_types.get(i).unwrap()); var f = String.from(impl_fns.get(i).unwrap()); self.d.text(" {f}\n"); }
+        Vec<String> drops = Vec.new(); Vec<String> unused = Vec.new();
+        for (t in &const m.drop_types) { drops.push(r.types.to_string(*t)); unused.push(String.new()); }
+        sort_pairs(&drops, &unused);
+        for (t in &const drops) { self.d.text("drop_type "); self.d.quoted(t); self.d.text("\n"); }
+    }
+}
+/// Sorts keys by unsigned bytes, then values, moving values with their keys (std::sort on pairs).
+void sort_pairs(&Vec<String> keys, &Vec<String> values) {
+    usize n = keys.len();
+    for (i in 1..n) {
+        usize j = i;
+        while (j > 0) {
+            var a = keys.get(j - 1).unwrap(); var b = keys.get(j).unwrap();
+            bool swap = defs.less(b, a) || (*a == *b && defs.less(values.get(j).unwrap(), values.get(j - 1).unwrap()));
+            if (!swap) { break; }
+            keys.swap(j, j - 1); values.swap(j, j - 1); j -= 1;
+        }
+    }
+}
+/// Dendrite oracle text; matches dump_ir_strict in C++.
+pub Vec<byte> dump_ir(&const Resolver r, &const Vec<ast.Ast> trees, &const ir.Module m) { var d = IrDump { d: Dump.new() }; d.run(r, trees, m); return d.d.out; }
+/// size align payload_offset fat [field offsets], as dump_machine in C++.
+void layout_text(&Dump d, &const Layout l) {
+    var fat = flag(l.is_fat_pointer); d.text(" {l.size} {l.align} {l.payload_offset} {fat} [");
+    for (o in &const l.field_offsets) { d.text("{*o} "); }
+    d.text("]");
+}
+/// Axon oracle text; matches dump_machine in C++. Call only after async
+/// conversion succeeds.
+pub Vec<byte> dump_machine(&Checker ck, &const ir.Module m) {
+    var lay = LayoutTable.new(); var d = Dump.new();
+    usize n = m.functions.len(); d.text("machine {n}\n");
+    for (i in 0..m.functions.len()) {
+        var f = m.functions.get(i).unwrap();
+        var allocation = regalloc.allocate_registers(&*ck, f, &lay);
+        d.text("f#{i} saved=["); for (r in &const allocation.saved) { d.text("{*r} "); } d.text("]\n");
+        for (l in 0..f.locals.len()) {
+            var t = f.locals.get(l).unwrap().type; int reg = *allocation.registers.get(l).unwrap();
+            d.text("  _{l} reg={reg}");
+            if (t.index == NONE) { d.text(" nil\n"); continue; }
+            var whole = lay.of(&*ck, t); layout_text(&d, &const whole);
+            match ck.r.types.get(t).kind {
+                types.TypeKind.Enum => {
+                    d.text(" variants=[");
+                    usize count = ck.r.program.def(ck.r.types.get(t).def).variants.len();
+                    for (v in 0..count) { var p = lay.variant_payload(&*ck, t, v as uint); d.text("("); layout_text(&d, &const p); d.text(")"); }
+                    d.text("]");
+                }
+                _ => {}
+            }
+            d.text("\n");
+        }
+    }
+    for (v in &const m.vtables) { d.text("vtable "); d.quoted(v.name.as_str()); var l = lay.of(&*ck, v.concrete); layout_text(&d, &const l); d.text("\n"); }
+    return d.out;
+}
+/// Axon object oracle text; matches dump_objects in C++.
+pub Vec<byte> dump_objects(&Checker ck, &const Vec<ast.Ast> trees, &ir.Module m, bool register_allocation, bool checked_arithmetic) {
+    var d = Dump.new();
+    Vec<TargetOs> oses = Vec.new(); oses.push(TargetOs.Linux); oses.push(TargetOs.Windows); oses.push(TargetOs.MacOs);
+    for (os in &const oses) {
+        var tg = Target.new(*os); tg.register_allocation = register_allocation; tg.checked_arithmetic = checked_arithmetic;
+        bool ok = false;
+        var data = axon.object_bytes(&*ck, trees, &*m, tg, &ok);
+        uint hash = 2166136261;
+        for (b in &const data) { hash ^= *b as uint; hash = ((hash as ulong * 16777619) & 4294967295) as uint; }
+        var name = tg.name(); var okf = flag(ok); usize size = data.len();
+        d.text("object "); d.text(name); d.text(" {okf} {size} {hash}\n");
+    }
+    return d.out;
+}

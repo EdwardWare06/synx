@@ -1,0 +1,2 @@
+pub import reexport_b.seed;
+pub int seed() { return 42; }

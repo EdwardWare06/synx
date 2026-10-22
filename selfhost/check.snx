@@ -1,0 +1,2768 @@
+/// Body checker. Source: compiler/src/check.cpp, a function-by-function port.
+/// Parity: tests/selfhost_check_test.cpp.
+/// Inference variables bind through a trail so snapshots can roll back.
+/// Function contexts are frames in a stack; closures name their enclosing
+/// frame and share the locals of the root frame, as FnCtx does in C++.
+/// Methods take the syntax trees as a separate argument; the checker keeps
+/// no references into them. Results are insertion-ordered tables.
+import ast;
+import ids.{TypeId, DefId, DefKind, ModuleId, NONE};
+import defs.{Symbol, TraitRef, FnOwner, Definition};
+import defs;
+import types.{Subst, InferKind};
+import types;
+import declare.Resolver;
+import resolve.{Scope};
+import resolve;
+import check_data.{LocalVar, NameRef, RefKind, Coercion, CoercionKind, CheckResult, Table, CaptureEntry, node_key, field_key, key_file, key_index};
+import check_data;
+import source.Span;
+import diagnostics.Severity;
+import bytes;
+import std.collections.HashMap;
+import std.mem;
+
+pub const uint K_PRIM = 0;
+pub const uint K_STR = 1;
+pub const uint K_DYN = 2;
+pub const uint K_STRUCT = 3;
+pub const uint K_ENUM = 4;
+pub const uint K_REF = 5;
+pub const uint K_PTR = 6;
+pub const uint K_ARRAY = 7;
+pub const uint K_SLICE = 8;
+pub const uint K_TUPLE = 9;
+pub const uint K_FN = 10;
+pub const uint K_PARAM = 11;
+pub const uint K_INFER = 12;
+pub const uint K_NEVER = 13;
+pub const uint K_ERROR = 14;
+const uint I_ANY = 0;
+const uint I_INT = 1;
+const uint I_FLOAT = 2;
+
+pub bool same_def(DefId a, DefId b) { return a.index == b.index && (a.index == NONE || types.def_kind(a.kind) == types.def_kind(b.kind)); }
+pub uint mode_index(ast.CallMode mode) { match mode { ast.CallMode.Writable => return 0, ast.CallMode.Shared => return 1, ast.CallMode.Once => return 2 } }
+pub uint self_kind_index(ast.SelfKind kind) { match kind { ast.SelfKind.None => return 0, ast.SelfKind.Value => return 1, ast.SelfKind.Ref => return 2, ast.SelfKind.ConstRef => return 3 } }
+pub uint owner_index(FnOwner owner) {
+    match owner { FnOwner.Module => return 0, FnOwner.Struct => return 1, FnOwner.Enum => return 2, FnOwner.Trait => return 3, FnOwner.Impl => return 4, FnOwner.Extern => return 5 }
+}
+pub uint capture_index(ast.CaptureMode mode) { match mode { ast.CaptureMode.Move => return 0, ast.CaptureMode.Shared => return 1, ast.CaptureMode.Writable => return 2 } }
+bool is_digit(byte b) { return b >= 48 && b <= 57; }
+/// std::stoul over a decimal prefix; the parser guarantees leading digits.
+usize parse_index(&const Vec<byte> text) {
+    usize value = 0; usize i = 0;
+    while (i < text.len() && is_digit(bytes.at(text, i))) { value = value * 10 + ((bytes.at(text, i) - 48) as usize); i += 1; }
+    return value;
+}
+&const str binary_op_name(ast.BinaryOp op) {
+    match op {
+        ast.BinaryOp.Add => return "+", ast.BinaryOp.Sub => return "-", ast.BinaryOp.Mul => return "*", ast.BinaryOp.Div => return "/",
+        ast.BinaryOp.Rem => return "%", ast.BinaryOp.Eq => return "==", ast.BinaryOp.Ne => return "!=", ast.BinaryOp.Lt => return "<",
+        ast.BinaryOp.Gt => return ">", ast.BinaryOp.Le => return "<=", ast.BinaryOp.Ge => return ">=", ast.BinaryOp.And => return "&&",
+        ast.BinaryOp.Or => return "||", ast.BinaryOp.BitAnd => return "&", ast.BinaryOp.BitOr => return "|", ast.BinaryOp.BitXor => return "^",
+        ast.BinaryOp.Shl => return "<<", ast.BinaryOp.Shr => return ">>",
+    }
+}
+&const str assign_op_name(ast.AssignOp op) {
+    match op {
+        ast.AssignOp.Assign => return "=", ast.AssignOp.Add => return "+=", ast.AssignOp.Sub => return "-=", ast.AssignOp.Mul => return "*=",
+        ast.AssignOp.Div => return "/=", ast.AssignOp.Rem => return "%=", ast.AssignOp.BitAnd => return "&=", ast.AssignOp.BitOr => return "|=",
+        ast.AssignOp.BitXor => return "^=", ast.AssignOp.Shl => return "<<=", ast.AssignOp.Shr => return ">>=",
+    }
+}
+String path_text(&const ast.Path path) {
+    var out = String.new();
+    for (i in 0..path.segments.len()) { if (i != 0) { out.push('.'); } var s = defs.name(path.segments.get(i).unwrap().name); out.push_str(s); }
+    return out;
+}
+pub TraitRef copy_trait(&const TraitRef t) { var out = TraitRef { trait_def: t.trait_def, args: Vec.new() }; for (a in &const t.args) { out.args.push(*a); } return out; }
+Vec<TypeId> copy_ids(&const Vec<TypeId> values) { Vec<TypeId> out = Vec.new(); for (v in values) { out.push(*v); } return out; }
+
+pub struct Obligation { pub TypeId type; pub TraitRef trait_ref; pub Span span; pub String what; }
+/// Where a parameter's bounds live: kind 0 is generic index of owner,
+/// kind 1 is the implicit Self bound of trait owner.
+struct BoundSource { uint kind; DefId owner; uint index; }
+struct BoundTable {
+    Vec<ulong> keys; Vec<BoundSource> values; HashMap<ulong, usize> index;
+    BoundTable new() { return BoundTable { keys: Vec.new(), values: Vec.new(), index: HashMap.new() }; }
+    BoundSource? get(&const self, TypeId t) {
+        ulong key = t.index as ulong;
+        match self.index.get(&key) { Some(i) => return Some(*self.values.get(*i).unwrap()), None => return None }
+    }
+    void put(&self, TypeId t, BoundSource source) {
+        ulong key = t.index as ulong; usize i = NONE as usize;
+        match self.index.get(&key) { Some(found) => { i = *found; }, None => {} }
+        if (i != NONE as usize) { *self.values.get_mut(i).unwrap() = source; return; }
+        self.index.insert(key, self.keys.len()); self.keys.push(key); self.values.push(source);
+    }
+    BoundTable copy(&const self) {
+        var out = BoundTable.new();
+        for (i in 0..self.keys.len()) { ulong key = *self.keys.get(i).unwrap(); out.index.insert(key, i); out.keys.push(key); out.values.push(*self.values.get(i).unwrap()); }
+        return out;
+    }
+}
+struct Named { String name; uint id; }
+/// One function, constant, or closure body (FnCtx in C++).
+struct Frame {
+    DefId fn_def;
+    TypeId ret;
+    bool ret_inferred;
+    bool saw_return;
+    bool in_const;
+    int loop_depth;
+    /// One entry per open loop, innermost last: true once a break targets it.
+    Vec<bool> loop_breaks;
+    int unsafe_depth;
+    Scope scope;
+    /// Frame whose locals vector this frame uses.
+    uint locals_frame;
+    Vec<LocalVar> locals;
+    Vec<Vec<Named>> scopes;
+    uint parent;
+    ulong closure;
+    uint local_start;
+    uint file;
+}
+struct Stripped { TypeId base; int count; }
+struct Found { bool ok; uint id; }
+struct TypeName { bool ok; DefId struct_def; DefId enum_def; Vec<TypeId> args; }
+struct Hit {
+    DefId fn_def; DefId impl_def; DefId trait_def; int derefs; TypeId base; Subst owner_subst; Vec<TypeId> owner_args;
+    Hit new() { return Hit { fn_def: DefId.none(), impl_def: DefId.none(), trait_def: DefId.none(), derefs: 0, base: TypeId.none(), owner_subst: Subst.new(), owner_args: Vec.new() }; }
+}
+struct TypePair { TypeId a; TypeId b; }
+/// Syntax facts the checker needs without the trees: async flags and body presence.
+struct FnSyntax { bool is_async; bool async_send; uint body; }
+
+pub struct Checker {
+    pub Resolver r;
+    pub CheckResult result;
+    pub bool frame_refs;
+    Vec<TypeId> bindings;
+    Vec<uint> trail;
+    Vec<Obligation> obligations;
+    BoundTable param_bounds;
+    /// Implicit Self bounds per trait arena index; empty until first use.
+    Vec<Vec<TraitRef>> self_bounds;
+    Vec<TypePair> checking_traits;
+    Vec<ulong> exprs_in_function;
+    Vec<Frame> frames;
+    Vec<FnSyntax> fn_syntax;
+
+    pub Checker new(Resolver r) {
+        return Checker { r: r, result: CheckResult.new(), frame_refs: false, bindings: Vec.new(), trail: Vec.new(), obligations: Vec.new(),
+            param_bounds: BoundTable.new(), self_bounds: Vec.new(), checking_traits: Vec.new(), exprs_in_function: Vec.new(), frames: Vec.new(), fn_syntax: Vec.new() };
+    }
+
+    // ---------- type access ----------
+
+    pub uint tk(&const self, TypeId t) {
+        match self.r.types.get(t).kind {
+            types.TypeKind.Prim => return 0, types.TypeKind.Str => return 1, types.TypeKind.Dyn => return 2, types.TypeKind.Struct => return 3,
+            types.TypeKind.Enum => return 4, types.TypeKind.Ref => return 5, types.TypeKind.Ptr => return 6, types.TypeKind.Array => return 7,
+            types.TypeKind.Slice => return 8, types.TypeKind.Tuple => return 9, types.TypeKind.Fn => return 10, types.TypeKind.Param => return 11,
+            types.TypeKind.Infer => return 12, types.TypeKind.Never => return 13, types.TypeKind.Error => return 14,
+        }
+    }
+    pub uint ik(&const self, TypeId t) { match self.r.types.get(t).infer_kind { InferKind.Any => return 0, InferKind.Int => return 1, InferKind.Float => return 2 } }
+    pub TypeId inner(&const self, TypeId t) { return self.r.types.get(t).inner; }
+    pub TypeId ret_of(&const self, TypeId t) { return self.r.types.get(t).ret; }
+    pub TypeId elem(&const self, TypeId t, usize i) { return *self.r.types.get(t).elems.get(i).unwrap(); }
+    pub usize n_elems(&const self, TypeId t) { return self.r.types.get(t).elems.len(); }
+    pub Vec<TypeId> elems(&const self, TypeId t) { return copy_ids(&const self.r.types.get(t).elems); }
+    pub DefId def_of(&const self, TypeId t) { return self.r.types.get(t).def; }
+    pub bool const_of(&const self, TypeId t) { return self.r.types.get(t).is_const; }
+    pub ulong length_of(&const self, TypeId t) { return self.r.types.get(t).length; }
+    pub ast.CallMode mode_of(&const self, TypeId t) { return self.r.types.get(t).call_mode; }
+    pub bool send_of(&const self, TypeId t) { return self.r.types.get(t).is_send; }
+    pub uint prim_of(&const self, TypeId t) { return types.prim_index(self.r.types.get(t).prim); }
+    pub bool is_error(&const self, TypeId t) { return self.tk(t) == K_ERROR; }
+    pub bool is_never(&const self, TypeId t) { return self.tk(t) == K_NEVER; }
+    pub bool is_infer(&const self, TypeId t) { return self.tk(t) == K_INFER; }
+    pub bool is_prim(&const self, TypeId t, ast.PrimKind p) { return self.tk(t) == K_PRIM && self.prim_of(t) == types.prim_index(p); }
+    pub bool is_void(&const self, TypeId t) { return self.is_prim(t, ast.PrimKind.Void); }
+    pub bool is_bool(&const self, TypeId t) { return self.is_prim(t, ast.PrimKind.Bool); }
+    pub bool is_integer(&const self, TypeId t) { return self.r.types.get(t).is_integer(); }
+    pub bool is_float(&const self, TypeId t) { return self.r.types.get(t).is_float(); }
+    pub bool is_numeric(&const self, TypeId t) { return self.is_integer(t) || self.is_float(t); }
+    pub bool is_signed(&const self, TypeId t) { return self.r.types.get(t).is_signed_integer(); }
+    pub bool is_unsized(&const self, TypeId t) { return self.r.types.get(t).is_unsized(); }
+    pub bool contains_infer(&const self, TypeId t) { return self.r.types.contains_infer(t); }
+    pub TypeId prim(&const self, ast.PrimKind p) { return self.r.types.prim(p); }
+    pub TypeId void_t(&const self) { return self.r.types.prim(ast.PrimKind.Void); }
+    pub TypeId bool_t(&const self) { return self.r.types.prim(ast.PrimKind.Bool); }
+    pub TypeId int_t(&const self) { return self.r.types.prim(ast.PrimKind.Int); }
+    pub TypeId usize_t(&const self) { return self.r.types.prim(ast.PrimKind.Usize); }
+    pub TypeId double_t(&const self) { return self.r.types.prim(ast.PrimKind.Double); }
+    pub TypeId error_t(&const self) { return self.r.types.error(); }
+    TypeId fresh(&self) { return self.r.types.fresh_infer(InferKind.Any); }
+    pub String show(&const self, TypeId t) { return self.r.types.to_string(t); }
+    /// Interns def<args> for a struct, enum, or trait (as dyn).
+    pub TypeId nominal(&self, DefId def, Vec<TypeId> args) {
+        var name = self.r.program.qualified_name(self.r.program.def(def).module, self.r.program.def(def).name);
+        match def.kind {
+            DefKind.Struct => return self.r.types.nominal(types.TypeKind.Struct, def, name, args),
+            DefKind.Enum => return self.r.types.nominal(types.TypeKind.Enum, def, name, args),
+            _ => return self.r.types.nominal(types.TypeKind.Dyn, def, name, args),
+        }
+    }
+    pub TypeId apply(&self, &const Subst s, TypeId t) { return s.apply(&self.r.types, t); }
+    pub TypeId fn_type(&self, Vec<TypeId> params, TypeId ret) { return self.r.types.fn_type(params, ret, ast.CallMode.Writable, false); }
+    pub DefId core_trait(&const self, &const str name) {
+        uint index = self.r.program.core_traits.get(name);
+        return if (index == NONE) { DefId.none() } else { DefId { kind: DefKind.Trait, index: index } };
+    }
+    /// has_marker in check.hpp: whether t implements the core marker trait
+    /// name. frame_refs makes a reference Send for a suspended frame.
+    pub bool has_marker(&self, TypeId t, &const str name, bool frame_refs) {
+        bool saved = self.frame_refs; self.frame_refs = frame_refs;
+        var tr = TraitRef { trait_def: self.core_trait(name), args: Vec.new() };
+        bool result = self.implements(t, &tr);
+        self.frame_refs = saved; return result;
+    }
+    pub String def_name(&const self, DefId d) { return String.from(self.r.program.def(d).name); }
+    void error(&self, Span span, &const str message, &const str code) { self.r.sink.error(span, message, code); }
+    void note(&self, Span span, &const str message) {
+        Vec<byte> data = Vec.new(); bytes.text(&data, message); self.r.sink.add(Severity.Note, span, data, String.new());
+    }
+    Span espan(&const self, &const Vec<ast.Ast> t, ulong key) { return t.get(key_file(key) as usize).unwrap().expr(key_index(key)).span; }
+    Scope scope_copy(&const self, uint f) {
+        var s = &const self.frames.get(f as usize).unwrap().scope; Vec<DefId> layers = Vec.new();
+        for (l in &const s.layers) { layers.push(*l); }
+        return Scope { layers: layers, self_type: s.self_type };
+    }
+    TypeId resolve_type(&self, &const Vec<ast.Ast> t, uint f, uint type_node) {
+        var scope = self.scope_copy(f); uint file = self.frames.get(f as usize).unwrap().file;
+        return resolve.resolve_type(&self.r, t.get(file as usize).unwrap(), type_node, &scope);
+    }
+
+    // ---------- inference ----------
+
+    TypeId shallow(&const self, TypeId t) {
+        var cur = t;
+        while (cur.index != NONE && self.tk(cur) == K_INFER) {
+            usize i = self.r.types.get(cur).index as usize;
+            if (i >= self.bindings.len()) { return cur; }
+            var bound = *self.bindings.get(i).unwrap();
+            if (bound.index == NONE) { return cur; }
+            cur = bound;
+        }
+        return cur;
+    }
+    TypeId zonk(&self, TypeId t) {
+        if (t.index == NONE) { return t; }
+        var s = self.shallow(t); uint k = self.tk(s);
+        if (k == K_REF) { var inner = self.zonk(self.inner(s)); bool c = self.const_of(s); return self.r.types.ref_type(inner, c); }
+        if (k == K_PTR) { var inner = self.zonk(self.inner(s)); bool c = self.const_of(s); return self.r.types.ptr(inner, c); }
+        if (k == K_ARRAY) { var inner = self.zonk(self.inner(s)); ulong n = self.length_of(s); return self.r.types.array(inner, n); }
+        if (k == K_SLICE) { var inner = self.zonk(self.inner(s)); return self.r.types.slice(inner); }
+        if (k == K_TUPLE || k == K_FN || k == K_STRUCT || k == K_DYN || k == K_ENUM) {
+            var old = self.elems(s); Vec<TypeId> e = Vec.new(); for (x in &const old) { e.push(self.zonk(*x)); }
+            if (k == K_TUPLE) { return self.r.types.tuple(e); }
+            if (k == K_FN) { var ret = self.zonk(self.ret_of(s)); var mode = self.mode_of(s); bool send = self.send_of(s); return self.r.types.fn_type(e, ret, mode, send); }
+            return self.nominal(self.def_of(s), e);
+        }
+        return s;
+    }
+    String type_name(&self, TypeId t) { var z = self.zonk(t); return self.show(z); }
+    void rollback(&self, usize mark) {
+        while (self.trail.len() > mark) { var i = self.trail.pop().unwrap(); *self.bindings.get_mut(i as usize).unwrap() = TypeId.none(); }
+    }
+    bool try_unify(&self, TypeId a, TypeId b) {
+        usize mark = self.trail.len();
+        if (self.unify(a, b)) { return true; }
+        self.rollback(mark); return false;
+    }
+    bool bind(&self, TypeId variable, TypeId to) {
+        uint i = self.r.types.get(variable).index;
+        while (self.bindings.len() <= i as usize) { self.bindings.push(TypeId.none()); }
+        *self.bindings.get_mut(i as usize).unwrap() = to; self.trail.push(i); return true;
+    }
+    bool unify(&self, TypeId a0, TypeId b0) {
+        var a = self.shallow(a0); var b = self.shallow(b0);
+        if (a.index == b.index) { return true; }
+        if (self.is_error(a) || self.is_error(b)) { return true; }
+        if (self.is_never(a) || self.is_never(b)) { return true; }
+        if (self.is_infer(a) && self.is_infer(b)) {
+            if (self.ik(a) == I_ANY) { return self.bind(a, b); }
+            if (self.ik(b) == I_ANY) { return self.bind(b, a); }
+            if (self.ik(a) != self.ik(b)) { return false; }
+            return self.bind(a, b);
+        }
+        if (self.is_infer(a)) { var swap = a; a = b; b = swap; }
+        if (self.is_infer(b)) {
+            uint kind = self.ik(b);
+            if (kind == I_ANY) { return self.bind(b, a); }
+            if (kind == I_INT) { return if (self.is_integer(a)) { self.bind(b, a) } else { false }; }
+            return if (self.is_float(a)) { self.bind(b, a) } else { false };
+        }
+        uint k = self.tk(a);
+        if (k != self.tk(b)) { return false; }
+        if (k == K_REF || k == K_PTR) { return self.const_of(a) == self.const_of(b) && self.unify(self.inner(a), self.inner(b)); }
+        if (k == K_ARRAY) { return self.length_of(a) == self.length_of(b) && self.unify(self.inner(a), self.inner(b)); }
+        if (k == K_SLICE) { return self.unify(self.inner(a), self.inner(b)); }
+        if (k == K_TUPLE || k == K_FN || k == K_STRUCT || k == K_DYN || k == K_ENUM) {
+            if (k == K_FN && (mode_index(self.mode_of(a)) != mode_index(self.mode_of(b)) || self.send_of(a) != self.send_of(b))) { return false; }
+            if ((k == K_DYN || k == K_STRUCT || k == K_ENUM) && !same_def(self.def_of(a), self.def_of(b))) { return false; }
+            usize n = self.n_elems(a);
+            if (n != self.n_elems(b)) { return false; }
+            for (i in 0..n) { if (!self.unify(self.elem(a, i), self.elem(b, i))) { return false; } }
+            if (k == K_FN) { return self.unify(self.ret_of(a), self.ret_of(b)); }
+            return true;
+        }
+        return false;
+    }
+    bool unify_or_error(&self, TypeId a, TypeId b, Span span, &const str context) {
+        if (self.unify(a, b)) { return true; }
+        var want = self.type_name(b); var found = self.type_name(a);
+        self.error(span, "type mismatch in {context}: expected '{want}', found '{found}'", "SNX0402"); return false;
+    }
+    void set_coercion(&self, ulong key, CoercionKind kind, bool borrow_first, TypeId target) {
+        self.result.coercions.put(key, Coercion { kind: kind, borrow_first: borrow_first, target: target });
+    }
+    /// Makes actual fit expected, recording a coercion when one applies.
+    bool coerce(&self, &const Vec<ast.Ast> t, ulong e, TypeId actual, TypeId expected, &const str context) {
+        if (expected.index == NONE) { return true; }
+        var a = self.shallow(actual); var x = self.shallow(expected); Span span = self.espan(t, e);
+        if (self.is_error(a) || self.is_error(x)) { return true; }
+        if (self.tk(a) == K_FN && self.tk(x) == K_FN && (mode_index(self.mode_of(a)) != mode_index(self.mode_of(x)) || self.send_of(a) != self.send_of(x))) {
+            bool named = false;
+            match self.result.refs.get(e) { Some(found) => { match found.kind { RefKind.Function => { named = true; }, RefKind.AssocFn => { named = true; }, _ => {} } }, None => {} }
+            uint am = mode_index(self.mode_of(a)); uint xm = mode_index(self.mode_of(x));
+            bool compatible = (named || am == xm || (am == 1 && xm == 0)) && (!self.send_of(x) || self.send_of(a) || named);
+            var params = self.elems(a); var ret = self.ret_of(a); var mode = self.mode_of(x); bool send = self.send_of(x);
+            var same_mode = self.r.types.fn_type(params, ret, mode, send);
+            if (compatible && self.try_unify(same_mode, x)) { self.set_coercion(e, CoercionKind.FnMode, false, x); return true; }
+        }
+        if (self.tk(x) == K_REF) {
+            var want = self.shallow(self.inner(x));
+            if (self.tk(a) == K_REF) {
+                var have = self.shallow(self.inner(a));
+                if (!self.const_of(x) && self.const_of(a)) {
+                    var xs = self.type_name(x); var as_text = self.type_name(a);
+                    self.error(span, "type mismatch in {context}: expected a writable reference '{xs}', found read only '{as_text}'", ""); return false;
+                }
+                bool mut_to_const = self.const_of(x) && !self.const_of(a);
+                if (self.try_unify(have, want)) {
+                    if (mut_to_const) { self.set_coercion(e, CoercionKind.MutToConst, false, TypeId.none()); }
+                    return true;
+                }
+                if (self.tk(want) == K_DYN && !self.is_unsized(have)) { return self.coerce_dyn(t, e, have, x, false); }
+                if (self.const_of(x)) {
+                    if (self.tk(have) == K_STRUCT && same_def(self.def_of(have), self.r.program.string_def) && self.tk(want) == K_STR) {
+                        self.set_coercion(e, CoercionKind.StringToStr, false, TypeId.none()); return true;
+                    }
+                    if (self.tk(have) == K_ARRAY && self.tk(want) == K_SLICE && self.try_unify(self.inner(have), self.inner(want))) {
+                        self.set_coercion(e, CoercionKind.ArrayToSlice, false, TypeId.none()); return true;
+                    }
+                    if (self.tk(have) == K_STRUCT && same_def(self.def_of(have), self.r.program.vec_def) && self.tk(want) == K_SLICE &&
+                        self.n_elems(have) > 0 && self.try_unify(self.elem(have, 0), self.inner(want))) {
+                        self.set_coercion(e, CoercionKind.VecToSlice, false, TypeId.none()); return true;
+                    }
+                }
+                return self.unify_or_error(actual, expected, span, context);
+            }
+            if (self.const_of(x) && !self.is_never(a)) {
+                if (self.try_unify(a, want)) { self.set_coercion(e, CoercionKind.AutoBorrowConst, false, TypeId.none()); return true; }
+                if (self.tk(want) == K_DYN && !self.is_unsized(a)) { return self.coerce_dyn(t, e, a, x, true); }
+                if (self.tk(a) == K_STRUCT && same_def(self.def_of(a), self.r.program.string_def) && self.tk(want) == K_STR) {
+                    self.set_coercion(e, CoercionKind.StringToStr, true, TypeId.none()); return true;
+                }
+                if (self.tk(a) == K_ARRAY && self.tk(want) == K_SLICE && self.try_unify(self.inner(a), self.inner(want))) {
+                    self.set_coercion(e, CoercionKind.ArrayToSlice, true, TypeId.none()); return true;
+                }
+                if (self.tk(a) == K_STRUCT && same_def(self.def_of(a), self.r.program.vec_def) && self.tk(want) == K_SLICE &&
+                    self.n_elems(a) > 0 && self.try_unify(self.elem(a, 0), self.inner(want))) {
+                    self.set_coercion(e, CoercionKind.VecToSlice, true, TypeId.none()); return true;
+                }
+                return self.unify_or_error(actual, expected, span, context);
+            }
+            if (!self.const_of(x) && !self.is_never(a)) {
+                var xs = self.type_name(x); var as_text = self.type_name(a);
+                self.error(span, "expected a writable reference '{xs}', found '{as_text}'. Write & in front of the value", ""); return false;
+            }
+        }
+        return self.unify_or_error(actual, expected, span, context);
+    }
+    bool coerce_dyn(&self, &const Vec<ast.Ast> t, ulong e, TypeId concrete, TypeId target, bool borrow_first) {
+        var dy = self.inner(target);
+        var trait_ref = TraitRef { trait_def: self.def_of(dy), args: self.elems(dy) };
+        self.implements(concrete, &trait_ref);
+        self.add_obligation(concrete, trait_ref, self.espan(t, e), String.from("trait object conversion"));
+        self.set_coercion(e, CoercionKind.ToDyn, borrow_first, target); return true;
+    }
+
+    // ---------- helpers ----------
+
+    TypeId record(&self, ulong e, TypeId t) { self.result.expr_types.put(e, t); self.exprs_in_function.push(e); return t; }
+    TypeId option_of(&self, TypeId t) {
+        var def = self.r.program.option_def; if (def.index == NONE) { return self.error_t(); }
+        Vec<TypeId> args = Vec.new(); args.push(t); return self.nominal(def, args);
+    }
+    TypeId string_type(&self) { var def = self.r.program.string_def; if (def.index == NONE) { return self.error_t(); } return self.nominal(def, Vec.new()); }
+    Stripped strip_refs(&const self, TypeId t0) {
+        var t = self.shallow(t0); int n = 0;
+        while (self.tk(t) == K_REF) { t = self.shallow(self.inner(t)); n += 1; }
+        return Stripped { base: t, count: n };
+    }
+    bool is_copy(&self, TypeId t0) {
+        var t = self.zonk(t0);
+        if (self.contains_infer(t)) { var s = self.shallow(t); return self.is_infer(s) && self.ik(s) != I_ANY; }
+        if (self.tk(t) == K_PARAM) {
+            var copy = self.core_trait("Copy");
+            match self.bounds_of(t) { Some(bounds) => { for (b in &const bounds) { if (same_def(b.trait_def, copy)) { return true; } } }, None => {} }
+            return false;
+        }
+        return self.is_copy_type(t);
+    }
+    /// is_copy_type in resolve.cpp.
+    pub bool has_impl_of(&const self, &const str trait_name, TypeId t) {
+        var tr = self.core_trait(trait_name); if (tr.index == NONE) { return false; }
+        for (i in 0..self.r.program.impls.len()) {
+            var im = self.r.program.impls.get(i).unwrap();
+            if (!same_def(im.trait_ref.trait_def, tr)) { continue; }
+            var s = im.self_type;
+            if (self.tk(s) != self.tk(t)) { continue; }
+            if ((self.tk(t) == K_STRUCT || self.tk(t) == K_ENUM) && same_def(self.def_of(s), self.def_of(t))) { return true; }
+        }
+        return false;
+    }
+    pub bool is_copy_type(&self, TypeId t) {
+        uint k = self.tk(t);
+        if (k == K_PRIM || k == K_PTR || k == K_NEVER || k == K_ERROR) { return true; }
+        if (k == K_FN) { return false; }
+        if (k == K_INFER) { return self.ik(t) != I_ANY; }
+        if (k == K_REF) { return self.const_of(t); }
+        if (k == K_ARRAY) { return self.is_copy_type(self.inner(t)); }
+        if (k == K_TUPLE) { var es = self.elems(t); for (e in &const es) { if (!self.is_copy_type(*e)) { return false; } } return true; }
+        if (k == K_STRUCT || k == K_ENUM) {
+            var def = self.def_of(t);
+            if (k == K_STRUCT && (same_def(def, self.r.program.string_def) || same_def(def, self.r.program.vec_def))) { return false; }
+            if (self.has_impl_of("Drop", t)) { return false; }
+            var s = self.owner_subst(def, t);
+            var fields = self.field_types(def);
+            for (f in &const fields) { var ft = self.apply(&s, *f); if (!self.is_copy_type(ft)) { return false; } }
+            return true;
+        }
+        return false;
+    }
+    /// Binds a struct or enum definition's generics to the arguments of t.
+    pub Subst owner_subst(&self, DefId def, TypeId t) {
+        var s = Subst.new(); usize n = self.r.program.def(def).generics.len(); usize m = self.n_elems(t);
+        for (i in 0..n) { if (i < m) { s.bind(self.r.program.def(def).generics.get(i).unwrap().type, self.elem(t, i)); } }
+        return s;
+    }
+    /// Field types in declaration order; for enums, every variant's tuple types then fields.
+    pub Vec<TypeId> field_types(&const self, DefId def) {
+        Vec<TypeId> out = Vec.new(); var d = self.r.program.def(def);
+        match def.kind {
+            DefKind.Struct => { for (f in &const d.fields) { out.push(f.type); } }
+            _ => { for (v in &const d.variants) { for (x in &const v.tuple_types) { out.push(*x); } for (f in &const v.fields) { out.push(f.type); } } }
+        }
+        return out;
+    }
+
+    // ---------- program ----------
+
+    pub void check_program(&self, &const Vec<ast.Ast> t) {
+        for (i in 0..self.r.program.functions.len()) {
+            var d = self.r.program.functions.get(i).unwrap(); var syntax = FnSyntax { is_async: false, async_send: false, body: ast.NONE };
+            if (d.ast_file != NONE) { var func = t.get(d.ast_file as usize).unwrap().function(d.ast_index); syntax = FnSyntax { is_async: func.is_async, async_send: func.async_send, body: func.body }; }
+            self.fn_syntax.push(syntax);
+        }
+        var send = self.core_trait("Send"); var sync = self.core_trait("Sync"); var owned = self.core_trait("Owned");
+        for (i in 0..self.r.program.impls.len()) {
+            var im = DefId { kind: DefKind.Impl, index: i as uint };
+            var d = self.r.program.def(im); if (d.ast_file == NONE) { continue; }
+            var tr = d.trait_ref.trait_def; Span span = d.span;
+            bool marker = tr.index != NONE && (same_def(tr, send) || same_def(tr, sync) || same_def(tr, owned));
+            bool is_unsafe = t.get(d.ast_file as usize).unwrap().items.get(d.ast_index as usize).unwrap().is_unsafe;
+            if (marker && !is_unsafe) { self.error(span, "Send, Sync, and Owned implementations require unsafe impl", "SNX0418"); }
+            if (!marker && is_unsafe) { self.error(span, "unsafe impl requires Send, Sync, or Owned", "SNX0418"); }
+        }
+        // An explicit Copy impl must satisfy the structural rule: no Drop and
+        // every field Copy. A type parameter with a Copy bound counts as Copy.
+        var copy = self.core_trait("Copy");
+        for (i in 0..self.r.program.impls.len()) {
+            var im = DefId { kind: DefKind.Impl, index: i as uint };
+            if (copy.index == NONE || self.r.program.def(im).ast_file == NONE || !same_def(self.r.program.def(im).trait_ref.trait_def, copy)) { continue; }
+            var s = Subst.new(); usize ng = self.r.program.def(im).generics.len();
+            for (g in 0..ng) {
+                bool bounded = false;
+                for (b in &const self.r.program.def(im).generics.get(g).unwrap().bounds) { if (same_def(b.trait_def, copy)) { bounded = true; } }
+                if (bounded) { var it = self.int_t(); s.bind(self.r.program.def(im).generics.get(g).unwrap().type, it); }
+            }
+            var self_type = self.r.program.def(im).self_type;
+            var applied = self.apply(&s, self_type);
+            if (!self.is_copy_type(applied)) {
+                var tn = self.type_name(self_type); Span span = self.r.program.def(im).span;
+                self.error(span, "'{tn}' cannot implement Copy: it implements Drop or has a field that is not Copy", "SNX0421");
+            }
+        }
+        for (i in 0..self.r.program.functions.len()) {
+            var f = self.r.program.functions.get(i).unwrap(); if (f.ast_file == NONE) { continue; }
+            if (!t.get(f.ast_file as usize).unwrap().function(f.ast_index).is_async) { continue; }
+            uint owner = owner_index(f.owner); Span span = f.span;
+            bool main = owner == 0 && f.module.index == self.r.program.root_module.index && f.name == String.from("main");
+            if (owner == 3 || owner == 4 || owner == 5) { self.error(span, "async trait and extern methods are not supported; return a Task<T> explicitly", "SNX0417"); }
+            if (main) { self.error(span, "main must be synchronous; use std.task.block_on", "SNX0417"); }
+        }
+        for (i in 0..self.r.builtin_str_methods.len()) {
+            var m = *self.r.builtin_str_methods.get(i).unwrap();
+            if (self.r.program.def(m).name == String.from("parse_int")) { var int_type = self.int_t(); var ret = self.option_of(int_type); self.r.program.def_mut(m).ret = ret; }
+        }
+        Vec<uint> checked = Vec.new(); Vec<uint> active = Vec.new();
+        for (i in 0..self.r.program.structs.len()) {
+            var d = self.r.program.structs.get(i).unwrap(); var st = d.self_type; Span span = d.span;
+            if (!self.finite_layout(st, span, 0, &checked, &active)) { return; }
+        }
+        for (i in 0..self.r.program.enums.len()) {
+            var d = self.r.program.enums.get(i).unwrap(); var st = d.self_type; Span span = d.span;
+            if (!self.finite_layout(st, span, 0, &checked, &active)) { return; }
+        }
+        for (i in 0..self.r.program.consts.len()) { self.check_const(t, i as uint); }
+        for (i in 0..self.r.program.functions.len()) {
+            if (!self.r.program.functions.get(i).unwrap().is_builtin) { self.check_function(t, DefId { kind: DefKind.Function, index: i as uint }); }
+        }
+        self.check_wake_future(t);
+        self.check_literal_ranges(t);
+        self.register_all_bounds();
+        self.validate_program(t);
+    }
+    /// Inline layout must be finite: pointers and references end a path.
+    bool finite_layout(&self, TypeId t, Span span, uint depth, &Vec<uint> checked, &Vec<uint> active) {
+        if (t.index == NONE) { return true; }
+        for (c in &const *checked) { if (*c == t.index) { return true; } }
+        bool on_path = false; for (a in &const *active) { if (*a == t.index) { on_path = true; } }
+        if (on_path || depth == 128) {
+            self.error(span, "type has an infinite or excessively nested inline layout; use Box<T>, Vec<T>, or a reference for recursion", "SNX0414"); return false;
+        }
+        uint k = self.tk(t);
+        if (k != K_STRUCT && k != K_ENUM && k != K_ARRAY && k != K_TUPLE) { return true; }
+        active.push(t.index); bool valid = true;
+        Vec<TypeId> fields = Vec.new();
+        if (k == K_ARRAY) { fields.push(self.inner(t)); }
+        else if (k == K_TUPLE) { fields = self.elems(t); }
+        else { var s = self.owner_subst(self.def_of(t), t); var raw = self.field_types(self.def_of(t)); for (f in &const raw) { fields.push(self.apply(&s, *f)); } }
+        for (f in &const fields) { if (valid) { valid = self.finite_layout(*f, span, depth + 1, &*checked, &*active); } }
+        self.remove_active(&*active, t.index);
+        if (valid) { checked.push(t.index); }
+        return valid;
+    }
+    void remove_active(&self, &Vec<uint> active, uint value) {
+        Vec<uint> kept = Vec.new(); bool removed = false;
+        for (a in &const *active) { if (!removed && *a == value) { removed = true; } else { kept.push(*a); } }
+        active.clear(); for (k in &const kept) { active.push(*k); }
+    }
+    /// Erased wake callbacks and future dispatch rely on exact receivers.
+    void check_wake_future(&self, &const Vec<ast.Ast> t) {
+        var wake = self.core_trait("Wake"); var future = self.core_trait("Future");
+        for (i in 0..self.r.program.impls.len()) {
+            var im = DefId { kind: DefKind.Impl, index: i as uint };
+            var tr = self.r.program.def(im).trait_ref.trait_def;
+            if (!same_def(tr, wake) && !same_def(tr, future)) { continue; }
+            if (tr.index == NONE) { continue; }
+            var s = Subst.new(); s.bind(self.r.program.def(tr).self_type, self.r.program.def(im).self_type);
+            usize ng = self.r.program.def(tr).generics.len(); usize na = self.r.program.def(im).trait_ref.args.len();
+            for (g in 0..ng) { if (g < na) { s.bind(self.r.program.def(tr).generics.get(g).unwrap().type, *self.r.program.def(im).trait_ref.args.get(g).unwrap()); } }
+            var required = copy_ids_def(&const self.r.program.def(tr).methods);
+            for (rq in &const required) {
+                var name = self.def_name(*rq);
+                var actual = self.find_method(im, name); if (actual.index == NONE) { continue; }
+                var ad = self.r.program.def(actual);
+                bool is_async = ad.ast_file != NONE && t.get(ad.ast_file as usize).unwrap().function(ad.ast_index).is_async;
+                bool valid = ad.generics.is_empty() && !is_async && ad.params.len() == self.r.program.def(*rq).params.len();
+                var want_ret = self.apply(&s, self.r.program.def(*rq).ret);
+                if (self.r.program.def(actual).ret.index != want_ret.index) { valid = false; }
+                usize np = self.r.program.def(actual).params.len(); usize nr = self.r.program.def(*rq).params.len();
+                for (p in 0..np) {
+                    if (p >= nr) { continue; }
+                    var want = self.apply(&s, self.r.program.def(*rq).params.get(p).unwrap().type);
+                    var ap = self.r.program.def(actual).params.get(p).unwrap(); var rp = self.r.program.def(*rq).params.get(p).unwrap();
+                    if (ap.type.index != want.index || self_kind_index(ap.self_kind) != self_kind_index(rp.self_kind)) { valid = false; }
+                }
+                if (!valid) {
+                    var tn = self.def_name(tr); Span span = self.r.program.def(actual).span;
+                    self.error(span, "implementation of {tn}.{name} does not match its trait signature", "SNX0419");
+                }
+            }
+        }
+    }
+    /// Literal types are fixed after inference. A negated literal may use the
+    /// signed minimum; an explicitly cast literal keeps truncation.
+    void check_literal_ranges(&self, &const Vec<ast.Ast> t) {
+        HashMap<ulong, bool> negative = HashMap.new(); HashMap<ulong, bool> cast = HashMap.new();
+        for (i in 0..self.result.expr_types.keys.len()) {
+            ulong key = *self.result.expr_types.keys.get(i).unwrap(); uint file = key_file(key);
+            var e = t.get(file as usize).unwrap().expr(key_index(key));
+            match e.kind {
+                ast.ExprKind.Unary => {
+                    match e.unary_op { ast.UnaryOp.Neg => {
+                        match t.get(file as usize).unwrap().expr(e.a).kind { ast.ExprKind.IntLit => { negative.insert(node_key(file, e.a), true); }, _ => {} }
+                    }, _ => {} }
+                }
+                ast.ExprKind.Cast => {
+                    match t.get(file as usize).unwrap().expr(e.a).kind { ast.ExprKind.IntLit => { cast.insert(node_key(file, e.a), true); }, _ => {} }
+                }
+                _ => {}
+            }
+        }
+        for (i in 0..self.result.expr_types.keys.len()) {
+            ulong key = *self.result.expr_types.keys.get(i).unwrap(); var raw = *self.result.expr_types.values.get(i).unwrap();
+            var e = t.get(key_file(key) as usize).unwrap().expr(key_index(key));
+            match e.kind { ast.ExprKind.IntLit => {}, _ => { continue; } }
+            if (cast.contains_key(&key)) { continue; }
+            ulong value = e.number; Span span = e.span;
+            var ty = self.zonk(raw);
+            if (self.tk(ty) != K_PRIM || !self.is_integer(ty)) { continue; }
+            uint bits = 64;
+            if (self.is_prim(ty, ast.PrimKind.Byte)) { bits = 8; }
+            else if (self.is_prim(ty, ast.PrimKind.Short)) { bits = 16; }
+            else if (self.is_prim(ty, ast.PrimKind.Int) || self.is_prim(ty, ast.PrimKind.Uint)) { bits = 32; }
+            ulong limit = if (bits == 64) { 18446744073709551615 } else { ((1 as ulong) << bits) - 1 };
+            if (self.is_signed(ty)) { limit = ((1 as ulong) << (bits - 1)) - (if (negative.contains_key(&key)) { 0 } else { 1 }); }
+            if (value > limit) { var shown = self.show(ty); self.error(span, "integer literal is out of range for '{shown}'", "SNX0413"); }
+        }
+    }
+    void register_generics(&self, DefId owner) {
+        usize n = self.r.program.def(owner).generics.len();
+        for (i in 0..n) { var g = self.r.program.def(owner).generics.get(i).unwrap().type; self.param_bounds.put(g, BoundSource { kind: 0, owner: owner, index: i as uint }); }
+    }
+    void ensure_self_bounds(&self, DefId tr) {
+        while (self.self_bounds.len() <= tr.index as usize) { self.self_bounds.push(Vec.new()); }
+        if (self.self_bounds.get(tr.index as usize).unwrap().is_empty()) {
+            var bound = TraitRef { trait_def: tr, args: Vec.new() };
+            for (g in &const self.r.program.def(tr).generics) { bound.args.push(g.type); }
+            self.self_bounds.get_mut(tr.index as usize).unwrap().push(bound);
+        }
+    }
+    void register_all_bounds(&self) {
+        for (i in 0..self.r.program.structs.len()) { self.register_generics(DefId { kind: DefKind.Struct, index: i as uint }); }
+        for (i in 0..self.r.program.enums.len()) { self.register_generics(DefId { kind: DefKind.Enum, index: i as uint }); }
+        for (i in 0..self.r.program.impls.len()) { self.register_generics(DefId { kind: DefKind.Impl, index: i as uint }); }
+        for (i in 0..self.r.program.functions.len()) { self.register_generics(DefId { kind: DefKind.Function, index: i as uint }); }
+        for (i in 0..self.r.program.traits.len()) {
+            var tr = DefId { kind: DefKind.Trait, index: i as uint };
+            self.register_generics(tr); self.ensure_self_bounds(tr);
+            self.param_bounds.put(self.r.program.def(tr).self_type, BoundSource { kind: 1, owner: tr, index: 0 });
+        }
+    }
+    void require_sized(&self, TypeId x, Span span) {
+        if (x.index != NONE && self.is_unsized(x)) { var shown = self.show(x); self.error(span, "type '{shown}' is unsized here; use a reference", "SNX0411"); }
+    }
+    bool mentions(&const self, TypeId x, TypeId self_type) {
+        if (x.index == NONE) { return false; }
+        if (x.index == self_type.index) { return true; }
+        if (self.mentions(self.inner(x), self_type) || self.mentions(self.ret_of(x), self_type)) { return true; }
+        var es = self.elems(x); for (e in &const es) { if (self.mentions(*e, self_type)) { return true; } }
+        return false;
+    }
+    /// Bounds, sized arguments, and object safety after every body is checked.
+    void validate(&self, TypeId t, Span span, &HashMap<ulong, bool> seen) {
+        if (t.index == NONE) { return; }
+        ulong key = t.index as ulong;
+        if (seen.contains_key(&key)) { return; }
+        seen.insert(key, true);
+        uint k = self.tk(t);
+        if ((k == K_STRUCT || k == K_ENUM) && !self.contains_infer(t)) {
+            var def = self.def_of(t); var s = self.owner_subst(def, t);
+            usize ng = self.r.program.def(def).generics.len(); usize ne = self.n_elems(t);
+            for (i in 0..ng) {
+                if (i >= ne) { continue; }
+                usize nb = self.r.program.def(def).generics.get(i).unwrap().bounds.len();
+                for (b in 0..nb) {
+                    var bound = copy_trait(self.r.program.def(def).generics.get(i).unwrap().bounds.get(b).unwrap());
+                    var concrete = TraitRef { trait_def: bound.trait_def, args: Vec.new() };
+                    for (a in &const bound.args) { concrete.args.push(self.apply(&s, *a)); }
+                    var arg = self.elem(t, i);
+                    if (concrete.trait_def.index != NONE && !self.implements(arg, &concrete)) {
+                        var at = self.show(arg); var tn = self.def_name(concrete.trait_def);
+                        var gn = String.from(self.r.program.def(def).generics.get(i).unwrap().name); var ts = self.show(t);
+                        self.error(span, "the type '{at}' does not implement '{tn}', required for type argument '{gn}' of '{ts}'", "");
+                    }
+                }
+            }
+        }
+        if (k == K_STRUCT || k == K_ENUM || k == K_DYN || k == K_TUPLE || k == K_FN) { var es = self.elems(t); for (e in &const es) { self.require_sized(*e, span); } }
+        if (k == K_ARRAY || k == K_SLICE) { self.require_sized(self.inner(t), span); }
+        if (k == K_FN) { self.require_sized(self.ret_of(t), span); }
+        if (k == K_DYN) {
+            var tr = self.def_of(t); var self_type = self.r.program.def(tr).self_type;
+            var methods = copy_ids_def(&const self.r.program.def(tr).methods);
+            for (m in &const methods) {
+                var md = self.r.program.def(*m);
+                bool has_self = !md.params.is_empty() && self_kind_index(md.params.get(0).unwrap().self_kind) != 0;
+                bool safe = has_self && md.generics.is_empty() && self_kind_index(md.params.get(0).unwrap().self_kind) != 1 && !self.mentions(md.ret, self_type);
+                for (p in 1..md.params.len()) { safe = safe && !self.mentions(md.params.get(p).unwrap().type, self_type); }
+                if (!safe) {
+                    var tn = self.def_name(tr); var mn = self.def_name(*m);
+                    self.error(span, "trait '{tn}' cannot be used as dyn: method '{mn}' must have a reference receiver, no generics, and no Self outside the receiver", "SNX0410");
+                }
+            }
+        }
+        self.validate(self.inner(t), span, &*seen);
+        self.validate(self.ret_of(t), span, &*seen);
+        var es = self.elems(t); for (e in &const es) { self.validate(*e, span, &*seen); }
+    }
+    void validate_args(&self, &const Vec<TypeId> list, Span span, &HashMap<ulong, bool> seen) {
+        for (x in list) {
+            if (self.is_unsized(*x)) { var shown = self.show(*x); self.error(span, "type argument '{shown}' is unsized; use a reference", "SNX0411"); }
+            self.validate(*x, span, &*seen);
+        }
+    }
+    void validate_locals(&self, &const Vec<LocalVar> locals, &HashMap<ulong, bool> seen) {
+        for (l in locals) { self.validate(l.type, l.span, &*seen); }
+    }
+    void validate_program(&self, &const Vec<ast.Ast> t) {
+        HashMap<ulong, bool> seen = HashMap.new();
+        for (i in 0..self.r.program.impls.len()) {
+            var d = self.r.program.impls.get(i).unwrap(); var st = d.self_type; Span span = d.span; var args = copy_ids(&const d.trait_ref.args);
+            self.validate(st, span, &seen); for (a in &const args) { self.validate(*a, span, &seen); }
+        }
+        for (i in 0..self.r.program.structs.len()) {
+            usize n = self.r.program.structs.get(i).unwrap().fields.len();
+            for (f in 0..n) { var field = self.r.program.structs.get(i).unwrap().fields.get(f).unwrap(); var ft = field.type; Span span = field.span; self.validate(ft, span, &seen); }
+        }
+        for (i in 0..self.r.program.enums.len()) {
+            usize nv = self.r.program.enums.get(i).unwrap().variants.len();
+            for (v in 0..nv) {
+                var variant = self.r.program.enums.get(i).unwrap().variants.get(v).unwrap(); Span vspan = variant.span;
+                var tuple = copy_ids(&const variant.tuple_types);
+                for (x in &const tuple) {
+                    if (self.is_unsized(*x)) { self.error(vspan, "enum payload is unsized; use a reference", "SNX0411"); }
+                    self.validate(*x, vspan, &seen);
+                }
+                usize nf = self.r.program.enums.get(i).unwrap().variants.get(v).unwrap().fields.len();
+                for (f in 0..nf) { var field = self.r.program.enums.get(i).unwrap().variants.get(v).unwrap().fields.get(f).unwrap(); var ft = field.type; Span span = field.span; self.validate(ft, span, &seen); }
+            }
+        }
+        for (i in 0..self.r.program.consts.len()) { var d = self.r.program.consts.get(i).unwrap(); var ct = d.ret; Span span = d.span; self.validate(ct, span, &seen); }
+        for (i in 0..self.result.refs.keys.len()) {
+            ulong key = *self.result.refs.keys.get(i).unwrap(); Span span = self.espan(t, key);
+            var r = self.result.refs.values.get(i).unwrap().copy();
+            if (r.struct_def.index != NONE && r.owner_args.len() == self.r.program.def(r.struct_def).generics.len()) {
+                var st = self.nominal(r.struct_def, copy_ids(&const r.owner_args)); self.validate(st, span, &seen);
+            }
+            if (r.enum_def.index != NONE && r.owner_args.len() == self.r.program.def(r.enum_def).generics.len()) {
+                var et = self.nominal(r.enum_def, copy_ids(&const r.owner_args)); self.validate(et, span, &seen);
+            }
+            self.validate_args(&const r.type_args, span, &seen);
+            self.validate_args(&const r.owner_args, span, &seen);
+        }
+        for (i in 0..self.r.program.functions.len()) {
+            var d = self.r.program.functions.get(i).unwrap(); var ret = d.ret; Span span = d.span;
+            if (ret.index != NONE && self.is_unsized(ret)) { var shown = self.show(ret); self.error(span, "return type '{shown}' is unsized; use a reference", "SNX0411"); }
+            self.validate(ret, span, &seen);
+            usize np = self.r.program.functions.get(i).unwrap().params.len();
+            for (p in 0..np) { var param = self.r.program.functions.get(i).unwrap().params.get(p).unwrap(); var pt = param.type; Span ps = param.span; self.validate(pt, ps, &seen); }
+        }
+        for (i in 0..self.result.expr_types.keys.len()) {
+            ulong key = *self.result.expr_types.keys.get(i).unwrap(); var ty = *self.result.expr_types.values.get(i).unwrap();
+            self.validate(ty, self.espan(t, key), &seen);
+        }
+        for (i in 0..self.result.fn_locals.keys.len()) { var locals = check_data.copy_locals(self.result.fn_locals.values.get(i).unwrap()); self.validate_locals(&locals, &seen); }
+        for (i in 0..self.result.const_locals.keys.len()) { var locals = check_data.copy_locals(self.result.const_locals.values.get(i).unwrap()); self.validate_locals(&locals, &seen); }
+        for (i in 0..self.result.closure_locals.keys.len()) { var locals = check_data.copy_locals(self.result.closure_locals.values.get(i).unwrap()); self.validate_locals(&locals, &seen); }
+        for (i in 0..self.result.coercions.keys.len()) {
+            ulong key = *self.result.coercions.keys.get(i).unwrap(); var target = self.result.coercions.values.get(i).unwrap().target;
+            self.validate(target, self.espan(t, key), &seen);
+        }
+    }
+
+    // ---------- functions and constants ----------
+
+    uint push_frame(&self, DefId fn_def, uint file, Scope scope) {
+        uint index = self.frames.len() as uint;
+        self.frames.push(Frame { fn_def: fn_def, ret: TypeId.none(), ret_inferred: false, saw_return: false, in_const: false, loop_depth: 0,
+            loop_breaks: Vec.new(), unsafe_depth: 0, scope: scope, locals_frame: index, locals: Vec.new(), scopes: Vec.new(), parent: NONE, closure: check_data.NO_KEY,
+            local_start: 0, file: file });
+        return index;
+    }
+    Vec<LocalVar> pop_frame(&self) { var frame = self.frames.pop().unwrap(); return frame.locals; }
+    &Frame frame(&self, uint f) { return self.frames.get_mut(f as usize).unwrap(); }
+    uint root(&const self, uint f) { return self.frames.get(f as usize).unwrap().locals_frame; }
+    &Vec<LocalVar> locals(&self, uint f) { uint r = self.root(f); return &self.frames.get_mut(r as usize).unwrap().locals; }
+    LocalVar local(&const self, uint f, uint id) {
+        uint r = self.root(f); return check_data.copy_local(self.frames.get(r as usize).unwrap().locals.get(id as usize).unwrap());
+    }
+    usize local_count(&const self, uint f) { uint r = self.root(f); return self.frames.get(r as usize).unwrap().locals.len(); }
+
+    pub void check_const(&self, &const Vec<ast.Ast> t, uint index) {
+        var c = DefId { kind: DefKind.Const, index: index };
+        if (self.r.program.def(c).checked) { return; }
+        if (self.r.program.def(c).checking) {
+            var name = self.def_name(c); Span span = self.r.program.def(c).span;
+            self.error(span, "cyclic constant '{name}'", "SNX0405"); var err = self.error_t(); self.r.program.def_mut(c).ret = err; return;
+        }
+        self.r.program.def_mut(c).checking = true;
+        var saved_exprs = mem_take_keys(&self.exprs_in_function);
+        var saved_obligations = mem_take_obligations(&self.obligations);
+        var saved_bounds = self.param_bounds.copy(); self.param_bounds = BoundTable.new();
+        ModuleId saved_module = self.r.program.active_module;
+        ModuleId module = self.r.program.def(c).module; self.r.program.active_module = module;
+        uint file = self.r.program.def(c).ast_file;
+        uint f = self.push_frame(DefId.none(), file, Scope.root());
+        self.frame(f).in_const = true; self.frame(f).ret = self.void_t();
+        self.push_scope(f);
+        uint value = t.get(file as usize).unwrap().items.get(self.r.program.def(c).ast_index as usize).unwrap().b;
+        var declared = self.r.program.def(c).ret;
+        var ty = self.check_expr(t, f, value, declared);
+        if (declared.index != NONE) { self.coerce(t, node_key(file, value), ty, declared, "constant"); }
+        else { self.r.program.def_mut(c).ret = ty; }
+        self.pop_scope(f);
+        self.finish_function_types(t);
+        var final_type = self.zonk(self.r.program.def(c).ret); self.r.program.def_mut(c).ret = final_type;
+        var locals = self.pop_frame();
+        for (i in 0..locals.len()) { var z = self.zonk(locals.get(i).unwrap().type); locals.get_mut(i).unwrap().type = z; }
+        self.result.const_locals.put(index as ulong, locals);
+        self.exprs_in_function = saved_exprs; self.obligations = saved_obligations; self.param_bounds = saved_bounds;
+        self.r.program.active_module = saved_module;
+        self.r.program.def_mut(c).checking = false; self.r.program.def_mut(c).checked = true;
+    }
+    Scope owner_scope(&const self, DefId f) {
+        var d = self.r.program.def(f);
+        var outer = Scope { layers: Vec.new(), self_type: d.self_type };
+        match d.owner {
+            FnOwner.Struct => { outer.layers.push(d.owner_struct); }
+            FnOwner.Enum => { outer.layers.push(d.owner_enum); }
+            FnOwner.Trait => { outer.layers.push(d.owner_trait); }
+            FnOwner.Impl => { outer.layers.push(d.owner_impl); }
+            _ => {}
+        }
+        return outer.nested(f, d.self_type);
+    }
+    void ensure_signature(&self, &const Vec<ast.Ast> t, DefId f, Span use_span) {
+        if (self.r.program.def(f).ret.index != NONE) { return; }
+        if (self.r.program.def(f).checking) {
+            var name = self.def_name(f); Span span = self.r.program.def(f).span;
+            self.error(use_span, "function '{name}' calls itself, so it must write its return type", "SNX0405");
+            self.note(span, "add the return type here");
+            var err = self.error_t(); self.r.program.def_mut(f).ret = err; return;
+        }
+        self.check_function(t, f);
+    }
+    pub void check_function(&self, &const Vec<ast.Ast> t, DefId fn_def) {
+        if (self.r.program.def(fn_def).checked || self.r.program.def(fn_def).checking) { return; }
+        uint file = self.r.program.def(fn_def).ast_file; uint node = self.r.program.def(fn_def).ast_index;
+        if (file == NONE || t.get(file as usize).unwrap().function(node).body == ast.NONE) {
+            self.r.program.def_mut(fn_def).checked = true;
+            if (self.r.program.def(fn_def).ret.index == NONE) { var err = self.error_t(); self.r.program.def_mut(fn_def).ret = err; }
+            return;
+        }
+        ModuleId saved_module = self.r.program.active_module;
+        ModuleId module = self.r.program.def(fn_def).module; self.r.program.active_module = module;
+        self.r.program.def_mut(fn_def).checking = true;
+        var saved_exprs = mem_take_keys(&self.exprs_in_function);
+        var saved_obligations = mem_take_obligations(&self.obligations);
+        var saved_bounds = self.param_bounds.copy();
+        var scope = self.owner_scope(fn_def);
+        uint f = self.push_frame(fn_def, file, scope);
+        var declared = self.r.program.def(fn_def).ret;
+        self.frame(f).ret_inferred = declared.index == NONE;
+        var ret = if (declared.index == NONE) { self.fresh() } else { declared }; self.frame(f).ret = ret;
+        var layers = self.scope_copy(f).layers;
+        for (l in &const layers) { self.register_generics(*l); }
+        if (owner_index(self.r.program.def(fn_def).owner) == 3 && self.r.program.def(fn_def).owner_trait.index != NONE) {
+            var tr = self.r.program.def(fn_def).owner_trait; self.ensure_self_bounds(tr);
+            self.param_bounds.put(self.r.program.def(tr).self_type, BoundSource { kind: 1, owner: tr, index: 0 });
+        }
+        self.push_scope(f);
+        usize np = self.r.program.def(fn_def).params.len();
+        for (p in 0..np) {
+            var param = self.r.program.def(fn_def).params.get(p).unwrap(); var name = String.from(param.name); var pt = param.type; Span ps = param.span;
+            self.declare_local(f, name, pt, false, ps);
+        }
+        uint body = t.get(file as usize).unwrap().function(node).body;
+        var body_type = self.check_block(t, f, body, ret);
+        var block = t.get(file as usize).unwrap().block(body);
+        bool tail_has_value = block.tail != ast.NONE && !self.is_void(self.shallow(body_type)) && !self.is_never(self.shallow(body_type));
+        Span end = Span { start: block.span.end - 1, end: block.span.end, file: block.span.file };
+        if (tail_has_value) {
+            self.coerce(t, node_key(file, block.tail), body_type, ret, "return value");
+        } else if (!self.is_never(self.shallow(body_type))) {
+            if (self.frames.get(f as usize).unwrap().ret_inferred) {
+                var void_type = self.void_t();
+                if (!self.frames.get(f as usize).unwrap().saw_return) { self.unify(ret, void_type); }
+                else if (!self.try_unify(ret, void_type)) { var rn = self.type_name(ret); self.error(end, "function returns '{rn}' on some paths but falls off the end without a value", ""); }
+            } else if (!self.is_void(self.shallow(ret)) && !self.is_error(self.shallow(ret))) {
+                var rn = self.type_name(ret); self.error(end, "missing return value: function returns '{rn}'", "");
+            }
+        } else if (self.frames.get(f as usize).unwrap().ret_inferred && !self.frames.get(f as usize).unwrap().saw_return) {
+            // The body always diverges and never returns a value: infer void.
+            var void_type = self.void_t(); self.unify(ret, void_type);
+        }
+        self.pop_scope(f);
+        if (t.get(file as usize).unwrap().function(node).async_send) {
+            Vec<String> markers = Vec.new(); markers.push(String.from("Send")); markers.push(String.from("Owned"));
+            for (marker in &const markers) {
+                var tr = self.core_trait(marker.as_str());
+                for (p in 0..np) {
+                    var param = self.r.program.def(fn_def).params.get(p).unwrap(); var pt = param.type; Span ps = param.span; var pn = String.from(param.name);
+                    self.add_obligation(pt, TraitRef { trait_def: tr, args: Vec.new() }, ps, "send async input {pn}");
+                }
+                Span fs = self.r.program.def(fn_def).span;
+                self.add_obligation(ret, TraitRef { trait_def: tr, args: Vec.new() }, fs, String.from("send async output"));
+            }
+        }
+        self.finish_function_types(t);
+        if (self.frames.get(f as usize).unwrap().ret_inferred) {
+            var final_ret = self.zonk(ret);
+            if (self.contains_infer(final_ret)) {
+                var name = self.def_name(fn_def); Span span = self.r.program.def(fn_def).span;
+                self.error(span, "cannot infer the return type of '{name}'; write it", ""); final_ret = self.error_t();
+            }
+            self.r.program.def_mut(fn_def).ret = final_ret;
+        }
+        var locals = self.pop_frame();
+        for (i in 0..locals.len()) { var z = self.zonk(locals.get(i).unwrap().type); locals.get_mut(i).unwrap().type = z; }
+        self.result.fn_locals.put(fn_def.index as ulong, locals);
+        self.exprs_in_function = saved_exprs; self.obligations = saved_obligations; self.param_bounds = saved_bounds;
+        self.r.program.active_module = saved_module;
+        self.r.program.def_mut(fn_def).checking = false; self.r.program.def_mut(fn_def).checked = true;
+    }
+    void default_literals(&self, TypeId t) {
+        Vec<TypeId> stack = Vec.new(); stack.push(t);
+        while (!stack.is_empty()) {
+            var x = self.shallow(stack.pop().unwrap());
+            if (self.is_infer(x)) {
+                if (self.ik(x) == I_INT) { var it = self.int_t(); self.unify(x, it); }
+                else if (self.ik(x) == I_FLOAT) { var dt = self.double_t(); self.unify(x, dt); }
+                continue;
+            }
+            self.push_parts(&stack, x);
+        }
+    }
+    void push_parts(&const self, &Vec<TypeId> stack, TypeId x) {
+        if (self.inner(x).index != NONE) { stack.push(self.inner(x)); }
+        if (self.ret_of(x).index != NONE) { stack.push(self.ret_of(x)); }
+        var es = self.elems(x); for (e in &const es) { stack.push(*e); }
+    }
+    /// Resolves the current function's recorded types, applies literal
+    /// defaults, reports unknown types, and checks trait obligations.
+    void finish_function_types(&self, &const Vec<ast.Ast> t) {
+        for (pass in 0..2) {
+            for (i in 0..self.exprs_in_function.len()) {
+                ulong key = *self.exprs_in_function.get(i).unwrap();
+                var raw = *self.result.expr_types.get(key).unwrap(); var z = self.zonk(raw); self.default_literals(z);
+            }
+        }
+        Vec<uint> reported = Vec.new();
+        for (i in 0..self.exprs_in_function.len()) {
+            ulong key = *self.exprs_in_function.get(i).unwrap();
+            var raw = *self.result.expr_types.get(key).unwrap(); var z = self.zonk(raw);
+            self.result.expr_types.put(key, z);
+            if (self.contains_infer(z)) {
+                Vec<TypeId> stack = Vec.new(); stack.push(z);
+                while (!stack.is_empty()) {
+                    var x = self.shallow(stack.pop().unwrap());
+                    if (self.is_infer(x)) {
+                        bool seen = false; for (r in &const reported) { if (*r == x.index) { seen = true; } }
+                        if (!seen) { reported.push(x.index); self.error(self.espan(t, key), "cannot infer the type of this expression; add a type annotation", ""); }
+                        continue;
+                    }
+                    self.push_parts(&stack, x);
+                }
+            }
+        }
+        for (i in 0..self.result.refs.values.len()) {
+            var args = copy_ids(&const self.result.refs.values.get(i).unwrap().type_args);
+            for (a in 0..args.len()) { var z = self.zonk(*args.get(a).unwrap()); *self.result.refs.values.get_mut(i).unwrap().type_args.get_mut(a).unwrap() = z; }
+            var owners = copy_ids(&const self.result.refs.values.get(i).unwrap().owner_args);
+            for (a in 0..owners.len()) { var z = self.zonk(*owners.get(a).unwrap()); *self.result.refs.values.get_mut(i).unwrap().owner_args.get_mut(a).unwrap() = z; }
+        }
+        for (i in 0..self.result.coercions.values.len()) {
+            var target = self.result.coercions.values.get(i).unwrap().target;
+            if (target.index != NONE) { var z = self.zonk(target); self.result.coercions.values.get_mut(i).unwrap().target = z; }
+        }
+        for (i in 0..self.result.closure_locals.values.len()) {
+            usize n = self.result.closure_locals.values.get(i).unwrap().len();
+            for (l in 0..n) { var lt = self.result.closure_locals.values.get(i).unwrap().get(l).unwrap().type; var z = self.zonk(lt); self.result.closure_locals.values.get_mut(i).unwrap().get_mut(l).unwrap().type = z; }
+        }
+        self.check_obligations();
+        self.exprs_in_function.clear();
+    }
+
+    // ---------- scopes ----------
+
+    void push_scope(&self, uint f) { self.frame(f).scopes.push(Vec.new()); }
+    void pop_scope(&self, uint f) { var unused = self.frame(f).scopes.pop(); }
+    uint declare_local(&self, uint f, String name, TypeId type, bool is_const, Span span) {
+        uint id = self.local_count(f) as uint;
+        var copy = String.from(name);
+        self.locals(f).push(LocalVar { name: name, type: type, is_const: is_const, span: span });
+        usize depth = self.frames.get(f as usize).unwrap().scopes.len();
+        if (depth > 0) { self.frame(f).scopes.get_mut(depth - 1).unwrap().push(Named { name: copy, id: id }); }
+        return id;
+    }
+    Found lookup_local(&self, &const Vec<ast.Ast> t, uint f, &const str name, bool record_capture) {
+        uint c = f;
+        while (c != NONE) {
+            usize ns = self.frames.get(c as usize).unwrap().scopes.len();
+            usize s = ns;
+            while (s > 0) {
+                s -= 1;
+                usize nn = self.frames.get(c as usize).unwrap().scopes.get(s).unwrap().len(); usize n = nn;
+                while (n > 0) {
+                    n -= 1;
+                    var named = self.frames.get(c as usize).unwrap().scopes.get(s).unwrap().get(n).unwrap();
+                    if (named.name == String.from(name)) {
+                        uint id = named.id;
+                        uint capture = f;
+                        while (capture != NONE) {
+                            var cf = self.frames.get(capture as usize).unwrap(); ulong closure = cf.closure; uint start = cf.local_start; uint parent = cf.parent;
+                            if (record_capture && closure != check_data.NO_KEY && id < start) {
+                                bool present = false;
+                                for (x in self.result.closure_captures.entry(closure, Vec.new())) { if (*x == id) { present = true; } }
+                                if (!present) {
+                                    var ce = t.get(key_file(closure) as usize).unwrap().expr(key_index(closure));
+                                    if (ce.explicit_captures) {
+                                        bool listed = check_data.capture_mode(self.result.closure_capture_modes.entry(closure, Vec.new()), id).is_some();
+                                        if (!listed) { Span cs = ce.span; self.error(cs, "captured variable '{name}' is not in the capture list", "SNX0408"); }
+                                    }
+                                    self.result.closure_captures.entry(closure, Vec.new()).push(id);
+                                }
+                            }
+                            capture = parent;
+                        }
+                        return Found { ok: true, id: id };
+                    }
+                }
+            }
+            c = self.frames.get(c as usize).unwrap().parent;
+        }
+        return Found { ok: false, id: 0 };
+    }
+
+    // ---------- statements ----------
+
+    TypeId check_block(&self, &const Vec<ast.Ast> t, uint f, uint block, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap();
+        self.push_scope(f);
+        bool diverged = false;
+        for (s in &const tree.block(block).stmts) { if (self.check_stmt(t, f, *s)) { diverged = true; } }
+        TypeId result = TypeId.none();
+        uint tail = tree.block(block).tail;
+        if (tail != ast.NONE) { result = self.check_expr(t, f, tail, expected); }
+        else { result = if (diverged) { self.r.types.never() } else { self.void_t() }; }
+        self.pop_scope(f);
+        return result;
+    }
+    /// Returns true when an expression statement diverges.
+    bool check_stmt(&self, &const Vec<ast.Ast> t, uint f, uint stmt) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var s = tree.stmt(stmt);
+        match s.kind {
+            ast.StmtKind.VarDecl => { self.check_var_decl(t, f, stmt); }
+            ast.StmtKind.Expr => {
+                bool has_semi = s.flag;
+                var ty = self.check_expr(t, f, s.a, if (has_semi) { TypeId.none() } else { self.void_t() });
+                bool diverged = self.is_never(self.shallow(ty));
+                var sh = self.shallow(ty);
+                if (!has_semi && !self.is_void(sh) && !self.is_never(sh) && !self.is_error(sh)) {
+                    var void_type = self.void_t();
+                    if (!self.try_unify(ty, void_type)) { var tn = self.type_name(ty); self.error(tree.expr(s.a).span, "this value of type '{tn}' is not used; add ';' or use it", ""); }
+                }
+                return diverged;
+            }
+            ast.StmtKind.Assign => { self.check_assign(t, f, stmt); }
+            ast.StmtKind.While => {
+                var bool_type = self.bool_t();
+                var c = self.check_expr(t, f, s.a, bool_type);
+                self.unify_or_error(c, bool_type, tree.expr(s.a).span, "while condition");
+                self.frame(f).loop_depth += 1; self.frame(f).loop_breaks.push(false);
+                var b = self.check_block(t, f, s.b, self.void_t());
+                self.frame(f).loop_breaks.pop(); self.frame(f).loop_depth -= 1;
+                uint tail = tree.block(s.b).tail; if (tail != ast.NONE) { self.coerce(t, node_key(file, tail), b, self.void_t(), "loop body"); }
+            }
+            ast.StmtKind.Loop => {
+                self.frame(f).loop_depth += 1; self.frame(f).loop_breaks.push(false);
+                var b = self.check_block(t, f, s.a, self.void_t());
+                bool broke = self.frame(f).loop_breaks.pop().unwrap(); self.frame(f).loop_depth -= 1;
+                uint tail = tree.block(s.a).tail; if (tail != ast.NONE) { self.coerce(t, node_key(file, tail), b, self.void_t(), "loop body"); }
+                // A loop that no break targets never finishes.
+                return !broke;
+            }
+            ast.StmtKind.For => {
+                var it = self.check_expr(t, f, s.b, TypeId.none());
+                var sh = self.shallow(it); TypeId elem = TypeId.none();
+                var stripped = self.strip_refs(sh); var base = stripped.base; int refs = stripped.count;
+                bool is_const_ref = refs > 0 && self.const_of(sh);
+                Span iter_span = tree.expr(s.b).span;
+                if (self.tk(base) == K_STRUCT && (same_def(self.def_of(base), self.r.program.range_def) || same_def(self.def_of(base), self.r.program.range_inclusive_def))) {
+                    elem = self.elem(base, 0);
+                    if (!self.is_integer(self.shallow(elem))) { var en = self.type_name(elem); self.error(iter_span, "for over a range needs integer bounds, found '{en}'", ""); }
+                } else if (self.tk(base) == K_ARRAY || self.tk(base) == K_SLICE) {
+                    elem = if (refs > 0) { self.r.types.ref_type(self.inner(base), is_const_ref) } else { self.inner(base) };
+                } else if (self.tk(base) == K_STRUCT && same_def(self.def_of(base), self.r.program.vec_def) && self.n_elems(base) > 0) {
+                    elem = if (refs > 0) { self.r.types.ref_type(self.elem(base, 0), is_const_ref) } else { self.elem(base, 0) };
+                } else if (!self.is_error(base)) {
+                    var tn = self.type_name(it); self.error(iter_span, "cannot iterate over a value of type '{tn}'", ""); elem = self.error_t();
+                } else { elem = self.error_t(); }
+                self.push_scope(f);
+                self.check_pattern(t, f, s.a, elem, 0);
+                self.frame(f).loop_depth += 1; self.frame(f).loop_breaks.push(false);
+                var b = self.check_block(t, f, s.c, self.void_t());
+                self.frame(f).loop_breaks.pop(); self.frame(f).loop_depth -= 1;
+                uint tail = tree.block(s.c).tail; if (tail != ast.NONE) { self.coerce(t, node_key(file, tail), b, self.void_t(), "loop body"); }
+                self.pop_scope(f);
+            }
+        }
+        return false;
+    }
+    void check_var_decl(&self, &const Vec<ast.Ast> t, uint f, uint stmt) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var s = tree.stmt(stmt);
+        TypeId declared = if (s.a != ast.NONE) { self.resolve_type(t, f, s.a) } else { TypeId.none() };
+        TypeId type = declared;
+        if (s.b != ast.NONE) {
+            var init = self.check_expr(t, f, s.b, declared);
+            if (declared.index != NONE) { self.coerce(t, node_key(file, s.b), init, declared, "variable initializer"); }
+            else {
+                type = init;
+                if (self.is_never(self.shallow(init))) { type = self.fresh(); }
+                if (self.is_void(self.shallow(init))) { self.error(tree.expr(s.b).span, "cannot store a void value in a variable", ""); type = self.error_t(); }
+            }
+        }
+        if (type.index == NONE) { type = self.error_t(); }
+        if (self.is_unsized(self.shallow(type))) {
+            var tn = self.type_name(type); self.error(s.span, "a variable cannot have the unsized type '{tn}'; use a reference", ""); type = self.error_t();
+        }
+        uint id = self.declare_local(f, defs.name(s.text), type, s.flag, s.name_span);
+        self.result.decl_locals.put(node_key(file, stmt), id);
+    }
+    void check_assign(&self, &const Vec<ast.Ast> t, uint f, uint stmt) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var s = tree.stmt(stmt);
+        var target = self.check_expr(t, f, s.a, TypeId.none());
+        if (self.is_error(self.shallow(target))) { self.check_expr(t, f, s.b, TypeId.none()); return; }
+        Span target_span = tree.expr(s.a).span;
+        if (!self.is_place(t, f, node_key(file, s.a))) { self.error(target_span, "cannot assign to this expression", ""); }
+        else if (!self.place_is_mutable(t, f, node_key(file, s.a))) { self.error(target_span, "cannot assign: this value is read only", "SNX0403"); }
+        var value = self.check_expr(t, f, s.b, target);
+        match s.assign_op { ast.AssignOp.Assign => { self.coerce(t, node_key(file, s.b), value, target, "assignment"); return; }, _ => {} }
+        self.unify_or_error(value, target, tree.expr(s.b).span, "assignment");
+        var z = self.zonk(target); var ty = self.shallow(z);
+        bool ok = self.is_numeric(ty) || self.is_error(ty);
+        match s.assign_op {
+            ast.AssignOp.BitAnd => { ok = self.is_integer(ty) || self.is_error(ty); }, ast.AssignOp.BitOr => { ok = self.is_integer(ty) || self.is_error(ty); },
+            ast.AssignOp.BitXor => { ok = self.is_integer(ty) || self.is_error(ty); }, ast.AssignOp.Shl => { ok = self.is_integer(ty) || self.is_error(ty); },
+            ast.AssignOp.Shr => { ok = self.is_integer(ty) || self.is_error(ty); }, _ => {}
+        }
+        if (!ok) { var op = assign_op_name(s.assign_op); var tn = self.type_name(target); self.error(s.span, "operator '{op}' is not defined for '{tn}'", ""); }
+    }
+
+    // ---------- places ----------
+
+    RefKind? ref_kind(&const self, ulong e) { match self.result.refs.get(e) { Some(r) => return Some(r.kind), None => return None } }
+    bool is_place(&self, &const Vec<ast.Ast> t, uint f, ulong e) {
+        var node = t.get(key_file(e) as usize).unwrap().expr(key_index(e));
+        match node.kind {
+            ast.ExprKind.Name => { match self.ref_kind(e) { Some(k) => { match k { RefKind.Local => return true, _ => return false } }, None => return false } }
+            ast.ExprKind.Field => {
+                match self.ref_kind(e) { Some(k) => { match k { RefKind.Field => {}, RefKind.TupleField => {}, _ => return false } }, None => return false }
+                if (self.result.refs.get(e).unwrap().auto_derefs > 0) { return true; }
+                return self.is_place(t, f, node_key(key_file(e), node.a));
+            }
+            ast.ExprKind.Index => return true,
+            ast.ExprKind.Unary => { match node.unary_op { ast.UnaryOp.Deref => return true, _ => return false } }
+            _ => return false,
+        }
+    }
+    bool place_is_mutable(&self, &const Vec<ast.Ast> t, uint f, ulong e) {
+        uint file = key_file(e); var node = t.get(file as usize).unwrap().expr(key_index(e));
+        match node.kind {
+            ast.ExprKind.Name => {
+                match self.ref_kind(e) { Some(k) => { match k { RefKind.Local => {}, _ => return false } }, None => return false }
+                uint id = self.result.refs.get(e).unwrap().local_id;
+                if (id as usize >= self.local_count(f)) { return true; }
+                ulong closure = self.frames.get(f as usize).unwrap().closure; uint start = self.frames.get(f as usize).unwrap().local_start;
+                if (closure != check_data.NO_KEY && id < start) {
+                    var mode = check_data.capture_mode(self.result.closure_capture_modes.entry(closure, Vec.new()), id);
+                    var ce = t.get(key_file(closure) as usize).unwrap().expr(key_index(closure));
+                    bool shared_closure = mode_index(ce.mode) == 1;
+                    bool shared_capture = false; match mode { Some(m) => { shared_capture = capture_index(m) == 1; }, None => {} }
+                    if (shared_closure || shared_capture) { return false; }
+                }
+                return !self.local(f, id).is_const;
+            }
+            ast.ExprKind.Field => {
+                bool through = false; match self.result.refs.get(e) { Some(r) => { through = r.auto_derefs > 0; }, None => {} }
+                if (through) {
+                    var bt = self.shallow(*self.result.expr_types.get(node_key(file, node.a)).unwrap());
+                    return if (self.tk(bt) == K_REF) { !self.const_of(bt) } else { true };
+                }
+                return self.place_is_mutable(t, f, node_key(file, node.a));
+            }
+            ast.ExprKind.Index => {
+                var bt = self.shallow(*self.result.expr_types.get(node_key(file, node.a)).unwrap());
+                if (self.tk(bt) == K_REF) { return !self.const_of(bt); }
+                return self.place_is_mutable(t, f, node_key(file, node.a));
+            }
+            ast.ExprKind.Unary => {
+                var ot = self.shallow(*self.result.expr_types.get(node_key(file, node.a)).unwrap());
+                return if (self.tk(ot) == K_REF || self.tk(ot) == K_PTR) { !self.const_of(ot) } else { false };
+            }
+            _ => return false,
+        }
+    }
+
+    // ---------- expressions ----------
+
+    TypeId check_expr(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        var ty = self.check_expr_inner(t, f, e, expected);
+        if (ty.index == NONE) { ty = self.error_t(); }
+        uint file = self.frames.get(f as usize).unwrap().file;
+        return self.record(node_key(file, e), ty);
+    }
+    TypeId check_expr_inner(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        ulong key = node_key(file, e);
+        if (self.frames.get(f as usize).unwrap().in_const) {
+            bool banned = false; match x.kind { ast.ExprKind.Return => { banned = true; }, ast.ExprKind.Try => { banned = true; }, ast.ExprKind.Await => { banned = true; }, _ => {} }
+            if (banned) { self.error(x.span, "constant initializers cannot use return, ?, or await", "SNX0412"); return self.error_t(); }
+        }
+        match x.kind {
+            ast.ExprKind.IntLit => {
+                if (x.flag) { return self.prim(ast.PrimKind.Long); }
+                if (expected.index != NONE) { var s = self.shallow(expected); if (self.is_integer(s) && self.tk(s) == K_PRIM) { return s; } }
+                return self.r.types.fresh_infer(InferKind.Int);
+            }
+            ast.ExprKind.FloatLit => {
+                if (x.flag) { return self.prim(ast.PrimKind.Float); }
+                if (expected.index != NONE) { var s = self.shallow(expected); if (self.is_float(s) && self.tk(s) == K_PRIM) { return s; } }
+                return self.r.types.fresh_infer(InferKind.Float);
+            }
+            ast.ExprKind.CharLit => return self.prim(ast.PrimKind.Char),
+            ast.ExprKind.StringLit => { var str_type = self.r.types.str(); return self.r.types.ref_type(str_type, true); }
+            ast.ExprKind.BoolLit => return self.bool_t(),
+            ast.ExprKind.Interp => return self.check_interp(t, f, e),
+            ast.ExprKind.Name => return self.check_name(t, f, e),
+            ast.ExprKind.Field => return self.check_field(t, f, e),
+            ast.ExprKind.Call => return self.check_call(t, f, e, expected),
+            ast.ExprKind.Index => return self.check_index(t, f, e),
+            ast.ExprKind.Unary => return self.check_unary(t, f, e, expected),
+            ast.ExprKind.Binary => return self.check_binary(t, f, e, expected),
+            ast.ExprKind.Cast => return self.check_cast(t, f, e),
+            ast.ExprKind.Try => return self.check_try(t, f, e),
+            ast.ExprKind.OptChain => {
+                var base = self.shallow(self.check_expr(t, f, x.a, TypeId.none()));
+                var b = self.strip_refs(base).base;
+                if (self.tk(b) != K_ENUM || !same_def(self.def_of(b), self.r.program.option_def)) {
+                    if (!self.is_error(b)) { var tn = self.type_name(base); self.error(tree.expr(x.a).span, "'?.' needs an Option, found '{tn}'", ""); }
+                    return self.error_t();
+                }
+                var inner = self.strip_refs(self.elem(b, 0)).base; var name = defs.name(x.text);
+                if (self.tk(inner) == K_STRUCT) {
+                    var def = self.def_of(inner); uint index = self.field_index(def, name);
+                    if (index == NONE) { var tn = self.type_name(inner); self.error(x.span, "no field '{name}' on '{tn}'", ""); return self.error_t(); }
+                    var s = self.owner_subst(def, inner);
+                    var ref = NameRef.new(); ref.kind = RefKind.Field; ref.struct_def = def; ref.field_index = index;
+                    self.result.refs.put(key, ref);
+                    var ft = self.apply(&s, self.r.program.def(def).fields.get(index as usize).unwrap().type);
+                    return self.option_of(ft);
+                }
+                if (!self.is_error(inner)) { var tn = self.type_name(inner); self.error(x.span, "'?.' field access needs a struct inside the Option, found '{tn}'", ""); }
+                return self.error_t();
+            }
+            ast.ExprKind.Coalesce => {
+                var v = self.shallow(self.check_expr(t, f, x.a, TypeId.none()));
+                if (self.tk(v) != K_ENUM || !same_def(self.def_of(v), self.r.program.option_def)) {
+                    if (!self.is_error(v)) { var tn = self.type_name(v); self.error(tree.expr(x.a).span, "'??' needs an Option on the left, found '{tn}'", ""); }
+                    self.check_expr(t, f, x.b, TypeId.none());
+                    return self.error_t();
+                }
+                var inner = self.elem(v, 0);
+                var fb = self.check_expr(t, f, x.b, inner);
+                self.coerce(t, node_key(file, x.b), fb, inner, "'??' fallback");
+                return inner;
+            }
+            ast.ExprKind.Range => return self.check_range(t, f, e, expected),
+            ast.ExprKind.Ref => {
+                TypeId want_inner = TypeId.none();
+                if (expected.index != NONE && self.tk(self.shallow(expected)) == K_REF) { want_inner = self.inner(self.shallow(expected)); }
+                var inner = self.check_expr(t, f, x.a, want_inner);
+                if (!x.flag) {
+                    if (!self.is_place(t, f, node_key(file, x.a))) { self.error(x.span, "cannot take a writable reference to a temporary value", ""); }
+                    else if (!self.place_is_mutable(t, f, node_key(file, x.a))) { self.error(x.span, "cannot take a writable reference to a read only value", ""); }
+                }
+                return self.r.types.ref_type(inner, x.flag);
+            }
+            ast.ExprKind.StructLit => return self.check_struct_lit(t, f, e),
+            ast.ExprKind.Tuple => {
+                TypeId want_tuple = TypeId.none(); if (expected.index != NONE) { want_tuple = self.shallow(expected); }
+                Vec<TypeId> es = Vec.new(); usize n = x.items.len();
+                for (i in 0..n) {
+                    TypeId want = TypeId.none();
+                    if (want_tuple.index != NONE && self.tk(want_tuple) == K_TUPLE && self.n_elems(want_tuple) == n) { want = self.elem(want_tuple, i); }
+                    es.push(self.check_expr(t, f, *x.items.get(i).unwrap(), want));
+                }
+                return self.r.types.tuple(es);
+            }
+            ast.ExprKind.Array => {
+                TypeId elem = TypeId.none();
+                if (expected.index != NONE) { var s = self.shallow(expected); if (self.tk(s) == K_ARRAY) { elem = self.inner(s); } }
+                if (elem.index == NONE) { elem = self.fresh(); }
+                for (item in &const x.items) { var ty = self.check_expr(t, f, *item, elem); self.coerce(t, node_key(file, *item), ty, elem, "array element"); }
+                return self.r.types.array(elem, x.items.len() as ulong);
+            }
+            ast.ExprKind.ArrayRepeat => {
+                TypeId elem = TypeId.none();
+                if (expected.index != NONE) { var s = self.shallow(expected); if (self.tk(s) == K_ARRAY) { elem = self.inner(s); } }
+                var ty = self.check_expr(t, f, x.a, elem);
+                if (elem.index != NONE) { self.coerce(t, node_key(file, x.a), ty, elem, "array element"); } else { elem = ty; }
+                self.check_expr(t, f, x.b, self.usize_t());
+                var count = tree.expr(x.b);
+                match count.kind { ast.ExprKind.IntLit => {}, _ => { self.error(count.span, "array repeat count must be an integer literal", ""); return self.error_t(); } }
+                return self.r.types.array(elem, count.number);
+            }
+            ast.ExprKind.Block => return self.check_block(t, f, x.a, expected),
+            ast.ExprKind.If => return self.check_if(t, f, e, expected),
+            ast.ExprKind.Match => return self.check_match(t, f, e, expected),
+            ast.ExprKind.Closure => return self.check_closure(t, f, e, expected),
+            ast.ExprKind.Unsafe => {
+                self.frame(f).unsafe_depth += 1;
+                var ty = self.check_block(t, f, x.a, expected);
+                self.frame(f).unsafe_depth -= 1;
+                return ty;
+            }
+            ast.ExprKind.Await => {
+                var future = self.shallow(self.check_expr(t, f, x.a, TypeId.none()));
+                var fn_def = self.frames.get(f as usize).unwrap().fn_def; bool is_async = false;
+                if (fn_def.index != NONE) {
+                    var d = self.r.program.def(fn_def);
+                    is_async = d.ast_file != NONE && t.get(d.ast_file as usize).unwrap().function(d.ast_index).is_async;
+                }
+                if (!is_async) { self.error(x.span, "await requires an async function body", "SNX0417"); return self.error_t(); }
+                while (self.tk(future) == K_REF) {
+                    if (self.const_of(future)) { self.error(x.span, "await needs writable access to the future", "SNX0417"); return self.error_t(); }
+                    future = self.shallow(self.inner(future));
+                }
+                var output = self.fresh();
+                Vec<TypeId> args = Vec.new(); args.push(output);
+                var tr = TraitRef { trait_def: self.core_trait("Future"), args: args };
+                if (!self.implements(future, &tr)) {
+                    if (!self.is_error(future)) { self.error(x.span, "await requires a type that implements Future<T>", "SNX0417"); }
+                    return self.error_t();
+                }
+                return output;
+            }
+            ast.ExprKind.Return => {
+                self.frame(f).saw_return = true; var ret = self.frames.get(f as usize).unwrap().ret;
+                if (x.a != ast.NONE) {
+                    var ty = self.check_expr(t, f, x.a, ret);
+                    self.coerce(t, node_key(file, x.a), ty, ret, "return value");
+                } else {
+                    var void_type = self.void_t();
+                    if (!self.try_unify(ret, void_type)) { var rn = self.type_name(ret); self.error(x.span, "this function returns '{rn}', so return needs a value", ""); }
+                }
+                return self.r.types.never();
+            }
+            ast.ExprKind.Break => {
+                if (self.frames.get(f as usize).unwrap().loop_depth == 0) { self.error(x.span, "break outside a loop", ""); }
+                usize open = self.frame(f).loop_breaks.len(); if (open > 0) { *self.frame(f).loop_breaks.get_mut(open - 1).unwrap() = true; }
+                return self.r.types.never();
+            }
+            ast.ExprKind.Continue => { if (self.frames.get(f as usize).unwrap().loop_depth == 0) { self.error(x.span, "continue outside a loop", ""); } return self.r.types.never(); }
+        }
+    }
+    pub uint field_index(&const self, DefId def, &const str name) {
+        var fields = &const self.r.program.def(def).fields;
+        for (i in 0..fields.len()) { if (fields.get(i).unwrap().name == String.from(name)) { return i as uint; } }
+        return NONE;
+    }
+    pub DefId find_method(&const self, DefId owner, &const str name) {
+        for (m in &const self.r.program.def(owner).methods) { if (self.r.program.def(*m).name == String.from(name)) { return *m; } }
+        return DefId.none();
+    }
+    pub uint find_variant(&const self, DefId en, &const str name) {
+        for (v in &const self.r.program.def(en).variants) { if (v.name == String.from(name)) { return v.index; } }
+        return NONE;
+    }
+    pub uint variant_kind(&const self, DefId en, uint v) {
+        match self.r.program.def(en).variants.get(v as usize).unwrap().kind { ast.VariantKind.Unit => return 0, ast.VariantKind.Tuple => return 1, ast.VariantKind.Struct => return 2 }
+    }
+    pub bool has_self(&const self, DefId f) {
+        var d = self.r.program.def(f); return !d.params.is_empty() && self_kind_index(d.params.get(0).unwrap().self_kind) != 0;
+    }
+
+    TypeId check_name(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var x = t.get(file as usize).unwrap().expr(e); ulong key = node_key(file, e);
+        var name = defs.name(x.text);
+        var found = self.lookup_local(t, f, name, true);
+        if (found.ok) {
+            var ref = NameRef.new(); ref.kind = RefKind.Local; ref.local_id = found.id; self.result.refs.put(key, ref);
+            return self.local(f, found.id).type;
+        }
+        if (name == String.from("Self")) {
+            var ref = NameRef.new(); ref.kind = RefKind.TypeName;
+            var self_type = self.frames.get(f as usize).unwrap().scope.self_type;
+            if (self_type.index == NONE) { self.error(x.span, "Self is only valid inside a type", ""); return self.error_t(); }
+            var s = self.shallow(self_type);
+            if (self.tk(s) == K_STRUCT) { ref.struct_def = self.def_of(s); }
+            if (self.tk(s) == K_ENUM) { ref.enum_def = self.def_of(s); }
+            self.result.refs.put(key, ref);
+            self.error(x.span, "'Self' names a type; use Self.item or Self {{ ... }}", "");
+            return self.error_t();
+        }
+        match self.r.program.find(name) {
+            None => { self.error(x.span, "unknown name '{name}'", "SNX0401"); return self.error_t(); }
+            Some(symbol) => return self.check_symbol(t, f, key, symbol, name),
+        }
+    }
+    bool accessible(&self, ModuleId module, bool is_pub, Span span, &const str name) {
+        if (module.index == NONE || module.index == self.r.program.active_module.index || is_pub) { return true; }
+        var mn = String.from(self.r.program.module(module).name);
+        self.error(span, "'{name}' is private to module '{mn}'", "SNX0304"); return false;
+    }
+    bool method_accessible(&self, DefId fn_def, Span span) {
+        var drop = self.core_trait("Drop"); var d = self.r.program.def(fn_def); uint owner = owner_index(d.owner);
+        bool is_drop = (owner == 3 && same_def(d.owner_trait, drop)) || (owner == 4 && same_def(self.r.program.def(d.owner_impl).trait_ref.trait_def, drop));
+        if (is_drop) { self.error(span, "Drop.drop cannot be called explicitly; use std.mem.drop(value) to consume a value", "SNX0416"); return false; }
+        if (d.is_builtin) { return true; }
+        DefId tr = d.owner_trait;
+        if (tr.index == NONE && d.owner_impl.index != NONE) { tr = self.r.program.def(d.owner_impl).trait_ref.trait_def; }
+        var name = String.from(d.name);
+        if (tr.index != NONE) { var tm = self.r.program.def(tr).module; bool tp = self.r.program.def(tr).is_pub; return self.accessible(tm, tp, span, name); }
+        var fm = d.module; bool fp = d.is_pub;
+        return self.accessible(fm, fp, span, name);
+    }
+    Symbol? module_member(&self, ModuleId module, &const str name, Span span) {
+        match self.r.program.module_find(module, name) {
+            None => return None,
+            Some(found) => {
+                if (self.r.program.module(found.owner).namespace_owner.index == self.r.program.active_module.index) { return Some(found.symbol); }
+                return if (self.accessible(found.owner, found.symbol.is_pub, span, name)) { Some(found.symbol) } else { None };
+            }
+        }
+    }
+    ModuleId module_expr(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var x = t.get(file as usize).unwrap().expr(e);
+        Symbol? symbol = None;
+        match x.kind {
+            ast.ExprKind.Name => {
+                var name = defs.name(x.text);
+                if (self.lookup_local(t, f, name, false).ok) { return ModuleId.none(); }
+                symbol = self.r.program.find(name);
+            }
+            ast.ExprKind.Field => {
+                var module = self.module_expr(t, f, x.a);
+                if (module.index == NONE) { return ModuleId.none(); }
+                var name = defs.name(x.text);
+                bool is_module = false;
+                match self.r.program.module_find(module, name) { Some(m) => { is_module = m.symbol.kind == 6; }, None => {} }
+                if (is_module) { symbol = self.module_member(module, name, x.name_span); }
+            }
+            _ => {}
+        }
+        match symbol { Some(s) => { if (s.kind == 6) { return ModuleId { index: s.module_def }; } }, None => {} }
+        return ModuleId.none();
+    }
+    TypeId check_symbol(&self, &const Vec<ast.Ast> t, uint f, ulong key, Symbol symbol, &const str name) {
+        var x = t.get(key_file(key) as usize).unwrap().expr(key_index(key)); Span span = x.span;
+        var ref = NameRef.new();
+        if (symbol.kind == 3) {
+            var fn_def = DefId { kind: DefKind.Function, index: symbol.fn_def };
+            var explicit_args = self.resolve_explicit_args(t, f, &const x.type_args);
+            self.ensure_signature(t, fn_def, span);
+            var ty = self.instantiate_function(fn_def, explicit_args, Subst.new(), span, &ref);
+            ref.kind = RefKind.Function; self.result.refs.put(key, ref); return ty;
+        }
+        if (symbol.kind == 5) {
+            var en = DefId { kind: DefKind.Enum, index: symbol.enum_def }; Vec<TypeId> args = Vec.new();
+            usize ng = self.r.program.def(en).generics.len(); for (i in 0..ng) { args.push(self.fresh()); }
+            var ty = self.variant_value_type(en, symbol.variant, args, &ref);
+            self.result.refs.put(key, ref); return ty;
+        }
+        if (symbol.kind == 4) {
+            self.check_const(t, symbol.const_def);
+            ref.kind = RefKind.Const; ref.const_def = DefId { kind: DefKind.Const, index: symbol.const_def };
+            self.result.refs.put(key, ref);
+            return self.r.program.def(DefId { kind: DefKind.Const, index: symbol.const_def }).ret;
+        }
+        if (symbol.kind == 0 || symbol.kind == 1) {
+            ref.kind = RefKind.TypeName;
+            if (symbol.struct_def != NONE) { ref.struct_def = DefId { kind: DefKind.Struct, index: symbol.struct_def }; }
+            if (symbol.enum_def != NONE) { ref.enum_def = DefId { kind: DefKind.Enum, index: symbol.enum_def }; }
+            self.result.refs.put(key, ref);
+            self.error(span, "'{name}' is a type, not a value", ""); return self.error_t();
+        }
+        if (symbol.kind == 6) { self.error(span, "'{name}' is a module, not a value", ""); return self.error_t(); }
+        self.error(span, "'{name}' is a trait, not a value", ""); return self.error_t();
+    }
+    Vec<TypeId> resolve_explicit_args(&self, &const Vec<ast.Ast> t, uint f, &const Vec<uint> args) {
+        Vec<TypeId> out = Vec.new(); for (a in args) { out.push(self.resolve_type(t, f, *a)); } return out;
+    }
+    /// Unit variant: the enum type. Tuple variant: a constructor function.
+    TypeId variant_value_type(&self, DefId en, uint v, Vec<TypeId> args, &NameRef ref) {
+        ref.kind = RefKind.Variant; ref.variant_enum = en; ref.variant = v; ref.enum_def = en; ref.owner_args = copy_ids(&const args);
+        var enum_type = self.nominal(en, copy_ids(&const args));
+        var s = Subst.new(); usize ng = self.r.program.def(en).generics.len();
+        for (i in 0..ng) { s.bind(self.r.program.def(en).generics.get(i).unwrap().type, *args.get(i).unwrap()); }
+        uint kind = self.variant_kind(en, v);
+        if (kind == 1) {
+            var tuple = copy_ids(&const self.r.program.def(en).variants.get(v as usize).unwrap().tuple_types);
+            Vec<TypeId> params = Vec.new(); for (x in &const tuple) { params.push(self.apply(&s, *x)); }
+            return self.fn_type(params, enum_type);
+        }
+        return enum_type;
+    }
+    /// True if e names a type: a bare struct or enum name, Self, or module.Type.
+    TypeName resolve_type_name(&self, &const Vec<ast.Ast> t, uint f, uint e, Span span) {
+        uint file = self.frames.get(f as usize).unwrap().file; var x = t.get(file as usize).unwrap().expr(e); ulong key = node_key(file, e);
+        var miss = TypeName { ok: false, struct_def: DefId.none(), enum_def: DefId.none(), args: Vec.new() };
+        Symbol? symbol = None; String name = String.new();
+        match x.kind {
+            ast.ExprKind.Name => {
+                name = defs.name(x.text);
+                if (self.lookup_local(t, f, name, false).ok) { return miss; }
+                if (name == String.from("Self")) {
+                    var self_type = self.frames.get(f as usize).unwrap().scope.self_type;
+                    if (self_type.index == NONE) { return miss; }
+                    var s = self.shallow(self_type);
+                    var out = TypeName { ok: true, struct_def: DefId.none(), enum_def: DefId.none(), args: Vec.new() };
+                    if (self.tk(s) == K_STRUCT) { out.struct_def = self.def_of(s); }
+                    else if (self.tk(s) == K_ENUM) { out.enum_def = self.def_of(s); }
+                    else { return miss; }
+                    out.args = self.elems(s);
+                    var ref = NameRef.new(); ref.kind = RefKind.TypeName; ref.struct_def = out.struct_def; ref.enum_def = out.enum_def;
+                    self.result.refs.put(key, ref); self.result.expr_types.put(key, self.void_t());
+                    return out;
+                }
+                symbol = self.r.program.find(name);
+            }
+            ast.ExprKind.Field => {
+                var module = self.module_expr(t, f, x.a);
+                if (module.index == NONE) { return miss; }
+                name = defs.name(x.text);
+                symbol = self.module_member(module, name, x.name_span);
+            }
+            _ => return miss,
+        }
+        var sym = Symbol.new(0);
+        match symbol { Some(s) => { sym = s; }, None => return miss }
+        if (sym.kind != 0 && sym.kind != 1) { return miss; }
+        var out = TypeName { ok: true, struct_def: DefId.none(), enum_def: DefId.none(), args: Vec.new() };
+        DefId owner = DefId.none();
+        if (sym.kind == 0) { out.struct_def = DefId { kind: DefKind.Struct, index: sym.struct_def }; owner = out.struct_def; }
+        else { out.enum_def = DefId { kind: DefKind.Enum, index: sym.enum_def }; owner = out.enum_def; }
+        usize want = self.r.program.def(owner).generics.len();
+        out.args = self.resolve_explicit_args(t, f, &const x.type_args);
+        if (!out.args.is_empty() && out.args.len() != want) {
+            usize got = out.args.len(); self.error(span, "'{name}' expects {want} type arguments, got {got}", ""); out.args = Vec.new();
+        }
+        if (out.args.is_empty()) { for (i in 0..want) { out.args.push(self.fresh()); } }
+        var ref = NameRef.new(); ref.kind = RefKind.TypeName; ref.struct_def = out.struct_def; ref.enum_def = out.enum_def;
+        self.result.refs.put(key, ref); self.result.expr_types.put(key, self.void_t());
+        return out;
+    }
+    TypeId instantiate_function(&self, DefId fn_def, Vec<TypeId> explicit_args, Subst owner, Span span, &NameRef ref) {
+        ref.fn_def = fn_def;
+        var s = owner;
+        usize n = self.r.program.def(fn_def).generics.len(); var name = self.def_name(fn_def);
+        if (!explicit_args.is_empty() && explicit_args.len() != n) {
+            usize got = explicit_args.len(); self.error(span, "'{name}' expects {n} type arguments, got {got}", "");
+        }
+        for (i in 0..n) {
+            var arg = if (explicit_args.len() == n) { *explicit_args.get(i).unwrap() } else { self.fresh() };
+            s.bind(self.r.program.def(fn_def).generics.get(i).unwrap().type, arg);
+            ref.type_args.push(arg);
+            usize nb = self.r.program.def(fn_def).generics.get(i).unwrap().bounds.len();
+            var gn = String.from(self.r.program.def(fn_def).generics.get(i).unwrap().name);
+            for (b in 0..nb) {
+                var bound = copy_trait(self.r.program.def(fn_def).generics.get(i).unwrap().bounds.get(b).unwrap());
+                var br = TraitRef { trait_def: bound.trait_def, args: Vec.new() };
+                for (a in &const bound.args) { br.args.push(self.apply(&s, *a)); }
+                self.add_obligation(arg, br, span, "type argument '{gn}' of '{name}'");
+            }
+        }
+        Vec<TypeId> params = Vec.new(); usize np = self.r.program.def(fn_def).params.len();
+        for (p in 0..np) { var pt = self.r.program.def(fn_def).params.get(p).unwrap().type; params.push(self.apply(&s, pt)); }
+        var declared = self.r.program.def(fn_def).ret;
+        var ret = if (declared.index != NONE) { self.apply(&s, declared) } else { self.error_t() };
+        var syntax = *self.fn_syntax.get(fn_def.index as usize).unwrap();
+        if (syntax.is_async && self.r.program.task_def.index != NONE) {
+            var task = if (syntax.async_send) { self.r.program.send_task_def } else { self.r.program.task_def };
+            Vec<TypeId> args = Vec.new(); args.push(ret); ret = self.nominal(task, args);
+        }
+        return self.fn_type(params, ret);
+    }
+
+    TypeId check_field(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var x = t.get(file as usize).unwrap().expr(e); ulong key = node_key(file, e);
+        var name = defs.name(x.text); Span name_span = x.name_span;
+        var module = self.module_expr(t, f, x.a);
+        if (module.index != NONE) {
+            match self.module_member(module, name, name_span) {
+                None => {
+                    // A private item already reported SNX0304 in module_member.
+                    if (self.r.program.module_find(module, name.as_str()).is_none()) {
+                        var mn = String.from(self.r.program.module(module).name); self.error(name_span, "no public item '{name}' in module '{mn}'", "");
+                    }
+                    return self.error_t();
+                }
+                Some(symbol) => return self.check_symbol(t, f, key, symbol, name),
+            }
+        }
+        Span base_span = t.get(file as usize).unwrap().expr(x.a).span;
+        var tn = self.resolve_type_name(t, f, x.a, base_span);
+        if (tn.ok) {
+            var ref = NameRef.new();
+            if (tn.enum_def.index != NONE) {
+                uint v = self.find_variant(tn.enum_def, name);
+                if (v != NONE) { var ty = self.variant_value_type(tn.enum_def, v, copy_ids(&const tn.args), &ref); self.result.refs.put(key, ref); return ty; }
+            }
+            var owner = if (tn.struct_def.index != NONE) { tn.struct_def } else { tn.enum_def };
+            var fn_def = self.find_method(owner, name);
+            if (fn_def.index == NONE) { var on = self.def_name(owner); self.error(name_span, "no item '{name}' on type '{on}'", ""); return self.error_t(); }
+            if (!self.method_accessible(fn_def, name_span)) { return self.error_t(); }
+            if (self.has_self(fn_def)) { self.error(name_span, "'{name}' is a method; call it on a value", ""); return self.error_t(); }
+            var s = Subst.new(); usize ng = self.r.program.def(owner).generics.len();
+            for (i in 0..ng) { s.bind(self.r.program.def(owner).generics.get(i).unwrap().type, *tn.args.get(i).unwrap()); }
+            self.ensure_signature(t, fn_def, x.span);
+            var explicit_args = self.resolve_explicit_args(t, f, &const x.type_args);
+            var ty = self.instantiate_function(fn_def, explicit_args, s, x.span, &ref);
+            ref.kind = RefKind.AssocFn; ref.struct_def = tn.struct_def; ref.enum_def = tn.enum_def; ref.owner_args = copy_ids(&const tn.args);
+            self.result.refs.put(key, ref);
+            return ty;
+        }
+        var base = self.check_expr(t, f, x.a, TypeId.none());
+        var stripped = self.strip_refs(base); var b = stripped.base; int derefs = stripped.count;
+        if (self.is_error(b)) { return self.error_t(); }
+        if (self.tk(b) == K_TUPLE && !x.text.is_empty() && is_digit(bytes.at(x.text, 0))) {
+            usize index = parse_index(x.text);
+            if (index >= self.n_elems(b)) { var bn = self.type_name(b); self.error(name_span, "tuple of type '{bn}' has no element {name}", ""); return self.error_t(); }
+            var ref = NameRef.new(); ref.kind = RefKind.TupleField; ref.field_index = index as uint; ref.auto_derefs = derefs;
+            self.result.refs.put(key, ref);
+            return self.elem(b, index);
+        }
+        if (self.tk(b) == K_STRUCT) {
+            var def = self.def_of(b); uint index = self.field_index(def, name);
+            if (index != NONE) {
+                var sm = self.r.program.def(def).module; bool fp = self.r.program.def(def).fields.get(index as usize).unwrap().is_pub;
+                var fname = String.from(self.r.program.def(def).fields.get(index as usize).unwrap().name);
+                if (!self.accessible(sm, fp, name_span, fname)) { return self.error_t(); }
+                var s = self.owner_subst(def, b);
+                var ref = NameRef.new(); ref.kind = RefKind.Field; ref.struct_def = def; ref.field_index = index; ref.auto_derefs = derefs;
+                self.result.refs.put(key, ref);
+                return self.apply(&s, self.r.program.def(def).fields.get(index as usize).unwrap().type);
+            }
+            if (self.find_method(def, name).index != NONE) { self.error(name_span, "'{name}' is a method; add parentheses to call it", ""); return self.error_t(); }
+            var bn = self.type_name(b); self.error(name_span, "no field '{name}' on type '{bn}'", ""); return self.error_t();
+        }
+        if (self.tk(b) == K_ENUM) { var bn = self.type_name(b); self.error(name_span, "cannot access '{name}' on enum '{bn}'; use match", ""); return self.error_t(); }
+        var hit = Hit.new();
+        if (self.lookup_method(base, name, &hit)) { self.error(name_span, "'{name}' is a method; add parentheses to call it", ""); return self.error_t(); }
+        var bn = self.type_name(base); self.error(name_span, "no field '{name}' on type '{bn}'", ""); return self.error_t();
+    }
+
+    // ---------- calls ----------
+
+    void check_loose(&self, &const Vec<ast.Ast> t, uint f, &const Vec<uint> args) { for (a in args) { self.check_expr(t, f, *a, TypeId.none()); } }
+    TypeId check_args(&self, &const Vec<ast.Ast> t, uint f, &const Vec<uint> args, TypeId fn_type, usize skip, Span span) {
+        var ft = self.shallow(fn_type); uint file = self.frames.get(f as usize).unwrap().file;
+        if (self.is_error(ft)) { self.check_loose(t, f, args); return self.error_t(); }
+        usize want = self.n_elems(ft) - skip;
+        if (args.len() != want) {
+            var plural = if (want == 1) { String.new() } else { String.from("s") }; usize got = args.len();
+            self.error(span, "expected {want} argument{plural}, got {got}", "");
+            self.check_loose(t, f, args); return self.ret_of(ft);
+        }
+        for (i in 0..args.len()) {
+            var want_t = self.elem(ft, i + skip); uint a = *args.get(i).unwrap();
+            var got = self.check_expr(t, f, a, want_t);
+            self.coerce(t, node_key(file, a), got, want_t, "argument");
+        }
+        return self.ret_of(ft);
+    }
+    /// Readonly when the callee is a read only place or reached through &const.
+    bool readonly_callee(&self, &const Vec<ast.Ast> t, uint f, ulong callee, TypeId ft) {
+        bool readonly = self.is_place(t, f, callee) && !self.place_is_mutable(t, f, callee);
+        var r = self.shallow(ft);
+        while (self.tk(r) == K_REF) { readonly = readonly || self.const_of(r); r = self.shallow(self.inner(r)); }
+        return readonly;
+    }
+    TypeId check_call(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e); ulong key = node_key(file, e);
+        uint callee = x.a; var c = tree.expr(callee); ulong ckey = node_key(file, callee);
+        match c.kind {
+            ast.ExprKind.OptChain => {
+                var base = self.check_expr(t, f, c.a, TypeId.none());
+                var b = self.strip_refs(base).base;
+                if (self.tk(b) != K_ENUM || !same_def(self.def_of(b), self.r.program.option_def)) {
+                    if (!self.is_error(b)) { var bn = self.type_name(base); self.error(tree.expr(c.a).span, "'?.' needs an Option, found '{bn}'", ""); }
+                    self.check_loose(t, f, &const x.items); return self.error_t();
+                }
+                var inner = self.elem(b, 0); var name = defs.name(c.text);
+                var hit = Hit.new();
+                if (!self.lookup_method(inner, name, &hit)) {
+                    var tn = self.type_name(inner); self.error(c.span, "no method '{name}' on type '{tn}'", "SNX0407");
+                    self.check_loose(t, f, &const x.items); return self.error_t();
+                }
+                if (!self.method_accessible(hit.fn_def, c.span)) { return self.error_t(); }
+                var ref = NameRef.new();
+                self.ensure_signature(t, hit.fn_def, x.span);
+                var ft = self.instantiate_function(hit.fn_def, Vec.new(), hit.owner_subst.copy(), x.span, &ref);
+                ref.kind = RefKind.Method; ref.impl_def = hit.impl_def; ref.trait_def = hit.trait_def; ref.auto_derefs = hit.derefs; ref.owner_args = copy_ids(&const hit.owner_args);
+                self.result.refs.put(key, ref);
+                self.result.expr_types.put(ckey, ft);
+                usize skip = if (self.has_self(hit.fn_def)) { 1 } else { 0 };
+                var ret = self.check_args(t, f, &const x.items, ft, skip, x.span);
+                return self.option_of(ret);
+            }
+            ast.ExprKind.Field => {
+                if (self.module_expr(t, f, c.a).index == NONE) {
+                    Span base_span = tree.expr(c.a).span;
+                    if (!self.resolve_type_name(t, f, c.a, base_span).ok) { return self.check_method_call(t, f, e, expected); }
+                }
+            }
+            _ => {}
+        }
+        var ref = NameRef.new();
+        var ft = self.check_expr(t, f, callee, TypeId.none());
+        match self.result.refs.get(ckey) { Some(found) => { ref = found.copy(); }, None => {} }
+        var fnt = self.strip_refs(ft).base;
+        if (self.tk(fnt) != K_FN) {
+            if (!self.is_error(fnt)) { var tn = self.type_name(ft); self.error(c.span, "cannot call a value of type '{tn}'", ""); }
+            self.check_loose(t, f, &const x.items); return self.error_t();
+        }
+        uint rk = check_data.ref_kind_index(ref.kind); int unsafe_depth = self.frames.get(f as usize).unwrap().unsafe_depth;
+        if (rk == 1 && ref.fn_def.index != NONE && self.r.program.def(ref.fn_def).is_builtin && unsafe_depth == 0
+            && (self.r.program.def(ref.fn_def).name == String.from("drop_in_place") || self.r.program.def(ref.fn_def).name == String.from("str_from_raw"))) {
+            var bn = String.from(self.r.program.def(ref.fn_def).name.as_str()); self.error(x.span, "{bn} requires an unsafe block", "SNX0415");
+        }
+        if (rk == 1 && ref.fn_def.index != NONE && owner_index(self.r.program.def(ref.fn_def).owner) == 5 && unsafe_depth == 0) {
+            self.error(x.span, "calling an extern function requires an unsafe block", "");
+        }
+        bool readonly = self.readonly_callee(t, f, ckey, ft);
+        uint mode = mode_index(self.mode_of(fnt));
+        if (mode == 2 && self.tk(self.shallow(ft)) == K_REF) { self.error(c.span, "a consuming function must be owned to call it", "SNX0408"); }
+        if (mode == 0 && rk != 1 && rk != 3 && readonly) { self.error(c.span, "calling a function value requires writable access", "SNX0408"); }
+        if (expected.index != NONE) { self.try_unify(self.ret_of(fnt), expected); }
+        return self.check_args(t, f, &const x.items, fnt, 0, x.span);
+    }
+    bool method_in_impls(&self, TypeId base, &const str name, &Hit hit) {
+        for (i in 0..self.r.program.impls.len()) {
+            var im = DefId { kind: DefKind.Impl, index: i as uint };
+            var m = self.find_method(im, name); if (m.index == NONE) { continue; }
+            var s = Subst.new(); Vec<TypeId> fresh = Vec.new(); usize ng = self.r.program.def(im).generics.len();
+            for (g in 0..ng) { var v = self.fresh(); s.bind(self.r.program.def(im).generics.get(g).unwrap().type, v); fresh.push(v); }
+            var self_type = self.apply(&s, self.r.program.def(im).self_type);
+            usize mark = self.trail.len();
+            if (self.unify(self_type, base)) {
+                hit.fn_def = m; hit.impl_def = im; hit.owner_subst = s.copy(); hit.owner_args = copy_ids(&const fresh);
+                Span span = self.r.program.def(im).span;
+                for (g in 0..ng) {
+                    usize nb = self.r.program.def(im).generics.get(g).unwrap().bounds.len();
+                    var gn = String.from(self.r.program.def(im).generics.get(g).unwrap().name);
+                    for (b in 0..nb) {
+                        var bound = copy_trait(self.r.program.def(im).generics.get(g).unwrap().bounds.get(b).unwrap());
+                        var br = TraitRef { trait_def: bound.trait_def, args: Vec.new() };
+                        for (a in &const bound.args) { br.args.push(self.apply(&s, *a)); }
+                        self.add_obligation(*fresh.get(g).unwrap(), br, span, "impl type parameter '{gn}'");
+                    }
+                }
+                return true;
+            }
+            self.rollback(mark);
+        }
+        return false;
+    }
+    bool lookup_method(&self, TypeId recv, &const str name, &Hit hit) {
+        var stripped = self.strip_refs(recv); var base = stripped.base;
+        hit.derefs = stripped.count; hit.base = base;
+        if (self.is_error(base)) { return false; }
+        uint k = self.tk(base);
+        if (k == K_STRUCT || k == K_ENUM) {
+            var def = self.def_of(base); var m = self.find_method(def, name);
+            if (m.index != NONE) {
+                usize ng = self.r.program.def(def).generics.len();
+                for (i in 0..ng) { hit.owner_subst.bind(self.r.program.def(def).generics.get(i).unwrap().type, self.elem(base, i)); }
+                hit.owner_args = self.elems(base); hit.fn_def = m; return true;
+            }
+        }
+        if (k == K_STR) {
+            for (m in &const self.r.builtin_str_methods) { if (self.r.program.def(*m).name == String.from(name)) { hit.fn_def = *m; return true; } }
+        }
+        if (k == K_DYN) {
+            var tr = self.def_of(base); var m = self.find_method(tr, name);
+            if (m.index != NONE) {
+                hit.fn_def = m; hit.trait_def = tr;
+                hit.owner_subst.bind(self.r.program.def(tr).self_type, base);
+                usize ne = self.n_elems(base);
+                for (i in 0..ne) { hit.owner_subst.bind(self.r.program.def(tr).generics.get(i).unwrap().type, self.elem(base, i)); }
+                hit.owner_args = self.elems(base); return true;
+            }
+            return false;
+        }
+        if (k == K_PARAM) {
+            match self.bounds_of(base) {
+                Some(bounds) => {
+                    for (b in &const bounds) {
+                        if (b.trait_def.index == NONE) { continue; }
+                        var m = self.find_method(b.trait_def, name);
+                        if (m.index != NONE) {
+                            hit.fn_def = m; hit.trait_def = b.trait_def;
+                            hit.owner_subst.bind(self.r.program.def(b.trait_def).self_type, base);
+                            usize ng = self.r.program.def(b.trait_def).generics.len();
+                            for (i in 0..ng) { if (i < b.args.len()) { hit.owner_subst.bind(self.r.program.def(b.trait_def).generics.get(i).unwrap().type, *b.args.get(i).unwrap()); } }
+                            hit.owner_args = copy_ids(&const b.args); return true;
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if (self.method_in_impls(base, name, &*hit)) {
+            if (hit.impl_def.index != NONE && self.r.program.def(hit.impl_def).trait_ref.trait_def.index != NONE) {
+                var tr = self.r.program.def(hit.impl_def).trait_ref.trait_def;
+                hit.owner_subst.bind(self.r.program.def(tr).self_type, base);
+                usize ng = self.r.program.def(tr).generics.len(); usize na = self.r.program.def(hit.impl_def).trait_ref.args.len();
+                for (i in 0..ng) {
+                    if (i >= na) { continue; }
+                    var arg = *self.r.program.def(hit.impl_def).trait_ref.args.get(i).unwrap();
+                    var applied = hit.owner_subst.apply(&self.r.types, arg);
+                    hit.owner_subst.bind(self.r.program.def(tr).generics.get(i).unwrap().type, applied);
+                }
+            }
+            return true;
+        }
+        for (i in 0..self.r.program.impls.len()) {
+            var im = DefId { kind: DefKind.Impl, index: i as uint };
+            var tr = self.r.program.def(im).trait_ref.trait_def; if (tr.index == NONE) { continue; }
+            var m = self.find_method(tr, name); if (m.index == NONE) { continue; }
+            var md = self.r.program.def(m);
+            if (md.ast_file == NONE || self.function_body(m) == ast.NONE) { continue; }
+            var s = Subst.new(); Vec<TypeId> fresh = Vec.new(); usize ng = self.r.program.def(im).generics.len();
+            for (g in 0..ng) { var v = self.fresh(); s.bind(self.r.program.def(im).generics.get(g).unwrap().type, v); fresh.push(v); }
+            usize mark = self.trail.len();
+            var self_type = self.apply(&s, self.r.program.def(im).self_type);
+            if (self.unify(self_type, base)) {
+                hit.fn_def = m; hit.impl_def = im; hit.trait_def = tr; hit.owner_subst = s.copy();
+                hit.owner_subst.bind(self.r.program.def(tr).self_type, base); hit.owner_args = copy_ids(&const fresh);
+                return true;
+            }
+            self.rollback(mark);
+        }
+        return false;
+    }
+    void check_receiver(&self, &const Vec<ast.Ast> t, uint f, ulong recv, TypeId recv_type, &const Hit hit, Span span) {
+        if (!self.has_self(hit.fn_def)) { return; }
+        uint kind = self_kind_index(self.r.program.def(hit.fn_def).params.get(0).unwrap().self_kind);
+        var rt = self.shallow(recv_type); var name = self.def_name(hit.fn_def);
+        if (kind == 1) {
+            if (hit.derefs > 0 && !self.is_copy(hit.base)) { self.error(span, "method '{name}' takes self by value, but the receiver is a reference to a non Copy value", ""); }
+        } else if (kind == 2) {
+            if (self.tk(rt) == K_REF) {
+                if (self.const_of(rt)) { self.error(span, "method '{name}' needs a writable reference, but the receiver is read only", ""); }
+            } else {
+                if (!self.is_place(t, f, recv)) { self.error(span, "method '{name}' needs a writable reference to a variable, not a temporary", ""); }
+                else if (!self.place_is_mutable(t, f, recv)) { self.error(span, "method '{name}' changes the value, but the receiver is read only", ""); }
+                self.set_coercion(recv, CoercionKind.AutoBorrowMut, false, TypeId.none());
+            }
+        } else if (kind == 3) {
+            if (self.tk(rt) != K_REF) { self.set_coercion(recv, CoercionKind.AutoBorrowConst, false, TypeId.none()); }
+        }
+    }
+    TypeId check_method_call(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var call = tree.expr(e); ulong key = node_key(file, e);
+        uint callee = call.a; var c = tree.expr(callee); ulong ckey = node_key(file, callee); ulong rkey = node_key(file, c.a);
+        var name = defs.name(c.text); Span name_span = c.name_span;
+        var recv = self.check_expr(t, f, c.a, TypeId.none());
+        var stripped = self.strip_refs(recv); var base = stripped.base; int field_derefs = stripped.count;
+        TypeId field_type = TypeId.none(); var field_ref = NameRef.new();
+        if (self.tk(base) == K_STRUCT) {
+            var def = self.def_of(base); uint index = self.field_index(def, name);
+            if (index != NONE) {
+                var s = Subst.new(); usize ne = self.n_elems(base);
+                for (i in 0..ne) { s.bind(self.r.program.def(def).generics.get(i).unwrap().type, self.elem(base, i)); }
+                field_type = self.apply(&s, self.r.program.def(def).fields.get(index as usize).unwrap().type);
+                field_ref.kind = RefKind.Field; field_ref.struct_def = def; field_ref.field_index = index;
+            }
+        } else if (self.tk(base) == K_TUPLE && !c.text.is_empty() && is_digit(bytes.at(c.text, 0))) {
+            usize index = parse_index(c.text);
+            if (index < self.n_elems(base)) { field_type = self.elem(base, index); field_ref.kind = RefKind.TupleField; field_ref.field_index = index as uint; }
+        }
+        TypeId callable = TypeId.none(); if (field_type.index != NONE) { callable = self.strip_refs(field_type).base; }
+        if (callable.index != NONE && self.tk(callable) == K_FN) {
+            if (self.tk(base) == K_STRUCT) {
+                var def = self.def_of(base); uint index = self.field_index(def, name);
+                if (index != NONE) {
+                    var sm = self.r.program.def(def).module; bool fp = self.r.program.def(def).fields.get(index as usize).unwrap().is_pub;
+                    var fname = String.from(self.r.program.def(def).fields.get(index as usize).unwrap().name);
+                    if (!self.accessible(sm, fp, name_span, fname)) { return self.error_t(); }
+                }
+            }
+            field_ref.auto_derefs = field_derefs;
+            self.result.refs.put(ckey, field_ref);
+            self.result.expr_types.put(ckey, field_type);
+            bool readonly = self.readonly_callee(t, f, ckey, field_type);
+            uint mode = mode_index(self.mode_of(callable));
+            if (mode == 2 && self.tk(self.shallow(field_type)) == K_REF) { self.error(c.span, "a consuming function must be owned to call it", "SNX0408"); }
+            if (mode == 0 && readonly) { self.error(c.span, "calling a function value requires writable access", "SNX0408"); }
+            if (expected.index != NONE) { self.try_unify(self.ret_of(callable), expected); }
+            return self.check_args(t, f, &const call.items, callable, 0, call.span);
+        }
+        var hit = Hit.new();
+        if (!self.lookup_method(recv, name, &hit)) {
+            var b = self.strip_refs(recv).base;
+            if (self.tk(b) == K_STRUCT && self.field_index(self.def_of(b), name) != NONE) { self.error(name_span, "'{name}' is a field, not a method", ""); }
+            else if (!self.is_error(b)) { var rn = self.type_name(recv); self.error(name_span, "no method '{name}' on type '{rn}'", "SNX0407"); }
+            self.check_loose(t, f, &const call.items); return self.error_t();
+        }
+        if (!self.method_accessible(hit.fn_def, name_span)) { return self.error_t(); }
+        if (!self.has_self(hit.fn_def)) {
+            var bn = self.type_name(hit.base);
+            self.error(name_span, "'{name}' is an associated function; call it as {bn}.{name}(...)", "");
+            self.check_loose(t, f, &const call.items); return self.error_t();
+        }
+        self.ensure_signature(t, hit.fn_def, call.span);
+        var ref = NameRef.new();
+        var explicit_args = self.resolve_explicit_args(t, f, &const c.type_args);
+        var ft = self.instantiate_function(hit.fn_def, explicit_args, hit.owner_subst.copy(), call.span, &ref);
+        ref.kind = RefKind.Method; ref.impl_def = hit.impl_def; ref.trait_def = hit.trait_def; ref.auto_derefs = hit.derefs; ref.owner_args = copy_ids(&const hit.owner_args);
+        self.result.refs.put(key, ref);
+        self.result.expr_types.put(ckey, ft);
+        self.check_receiver(t, f, rkey, recv, &hit, name_span);
+        var sh = self.shallow(ft);
+        if (expected.index != NONE) { self.try_unify(self.ret_of(sh), expected); }
+        return self.check_args(t, f, &const call.items, ft, 1, call.span);
+    }
+
+    // ---------- other expressions ----------
+
+    TypeId check_index(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e); ulong key = node_key(file, e);
+        var base = self.check_expr(t, f, x.a, TypeId.none());
+        var stripped = self.strip_refs(base); var b = stripped.base; int derefs = stripped.count;
+        TypeId elem = TypeId.none();
+        if (self.tk(b) == K_ARRAY || self.tk(b) == K_SLICE) { elem = self.inner(b); }
+        else if (self.tk(b) == K_STRUCT && same_def(self.def_of(b), self.r.program.vec_def) && self.n_elems(b) > 0) { elem = self.elem(b, 0); }
+        else if (self.tk(b) == K_STRUCT && same_def(self.def_of(b), self.r.program.string_def)) {
+            self.error(x.span, "strings cannot be indexed by position; use as_str() and byte or char methods", "");
+            self.check_expr(t, f, x.b, TypeId.none()); return self.error_t();
+        } else {
+            if (!self.is_error(b)) { var bn = self.type_name(base); self.error(tree.expr(x.a).span, "cannot index a value of type '{bn}'", ""); }
+            self.check_expr(t, f, x.b, TypeId.none()); return self.error_t();
+        }
+        var ref = NameRef.new(); ref.kind = RefKind.Field; ref.auto_derefs = derefs; self.result.refs.put(key, ref);
+        var usize_type = self.usize_t();
+        var idx = self.check_expr(t, f, x.b, usize_type);
+        var it = self.shallow(idx); Span index_span = tree.expr(x.b).span;
+        if (self.tk(it) == K_STRUCT && (same_def(self.def_of(it), self.r.program.range_def) || same_def(self.def_of(it), self.r.program.range_inclusive_def))) {
+            self.unify_or_error(self.elem(it, 0), usize_type, index_span, "slice range");
+            return self.r.types.slice(elem);
+        }
+        self.unify_or_error(idx, usize_type, index_span, "index");
+        return elem;
+    }
+    TypeId check_unary(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var x = t.get(file as usize).unwrap().expr(e);
+        match x.unary_op {
+            ast.UnaryOp.Deref => {
+                var ty = self.shallow(self.check_expr(t, f, x.a, TypeId.none()));
+                if (self.tk(ty) == K_REF) { return self.inner(ty); }
+                if (self.tk(ty) == K_PTR) {
+                    if (self.frames.get(f as usize).unwrap().unsafe_depth == 0) { self.error(x.span, "dereferencing a raw pointer requires an unsafe block", ""); }
+                    return self.inner(ty);
+                }
+                if (!self.is_error(ty)) { var tn = self.type_name(ty); self.error(x.span, "cannot dereference a value of type '{tn}'", ""); }
+                return self.error_t();
+            }
+            ast.UnaryOp.Not => {
+                var ty = self.check_expr(t, f, x.a, self.bool_t()); var s = self.shallow(ty);
+                if (self.is_bool(s) || self.is_error(s)) { return self.bool_t(); }
+                if (self.is_integer(s)) { return ty; }
+                var not_trait = self.core_trait("Not");
+                if (not_trait.index != NONE) { var r = TraitRef { trait_def: not_trait, args: Vec.new() }; if (self.implements(s, &r)) { return ty; } }
+                var tn = self.type_name(ty); self.error(x.span, "operator '!' needs a bool, found '{tn}'", ""); return self.error_t();
+            }
+            ast.UnaryOp.BitNot => {
+                var ty = self.check_expr(t, f, x.a, expected);
+                if (self.is_integer(self.shallow(ty)) || self.is_error(self.shallow(ty))) { return ty; }
+                var tn = self.type_name(ty); self.error(x.span, "operator '~' needs an integer, found '{tn}'", ""); return self.error_t();
+            }
+            ast.UnaryOp.Neg => {
+                var ty = self.check_expr(t, f, x.a, expected); var s = self.shallow(ty);
+                if (self.is_numeric(s) || self.is_error(s)) {
+                    if (self.tk(s) == K_PRIM && !self.is_signed(s) && !self.is_float(s)) { var tn = self.type_name(ty); self.error(x.span, "cannot negate an unsigned value of type '{tn}'", ""); }
+                    return ty;
+                }
+                var neg = self.core_trait("Neg");
+                if (neg.index != NONE) { var r = TraitRef { trait_def: neg, args: Vec.new() }; if (self.implements(s, &r)) { return ty; } }
+                var tn = self.type_name(ty); self.error(x.span, "operator '-' is not defined for '{tn}'", ""); return self.error_t();
+            }
+        }
+    }
+    TypeId operator_result(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId lhs, TypeId rhs) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        var l = self.shallow(lhs); var r = self.shallow(rhs);
+        if (self.is_error(l) || self.is_error(r)) { return self.error_t(); }
+        String trait_name = String.new(); bool is_cmp = false; bool is_bits = false; bool is_eq = false;
+        match x.binary_op {
+            ast.BinaryOp.Add => { trait_name = String.from("Add"); }, ast.BinaryOp.Sub => { trait_name = String.from("Sub"); },
+            ast.BinaryOp.Mul => { trait_name = String.from("Mul"); }, ast.BinaryOp.Div => { trait_name = String.from("Div"); },
+            ast.BinaryOp.Rem => { trait_name = String.from("Rem"); },
+            ast.BinaryOp.Eq => { trait_name = String.from("Eq"); is_cmp = true; is_eq = true; }, ast.BinaryOp.Ne => { trait_name = String.from("Eq"); is_cmp = true; is_eq = true; },
+            ast.BinaryOp.Lt => { trait_name = String.from("Ord"); is_cmp = true; }, ast.BinaryOp.Gt => { trait_name = String.from("Ord"); is_cmp = true; },
+            ast.BinaryOp.Le => { trait_name = String.from("Ord"); is_cmp = true; }, ast.BinaryOp.Ge => { trait_name = String.from("Ord"); is_cmp = true; },
+            ast.BinaryOp.BitAnd => { is_bits = true; }, ast.BinaryOp.BitOr => { is_bits = true; }, ast.BinaryOp.BitXor => { is_bits = true; },
+            ast.BinaryOp.Shl => { is_bits = true; }, ast.BinaryOp.Shr => { is_bits = true; }, _ => {}
+        }
+        var op = binary_op_name(x.binary_op);
+        if (is_bits) {
+            if (!self.is_integer(l) || !self.is_integer(r)) {
+                var ln = self.type_name(l); var rn = self.type_name(r); self.error(x.span, "operator '{op}' needs integers, found '{ln}' and '{rn}'", ""); return self.error_t();
+            }
+            bool shift = false; match x.binary_op { ast.BinaryOp.Shl => { shift = true; }, ast.BinaryOp.Shr => { shift = true; }, _ => {} }
+            if (shift) { return lhs; }
+            self.unify_or_error(rhs, lhs, tree.expr(x.b).span, "operator operands");
+            return lhs;
+        }
+        var lb = if (is_cmp) { self.strip_refs(l).base } else { l };
+        var rb = if (is_cmp) { self.strip_refs(r).base } else { r };
+        if (!self.unify(lb, rb)) {
+            var ln = self.type_name(lhs); var rn = self.type_name(rhs);
+            self.error(x.span, "operator '{op}' needs both sides to have the same type, found '{ln}' and '{rn}'", ""); return self.error_t();
+        }
+        var ty = self.shallow(lb);
+        bool builtin_ok = self.is_numeric(ty) || (is_cmp && (self.is_bool(ty) || self.is_prim(ty, ast.PrimKind.Char) || self.tk(ty) == K_STR ||
+            (self.tk(ty) == K_STRUCT && same_def(self.def_of(ty), self.r.program.string_def))));
+        if (is_cmp && !is_eq && self.is_bool(ty)) { builtin_ok = false; }
+        if (!builtin_ok && !self.is_infer(ty)) {
+            var tr = self.core_trait(trait_name.as_str());
+            var want = TraitRef { trait_def: tr, args: Vec.new() };
+            if (tr.index == NONE || !self.implements(ty, &want)) {
+                var tn = self.type_name(ty); self.error(x.span, "operator '{op}' is not defined for '{tn}'; implement the trait '{trait_name}'", ""); return self.error_t();
+            }
+        }
+        return if (is_cmp) { self.bool_t() } else { lhs };
+    }
+    TypeId check_binary(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        bool logical = false; bool arithmetic = false;
+        match x.binary_op {
+            ast.BinaryOp.And => { logical = true; }, ast.BinaryOp.Or => { logical = true; },
+            ast.BinaryOp.Add => { arithmetic = true; }, ast.BinaryOp.Sub => { arithmetic = true; }, ast.BinaryOp.Mul => { arithmetic = true; },
+            ast.BinaryOp.Div => { arithmetic = true; }, ast.BinaryOp.Rem => { arithmetic = true; }, _ => {}
+        }
+        if (logical) {
+            var bool_type = self.bool_t();
+            var l = self.check_expr(t, f, x.a, bool_type); var r = self.check_expr(t, f, x.b, bool_type);
+            self.unify_or_error(l, bool_type, tree.expr(x.a).span, "logical operator");
+            self.unify_or_error(r, bool_type, tree.expr(x.b).span, "logical operator");
+            return bool_type;
+        }
+        var hint = if (arithmetic) { expected } else { TypeId.none() };
+        var l = self.check_expr(t, f, x.a, hint);
+        var lh = self.shallow(l);
+        var rhint = if (self.tk(lh) == K_PRIM) { lh } else { hint };
+        var r = self.check_expr(t, f, x.b, rhint);
+        return self.operator_result(t, f, e, l, r);
+    }
+    bool castable(&const self, TypeId t) { return self.is_numeric(t) || self.is_bool(t) || self.is_prim(t, ast.PrimKind.Char); }
+    TypeId check_cast(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var x = t.get(file as usize).unwrap().expr(e);
+        var target = self.resolve_type(t, f, x.b);
+        var from = self.shallow(self.check_expr(t, f, x.a, TypeId.none()));
+        if (self.is_infer(from) && self.ik(from) == I_INT) { var it = self.int_t(); self.unify(from, it); }
+        if (self.is_infer(from) && self.ik(from) == I_FLOAT) { var dt = self.double_t(); self.unify(from, dt); }
+        from = self.shallow(from);
+        if (self.is_error(from) || self.is_error(target)) { return target; }
+        if (self.castable(from) && self.castable(target)) {
+            if (self.is_bool(target)) { self.error(x.span, "cannot cast to bool; compare with 0 instead", ""); return self.error_t(); }
+            if (self.is_prim(target, ast.PrimKind.Char) && !self.is_prim(from, ast.PrimKind.Byte) && !self.is_prim(from, ast.PrimKind.Char)) {
+                self.error(x.span, "only byte can be cast to char; other integers may not be valid characters", ""); return self.error_t();
+            }
+            return target;
+        }
+        if (self.tk(from) == K_PTR && self.tk(target) == K_PTR) { return target; }
+        if (self.tk(from) == K_REF && self.tk(target) == K_PTR && !self.is_unsized(self.inner(from)) &&
+            (!self.const_of(from) || self.const_of(target)) && self.try_unify(self.inner(from), self.inner(target))) { return target; }
+        if (self.tk(from) == K_PTR && self.is_integer(target)) { return target; }
+        if (self.is_integer(from) && self.tk(target) == K_PTR) { return target; }
+        var fn_text = self.type_name(from); var tn = self.type_name(target);
+        self.error(x.span, "cannot cast '{fn_text}' to '{tn}'", ""); return self.error_t();
+    }
+    TypeId check_try(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var x = t.get(file as usize).unwrap().expr(e);
+        var ty = self.shallow(self.check_expr(t, f, x.a, TypeId.none()));
+        if (self.is_error(ty)) { return self.error_t(); }
+        var fret = self.frames.get(f as usize).unwrap().ret; var ret = self.shallow(fret);
+        if (self.tk(ty) == K_ENUM && same_def(self.def_of(ty), self.r.program.result_def)) {
+            if (self.is_infer(ret)) {
+                Vec<TypeId> args = Vec.new(); args.push(self.fresh()); args.push(self.elem(ty, 1));
+                var want = self.nominal(self.r.program.result_def, args); self.unify(ret, want); ret = self.shallow(fret);
+            }
+            if (self.tk(ret) != K_ENUM || !same_def(self.def_of(ret), self.r.program.result_def)) {
+                var rn = self.type_name(fret); self.error(x.span, "'?' on a Result needs the function to return a Result, but it returns '{rn}'", "");
+                return self.elem(ty, 0);
+            }
+            if (!self.unify(self.elem(ty, 1), self.elem(ret, 1))) {
+                var en = self.type_name(self.elem(ty, 1)); var rn = self.type_name(fret);
+                self.error(x.span, "'?' error type mismatch: this Result has error type '{en}' but the function returns '{rn}'", "");
+            }
+            return self.elem(ty, 0);
+        }
+        if (self.tk(ty) == K_ENUM && same_def(self.def_of(ty), self.r.program.option_def)) {
+            if (self.is_infer(ret)) { var v = self.fresh(); var want = self.option_of(v); self.unify(ret, want); ret = self.shallow(fret); }
+            if (self.tk(ret) != K_ENUM || !same_def(self.def_of(ret), self.r.program.option_def)) {
+                var rn = self.type_name(fret); self.error(x.span, "'?' on an Option needs the function to return an Option, but it returns '{rn}'", "");
+            }
+            return self.elem(ty, 0);
+        }
+        var tn = self.type_name(ty); self.error(x.span, "'?' needs a Result or Option, found '{tn}'", ""); return self.error_t();
+    }
+    /// Fields of a struct or of a struct variant (variant index v).
+    Vec<defs.FieldDef> field_defs(&const self, DefId owner, uint v) {
+        Vec<defs.FieldDef> out = Vec.new();
+        if (v == NONE) { for (fd in &const self.r.program.def(owner).fields) { out.push(defs.FieldDef { name: String.from(fd.name), span: fd.span, type: fd.type, is_pub: fd.is_pub }); } }
+        else { for (fd in &const self.r.program.def(owner).variants.get(v as usize).unwrap().fields) { out.push(defs.FieldDef { name: String.from(fd.name), span: fd.span, type: fd.type, is_pub: fd.is_pub }); } }
+        return out;
+    }
+    TypeId check_struct_lit(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e); ulong key = node_key(file, e);
+        DefId s = DefId.none(); DefId en = DefId.none(); uint variant = NONE; Vec<TypeId> args = Vec.new();
+        bool self_path = x.path.segments.len() == 1 && bytes.equals(x.path.segments.get(0).unwrap().name, "Self");
+        if (self_path) {
+            var self_type = self.frames.get(f as usize).unwrap().scope.self_type;
+            if (self_type.index != NONE && self.tk(self.shallow(self_type)) == K_STRUCT) { var st = self.shallow(self_type); s = self.def_of(st); args = self.elems(st); }
+        } else {
+            match resolve.lookup_path(&self.r, &const x.path) {
+                Some(symbol) => {
+                    if (symbol.kind == 0) { s = DefId { kind: DefKind.Struct, index: symbol.struct_def }; }
+                    if (symbol.kind == 5) { en = DefId { kind: DefKind.Enum, index: symbol.enum_def }; variant = symbol.variant; }
+                }
+                None => {}
+            }
+            if (s.index == NONE && variant == NONE && x.path.segments.len() > 1) {
+                match resolve.lookup_prefix(&self.r, &const x.path, x.path.segments.len() - 1) {
+                    Some(owner) => {
+                        if (owner.kind == 1) {
+                            en = DefId { kind: DefKind.Enum, index: owner.enum_def };
+                            variant = self.find_variant(en, defs.name(x.path.segments.get(x.path.segments.len() - 1).unwrap().name));
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        var path = path_text(&const x.path);
+        Vec<defs.FieldDef> fields = Vec.new(); DefId generics_owner = DefId.none(); TypeId result = TypeId.none();
+        if (s.index != NONE) {
+            if (args.is_empty()) { usize ng = self.r.program.def(s).generics.len(); for (i in 0..ng) { args.push(self.fresh()); } }
+            fields = self.field_defs(s, NONE); generics_owner = s; result = self.nominal(s, copy_ids(&const args));
+        } else if (variant != NONE && self.variant_kind(en, variant) == 2) {
+            usize ng = self.r.program.def(en).generics.len(); for (i in 0..ng) { args.push(self.fresh()); }
+            fields = self.field_defs(en, variant); generics_owner = en; result = self.nominal(en, copy_ids(&const args));
+        } else {
+            self.error(x.path.span, "unknown struct or struct variant '{path}'", "");
+            for (init in &const x.fields) { if (init.value != ast.NONE) { self.check_expr(t, f, init.value, TypeId.none()); } }
+            return self.error_t();
+        }
+        var sub = Subst.new(); usize ng = self.r.program.def(generics_owner).generics.len();
+        for (i in 0..ng) { sub.bind(self.r.program.def(generics_owner).generics.get(i).unwrap().type, *args.get(i).unwrap()); }
+        Vec<String> seen = Vec.new();
+        for (position in 0..x.fields.len()) {
+            var init = x.fields.get(position).unwrap(); var name = defs.name(init.name);
+            bool dup = false; for (sn in &const seen) { if (*sn == name) { dup = true; } }
+            if (dup) {
+                self.error(init.span, "field '{name}' is given twice", "");
+                if (init.value != ast.NONE) { self.check_expr(t, f, init.value, TypeId.none()); }
+                continue;
+            }
+            seen.push(String.from(name));
+            uint fi = NONE; for (i in 0..fields.len()) { if (fields.get(i).unwrap().name == name) { fi = i as uint; } }
+            if (fi == NONE) {
+                self.error(init.span, "no field '{name}' in '{path}'", "");
+                if (init.value != ast.NONE) { self.check_expr(t, f, init.value, TypeId.none()); }
+                continue;
+            }
+            var fd = fields.get(fi as usize).unwrap();
+            if (s.index != NONE) { var sm = self.r.program.def(s).module; if (!self.accessible(sm, fd.is_pub, init.span, fd.name)) { continue; } }
+            var want = self.apply(&sub, fd.type);
+            if (init.value != ast.NONE) {
+                var got = self.check_expr(t, f, init.value, want);
+                self.coerce(t, node_key(file, init.value), got, want, "struct field");
+            } else {
+                var found = self.lookup_local(t, f, name, true);
+                if (!found.ok) { self.error(init.span, "no variable '{name}' for field shorthand", ""); continue; }
+                var lt = self.local(f, found.id).type;
+                self.unify_or_error(lt, want, init.span, "struct field");
+                self.result.shorthand_locals.put(field_key(file, e, position), found.id);
+            }
+        }
+        for (fd in &const fields) {
+            bool given = false; for (sn in &const seen) { if (*sn == fd.name) { given = true; } }
+            if (!given) { var fname = String.from(fd.name); self.error(x.span, "missing field '{fname}' in '{path}'", "SNX0406"); }
+        }
+        var ref = NameRef.new();
+        ref.kind = if (s.index != NONE) { RefKind.TypeName } else { RefKind.Variant };
+        ref.struct_def = s;
+        if (variant != NONE) { ref.variant_enum = en; ref.variant = variant; ref.enum_def = en; }
+        ref.owner_args = args;
+        self.result.refs.put(key, ref);
+        return result;
+    }
+    TypeId check_if(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        var bool_type = self.bool_t();
+        var c = self.check_expr(t, f, x.a, bool_type);
+        self.unify_or_error(c, bool_type, tree.expr(x.a).span, "if condition");
+        if (x.c == ast.NONE) {
+            var ty = self.check_block(t, f, x.b, self.void_t());
+            uint tail = tree.block(x.b).tail;
+            if (tail != ast.NONE && !self.is_void(self.shallow(ty)) && !self.is_never(self.shallow(ty))) {
+                self.error(tree.expr(tail).span, "an if without else cannot produce a value; add an else branch", "");
+            }
+            return self.void_t();
+        }
+        var then_type = self.check_block(t, f, x.b, expected);
+        var else_type = self.check_expr(t, f, x.c, if (expected.index != NONE) { expected } else { then_type });
+        if (self.is_never(self.shallow(then_type))) { return else_type; }
+        if (self.is_never(self.shallow(else_type))) { return then_type; }
+        if (!self.unify(then_type, else_type)) {
+            var a = self.type_name(then_type); var b = self.type_name(else_type);
+            self.error(x.span, "if branches have different types: '{a}' and '{b}'", ""); return self.error_t();
+        }
+        return then_type;
+    }
+    TypeId check_match(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        var scrut = self.check_expr(t, f, x.a, TypeId.none());
+        TypeId result = TypeId.none(); bool all_never = true;
+        for (arm in &const x.arms) {
+            self.push_scope(f);
+            self.check_pattern(t, f, arm.pattern, scrut, 0);
+            if (arm.guard != ast.NONE) {
+                var bool_type = self.bool_t(); var g = self.check_expr(t, f, arm.guard, bool_type);
+                self.unify_or_error(g, bool_type, tree.expr(arm.guard).span, "match guard");
+            }
+            var want = if (expected.index != NONE) { expected } else { result };
+            var ty = self.check_expr(t, f, arm.body, want);
+            self.pop_scope(f);
+            if (self.is_never(self.shallow(ty))) { continue; }
+            all_never = false;
+            if (result.index == NONE) { result = ty; }
+            else if (!self.unify(result, ty)) {
+                var a = self.type_name(result); var b = self.type_name(ty);
+                self.error(tree.expr(arm.body).span, "match arms have different types: '{a}' and '{b}'", "");
+            }
+        }
+        self.check_exhaustive(t, f, e, scrut);
+        if (all_never) { return if (x.arms.is_empty()) { self.void_t() } else { self.r.types.never() }; }
+        return if (result.index != NONE) { result } else { self.void_t() };
+    }
+    TypeId check_closure(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e); ulong key = node_key(file, e);
+        TypeId want = TypeId.none();
+        if (expected.index != NONE) { var s = self.shallow(expected); if (self.tk(s) == K_FN) { want = s; } }
+        var scope = self.scope_copy(f);
+        uint c = self.push_frame(DefId.none(), file, scope);
+        uint root = self.root(f);
+        self.frame(c).parent = f; self.frame(c).closure = key; self.frame(c).local_start = self.local_count(f) as uint;
+        self.frame(c).locals_frame = root; self.frame(c).unsafe_depth = self.frames.get(f as usize).unwrap().unsafe_depth;
+        Vec<TypeId> params = Vec.new(); Vec<uint> ids = Vec.new();
+        self.push_scope(c);
+        for (i in 0..x.params.len()) {
+            var p = x.params.get(i).unwrap(); TypeId ty = TypeId.none();
+            if (p.type != ast.NONE) { ty = self.resolve_type(t, f, p.type); }
+            else if (want.index != NONE && i < self.n_elems(want)) { ty = self.elem(want, i); }
+            else { ty = self.fresh(); }
+            params.push(ty);
+            ids.push(self.declare_local(c, defs.name(p.name), ty, false, p.span));
+        }
+        for (capture in &const x.captures) {
+            var name = defs.name(capture.name);
+            var found = self.lookup_local(t, f, name, true);
+            if (!found.ok) { self.error(capture.span, "unknown captured variable '{name}'", "SNX0401"); continue; }
+            var modes = self.result.closure_capture_modes.entry(key, Vec.new());
+            if (!check_data.add_capture(modes, found.id, capture.mode)) { self.error(capture.span, "duplicate capture '{name}'", "SNX0408"); }
+            else { self.result.closure_captures.entry(key, Vec.new()).push(found.id); }
+            if (capture_index(capture.mode) == 2 && self.local(f, found.id).is_const) { self.error(capture.span, "cannot borrow a read only captured variable as writable", "SNX0408"); }
+        }
+        self.result.closure_params.put(key, ids);
+        TypeId ret = TypeId.none();
+        if (x.a != ast.NONE) { ret = self.resolve_type(t, f, x.a); }
+        else if (want.index != NONE) { ret = self.ret_of(want); }
+        else { ret = self.fresh(); }
+        self.frame(c).ret = ret; self.frame(c).ret_inferred = x.a == ast.NONE;
+        var body = self.check_expr(t, c, x.b, ret);
+        if (!self.is_never(self.shallow(body))) { self.coerce(t, node_key(file, x.b), body, ret, "closure body"); }
+        self.pop_scope(c);
+        var unused = self.pop_frame();
+        var all = check_data.copy_locals(self.locals(f));
+        self.result.closure_locals.put(key, all);
+        bool send = x.is_send || (want.index != NONE && self.send_of(want));
+        if (send) {
+            var captured_ids = copy_uints(self.result.closure_captures.entry(key, Vec.new()));
+            for (id in &const captured_ids) {
+                var local = self.local(f, *id); var captured = local.type;
+                var mode = check_data.capture_mode(self.result.closure_capture_modes.entry(key, Vec.new()), *id);
+                match mode { Some(m) => { if (capture_index(m) != 0) { captured = self.r.types.ref_type(captured, capture_index(m) == 1); } }, None => {} }
+                Vec<String> markers = Vec.new(); markers.push(String.from("Send")); markers.push(String.from("Owned"));
+                for (marker in &const markers) {
+                    var tr = self.core_trait(marker.as_str()); var ln = String.from(local.name);
+                    self.add_obligation(captured, TraitRef { trait_def: tr, args: Vec.new() }, x.span, "send closure capture {ln}");
+                }
+            }
+        }
+        return self.r.types.fn_type(params, ret, x.mode, send);
+    }
+    TypeId check_interp(&self, &const Vec<ast.Ast> t, uint f, uint e) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        var display = self.core_trait("Display");
+        for (part in &const x.parts) {
+            if (part.expr == ast.NONE) { continue; }
+            var ty = self.check_expr(t, f, part.expr, TypeId.none());
+            if (display.index != NONE) { self.add_obligation(ty, TraitRef { trait_def: display, args: Vec.new() }, tree.expr(part.expr).span, String.from("value in a string")); }
+        }
+        return self.string_type();
+    }
+    TypeId check_range(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId expected) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        if (x.a == ast.NONE || x.b == ast.NONE) {
+            self.error(x.span, "open ranges are not supported yet; write both ends", "");
+            if (x.a != ast.NONE) { self.check_expr(t, f, x.a, TypeId.none()); }
+            if (x.b != ast.NONE) { self.check_expr(t, f, x.b, TypeId.none()); }
+            return self.error_t();
+        }
+        TypeId hint = TypeId.none();
+        if (expected.index != NONE) {
+            var s = self.shallow(expected);
+            if (self.tk(s) == K_STRUCT && self.n_elems(s) > 0 && (same_def(self.def_of(s), self.r.program.range_def) || same_def(self.def_of(s), self.r.program.range_inclusive_def))) { hint = self.elem(s, 0); }
+        }
+        var a = self.check_expr(t, f, x.a, hint);
+        var b = self.check_expr(t, f, x.b, if (hint.index != NONE) { hint } else { a });
+        self.unify_or_error(b, a, tree.expr(x.b).span, "range bounds");
+        var def = if (x.flag) { self.r.program.range_inclusive_def } else { self.r.program.range_def };
+        if (def.index == NONE) { return self.error_t(); }
+        Vec<TypeId> args = Vec.new(); args.push(a); return self.nominal(def, args);
+    }
+
+    // ---------- patterns ----------
+
+    /// Resolves a variant path; fresh enum arguments go to args. Returns (enum, variant) or none.
+    uint resolve_variant_path(&self, &const ast.Path path, TypeId scrutinee, &Vec<TypeId> args, Span span, &DefId en_out) {
+        DefId en = DefId.none(); uint v = NONE;
+        match resolve.lookup_path(&self.r, path) { Some(symbol) => { if (symbol.kind == 5) { en = DefId { kind: DefKind.Enum, index: symbol.enum_def }; v = symbol.variant; } }, None => {} }
+        if (v == NONE && path.segments.len() > 1) {
+            match resolve.lookup_prefix(&self.r, path, path.segments.len() - 1) {
+                Some(owner) => { if (owner.kind == 1) { en = DefId { kind: DefKind.Enum, index: owner.enum_def }; v = self.find_variant(en, defs.name(path.segments.get(path.segments.len() - 1).unwrap().name)); } }
+                None => {}
+            }
+        }
+        if (v == NONE && path.segments.len() == 1) {
+            var base = self.strip_refs(scrutinee).base;
+            if (self.tk(base) == K_ENUM) { en = self.def_of(base); v = self.find_variant(en, defs.name(path.segments.get(0).unwrap().name)); }
+        }
+        if (v == NONE) { var text = path_text(path); self.error(span, "unknown variant '{text}'", ""); return NONE; }
+        usize ng = self.r.program.def(en).generics.len(); for (i in 0..ng) { args.push(self.fresh()); }
+        *en_out = en;
+        return v;
+    }
+    TypeId bind_type(&self, TypeId inner, uint ref_mode) { if (ref_mode == 0) { return inner; } return self.r.types.ref_type(inner, ref_mode == 1); }
+    /// ref_mode: 0 by value, 1 behind &const, 2 behind &.
+    void check_pattern(&self, &const Vec<ast.Ast> t, uint f, uint p, TypeId type, uint mode) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.pattern(p); ulong key = node_key(file, p);
+        var ty = self.shallow(type); uint ref_mode = mode;
+        bool structured = false;
+        match x.kind { ast.PatternKind.Wildcard => {}, ast.PatternKind.Binding => {}, ast.PatternKind.Or => {}, _ => { structured = true; } }
+        if (structured) {
+            int n = 0;
+            while (self.tk(ty) == K_REF) { ref_mode = if (ref_mode == 1 || self.const_of(ty)) { 1 } else { 2 }; ty = self.shallow(self.inner(ty)); n += 1; }
+            self.result.pattern_derefs.put(key, n);
+        }
+        match x.kind {
+            ast.PatternKind.Wildcard => {}
+            ast.PatternKind.Binding => {
+                var name = defs.name(x.text);
+                var base = self.strip_refs(ty).base; bool is_variant = false;
+                match self.r.program.find(name) {
+                    Some(sym) => { if (sym.kind == 5 && self.variant_kind(DefId { kind: DefKind.Enum, index: sym.enum_def }, sym.variant) == 0) { is_variant = true; } }
+                    None => {}
+                }
+                if (!is_variant && self.tk(base) == K_ENUM) {
+                    uint v = self.find_variant(self.def_of(base), name);
+                    if (v != NONE && self.variant_kind(self.def_of(base), v) == 0) { is_variant = true; }
+                }
+                if (is_variant) {
+                    int n = 0;
+                    while (self.tk(ty) == K_REF) { ref_mode = if (ref_mode == 1 || self.const_of(ty)) { 1 } else { 2 }; ty = self.shallow(self.inner(ty)); n += 1; }
+                    self.result.pattern_derefs.put(key, n);
+                    Vec<TypeId> args = Vec.new(); DefId en = DefId.none();
+                    var path = ast.empty_path(); path.span = x.span;
+                    path.segments.push(ast.PathSegment { span: x.span, name: bytes.copy(x.text, 0, x.text.len()) });
+                    uint v = self.resolve_variant_path(&path, ty, &args, x.span, &en);
+                    if (v != NONE) { var et = self.nominal(en, args); self.unify_or_error(et, ty, x.span, "pattern"); }
+                    return;
+                }
+                var bt = self.bind_type(ty, ref_mode);
+                uint id = self.declare_local(f, name, bt, false, x.span);
+                self.result.pattern_locals.put(key, id);
+            }
+            ast.PatternKind.Literal => {
+                var lt = self.check_expr(t, f, x.a, ty);
+                if (self.tk(self.shallow(lt)) == K_REF && self.tk(ty) == K_STR) { return; }
+                self.unify_or_error(lt, ty, x.span, "pattern");
+            }
+            ast.PatternKind.Range => {
+                var lo = self.check_expr(t, f, x.a, ty); var hi = self.check_expr(t, f, x.b, ty);
+                self.unify_or_error(lo, ty, tree.expr(x.a).span, "pattern");
+                self.unify_or_error(hi, ty, tree.expr(x.b).span, "pattern");
+            }
+            ast.PatternKind.Path => {
+                Vec<TypeId> args = Vec.new(); DefId en = DefId.none();
+                uint v = self.resolve_variant_path(&const x.path, ty, &args, x.span, &en);
+                if (v == NONE) { return; }
+                if (self.variant_kind(en, v) != 0) { var text = path_text(&const x.path); self.error(x.span, "variant '{text}' carries data; match its fields", ""); }
+                var et = self.nominal(en, args); self.unify_or_error(et, ty, x.span, "pattern");
+            }
+            ast.PatternKind.TupleStruct => {
+                Vec<TypeId> args = Vec.new(); DefId en = DefId.none();
+                uint v = self.resolve_variant_path(&const x.path, ty, &args, x.span, &en);
+                if (v == NONE) { for (el in &const x.items) { self.check_pattern(t, f, *el, self.error_t(), ref_mode); } return; }
+                var et = self.nominal(en, copy_ids(&const args)); self.unify_or_error(et, ty, x.span, "pattern");
+                var text = path_text(&const x.path);
+                if (self.variant_kind(en, v) != 1) { self.error(x.span, "variant '{text}' does not have tuple fields", ""); return; }
+                var tuple = copy_ids(&const self.r.program.def(en).variants.get(v as usize).unwrap().tuple_types);
+                if (x.items.len() != tuple.len()) {
+                    usize want = tuple.len(); usize got = x.items.len();
+                    self.error(x.span, "variant '{text}' has {want} fields, pattern has {got}", "");
+                }
+                var s = Subst.new(); usize ng = self.r.program.def(en).generics.len();
+                for (i in 0..ng) { s.bind(self.r.program.def(en).generics.get(i).unwrap().type, *args.get(i).unwrap()); }
+                for (i in 0..x.items.len()) { if (i < tuple.len()) { var ft = self.apply(&s, *tuple.get(i).unwrap()); self.check_pattern(t, f, *x.items.get(i).unwrap(), ft, ref_mode); } }
+            }
+            ast.PatternKind.Struct => {
+                Vec<defs.FieldDef> fields = Vec.new(); bool have = false; ModuleId field_module = ModuleId.none(); var s = Subst.new();
+                match resolve.lookup_path(&self.r, &const x.path) {
+                    Some(sym) => {
+                        if (sym.kind == 0) {
+                            var sd = DefId { kind: DefKind.Struct, index: sym.struct_def }; Vec<TypeId> args = Vec.new();
+                            usize ng = self.r.program.def(sd).generics.len(); for (i in 0..ng) { args.push(self.fresh()); }
+                            var st = self.nominal(sd, copy_ids(&const args)); self.unify_or_error(st, ty, x.span, "pattern");
+                            for (i in 0..ng) { s.bind(self.r.program.def(sd).generics.get(i).unwrap().type, *args.get(i).unwrap()); }
+                            fields = self.field_defs(sd, NONE); have = true; field_module = self.r.program.def(sd).module;
+                        }
+                    }
+                    None => {}
+                }
+                var text = path_text(&const x.path);
+                if (!have) {
+                    Vec<TypeId> args = Vec.new(); DefId en = DefId.none();
+                    uint v = self.resolve_variant_path(&const x.path, ty, &args, x.span, &en);
+                    if (v == NONE) { return; }
+                    if (self.variant_kind(en, v) != 2) { self.error(x.span, "'{text}' does not have named fields", ""); return; }
+                    var et = self.nominal(en, copy_ids(&const args)); self.unify_or_error(et, ty, x.span, "pattern");
+                    usize ng = self.r.program.def(en).generics.len();
+                    for (i in 0..ng) { s.bind(self.r.program.def(en).generics.get(i).unwrap().type, *args.get(i).unwrap()); }
+                    fields = self.field_defs(en, v);
+                }
+                for (fp in &const x.fields) {
+                    var name = defs.name(fp.name); uint fi = NONE;
+                    for (i in 0..fields.len()) { if (fields.get(i).unwrap().name == name) { fi = i as uint; } }
+                    if (fi == NONE) { self.error(fp.span, "no field '{name}' in '{text}'", ""); continue; }
+                    var fd = fields.get(fi as usize).unwrap();
+                    if (!self.accessible(field_module, fd.is_pub, fp.span, fd.name)) { continue; }
+                    var ft = self.apply(&s, fd.type);
+                    if (fp.pattern != ast.NONE) { self.check_pattern(t, f, fp.pattern, ft, ref_mode); }
+                    else { var bt = self.bind_type(ft, ref_mode); self.declare_local(f, name, bt, false, fp.span); }
+                }
+            }
+            ast.PatternKind.Tuple => {
+                if (x.items.is_empty()) { var void_type = self.void_t(); self.unify_or_error(void_type, ty, x.span, "pattern"); return; }
+                Vec<TypeId> es = Vec.new(); for (i in 0..x.items.len()) { es.push(self.fresh()); }
+                var tt = self.r.types.tuple(copy_ids(&const es));
+                if (!self.unify(tt, ty)) {
+                    usize n = x.items.len(); var tn = self.type_name(ty);
+                    self.error(x.span, "tuple pattern with {n} elements does not match '{tn}'", "");
+                    for (el in &const x.items) { self.check_pattern(t, f, *el, self.error_t(), ref_mode); }
+                    return;
+                }
+                for (i in 0..x.items.len()) { self.check_pattern(t, f, *x.items.get(i).unwrap(), *es.get(i).unwrap(), ref_mode); }
+            }
+            ast.PatternKind.Or => {
+                for (alt in &const x.items) {
+                    usize before = self.local_count(f);
+                    self.check_pattern(t, f, *alt, type, mode);
+                    if (self.local_count(f) != before) { self.error(tree.pattern(*alt).span, "alternatives of an or-pattern cannot bind variables yet", ""); }
+                }
+            }
+        }
+    }
+    bool pattern_is_irrefutable(&self, &const ast.Ast tree, uint file, uint p) {
+        var x = tree.pattern(p);
+        match x.kind {
+            ast.PatternKind.Wildcard => return true,
+            ast.PatternKind.Binding => return self.result.pattern_locals.has(node_key(file, p)) || bytes.equals(x.text, "_"),
+            ast.PatternKind.Tuple => { for (e in &const x.items) { if (!self.pattern_is_irrefutable(tree, file, *e)) { return false; } } return true; }
+            ast.PatternKind.Struct => {
+                bool is_struct = false;
+                match resolve.lookup_path(&self.r, &const x.path) { Some(sym) => { is_struct = sym.kind == 0; }, None => {} }
+                if (!is_struct) { return false; }
+                for (fp in &const x.fields) { if (fp.pattern != ast.NONE && !self.pattern_is_irrefutable(tree, file, fp.pattern)) { return false; } }
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    void flatten(&const self, &const ast.Ast tree, uint p, &Vec<uint> out) {
+        var x = tree.pattern(p);
+        match x.kind { ast.PatternKind.Or => { for (a in &const x.items) { self.flatten(tree, *a, &*out); } }, _ => { out.push(p); } }
+    }
+    /// True when pats cover every value of type t; exact for enums, bools,
+    /// and tuples of those, conservative elsewhere. missing names one gap.
+    bool covers(&self, &const ast.Ast tree, uint file, TypeId t0, &const Vec<uint> pats, &String missing) {
+        for (p in pats) { if (self.pattern_is_irrefutable(tree, file, *p)) { return true; } }
+        var z = self.zonk(t0); var t = self.strip_refs(z).base;
+        if (self.is_error(t)) { return true; }
+        if (self.tk(t) == K_ENUM) {
+            var en = self.def_of(t); var sub = self.owner_subst(en, t);
+            usize nv = self.r.program.def(en).variants.len();
+            for (vi in 0..nv) {
+                var vname = String.from(self.r.program.def(en).variants.get(vi).unwrap().name);
+                uint vkind = self.variant_kind(en, vi as uint);
+                var vtuple = copy_ids(&const self.r.program.def(en).variants.get(vi).unwrap().tuple_types);
+                var vfields = self.field_defs(en, vi as uint);
+                bool named = false; bool any_all = false;
+                Vec<Vec<uint>> per_field = Vec.new(); for (i in 0..vtuple.len() + vfields.len()) { per_field.push(Vec.new()); }
+                for (p in pats) {
+                    var px = tree.pattern(*p); String name = String.new(); bool has_elems = false; bool has_fields = false;
+                    match px.kind {
+                        ast.PatternKind.Binding => { name = defs.name(px.text); }
+                        ast.PatternKind.Path => { name = defs.name(px.path.segments.get(px.path.segments.len() - 1).unwrap().name); }
+                        ast.PatternKind.TupleStruct => { name = defs.name(px.path.segments.get(px.path.segments.len() - 1).unwrap().name); has_elems = true; }
+                        ast.PatternKind.Struct => { name = defs.name(px.path.segments.get(px.path.segments.len() - 1).unwrap().name); has_fields = true; }
+                        _ => {}
+                    }
+                    if (name != vname) { continue; }
+                    named = true;
+                    if (vkind == 0) { any_all = true; }
+                    else if (has_elems) {
+                        bool all = true;
+                        for (i in 0..px.items.len()) {
+                            if (i >= per_field.len()) { continue; }
+                            uint sp = *px.items.get(i).unwrap(); per_field.get_mut(i).unwrap().push(sp);
+                            if (!self.pattern_is_irrefutable(tree, file, sp)) { all = false; }
+                        }
+                        if (all) { any_all = true; }
+                    } else if (has_fields) {
+                        bool all = true;
+                        for (fp in &const px.fields) {
+                            var fname = defs.name(fp.name); usize idx = vfields.len();
+                            for (i in 0..vfields.len()) { if (idx == vfields.len() && vfields.get(i).unwrap().name == fname) { idx = i; } }
+                            if (idx == vfields.len()) { continue; }
+                            if (fp.pattern != ast.NONE) {
+                                per_field.get_mut(idx).unwrap().push(fp.pattern);
+                                if (!self.pattern_is_irrefutable(tree, file, fp.pattern)) { all = false; }
+                            }
+                        }
+                        if (all) { any_all = true; }
+                    }
+                }
+                if (!named) { set_text(&*missing, vname); return false; }
+                if (any_all) { continue; }
+                if (vkind == 1 && vtuple.len() == 1) {
+                    var inner = String.new(); var ft = self.apply(&sub, *vtuple.get(0).unwrap());
+                    if (!self.covers(tree, file, ft, per_field.get(0).unwrap(), &inner)) { set_text(&*missing, "{vname}({inner})"); return false; }
+                    continue;
+                }
+                for (i in 0..per_field.len()) {
+                    var raw = if (i < vtuple.len()) { *vtuple.get(i).unwrap() } else { vfields.get(i - vtuple.len()).unwrap().type };
+                    var ft = self.apply(&sub, raw); var inner = String.new();
+                    if (!self.covers(tree, file, ft, per_field.get(i).unwrap(), &inner)) { set_text(&*missing, "{vname}(.., {inner}, ..)"); return false; }
+                }
+            }
+            return true;
+        }
+        if (self.is_bool(t)) {
+            bool has_true = false; bool has_false = false;
+            for (p in pats) {
+                var px = tree.pattern(*p);
+                match px.kind { ast.PatternKind.Literal => {}, _ => { continue; } }
+                var v = tree.expr(px.a);
+                match v.kind { ast.ExprKind.BoolLit => { if (v.flag) { has_true = true; } else { has_false = true; } }, _ => {} }
+            }
+            if (has_true && has_false) { return true; }
+            set_text(&*missing, String.from(if (has_true) { "false" } else { "true" })); return false;
+        }
+        if (self.tk(t) == K_TUPLE) {
+            usize n = self.n_elems(t);
+            for (i in 0..n) {
+                Vec<uint> subs = Vec.new();
+                for (p in pats) {
+                    var px = tree.pattern(*p);
+                    match px.kind { ast.PatternKind.Tuple => { if (i < px.items.len()) { subs.push(*px.items.get(i).unwrap()); } }, _ => {} }
+                }
+                var inner = String.new();
+                if (!self.covers(tree, file, self.elem(t, i), &subs, &inner)) { set_text(&*missing, "(.., {inner}, ..)"); return false; }
+            }
+            return true;
+        }
+        set_text(&*missing, String.from("_")); return false;
+    }
+    void check_exhaustive(&self, &const Vec<ast.Ast> t, uint f, uint e, TypeId scrutinee) {
+        uint file = self.frames.get(f as usize).unwrap().file; var tree = t.get(file as usize).unwrap(); var x = tree.expr(e);
+        Vec<uint> pats = Vec.new();
+        for (arm in &const x.arms) { if (arm.guard != ast.NONE) { continue; } self.flatten(tree, arm.pattern, &pats); }
+        var missing = String.new();
+        if (self.covers(tree, file, scrutinee, &pats, &missing)) { return; }
+        if (missing == String.from("_")) { self.error(x.span, "match is not exhaustive; add a '_' arm", "SNX0404"); }
+        else { self.error(x.span, "match is not exhaustive; missing: {missing}", "SNX0404"); }
+    }
+
+    // ---------- traits ----------
+
+    Vec<TraitRef>? bounds_of(&const self, TypeId param) {
+        match self.param_bounds.get(param) {
+            None => return None,
+            Some(source) => {
+                Vec<TraitRef> out = Vec.new();
+                if (source.kind == 0) { for (b in &const self.r.program.def(source.owner).generics.get(source.index as usize).unwrap().bounds) { out.push(copy_trait(b)); } }
+                else { for (b in self.self_bounds.get(source.owner.index as usize).unwrap()) { out.push(copy_trait(b)); } }
+                return Some(out);
+            }
+        }
+    }
+    bool builtin_implements(&self, TypeId t0, &const str name) {
+        var t = self.shallow(t0);
+        bool numeric = self.is_numeric(t);
+        bool is_string = self.tk(t) == K_STRUCT && same_def(self.def_of(t), self.r.program.string_def);
+        var n = String.from(name);
+        if (n == String.from("Copy")) { return self.is_copy(t); }
+        if (n == String.from("Display")) {
+            if (self.tk(t) == K_PRIM && !self.is_void(t)) { return true; }
+            if (self.tk(t) == K_STR || is_string) { return true; }
+            if (self.tk(t) == K_REF) {
+                var inner = self.inner(t);
+                if (self.builtin_implements(inner, name)) { return true; }
+                var display = TraitRef { trait_def: self.core_trait("Display"), args: Vec.new() };
+                return self.implements(inner, &display);
+            }
+            return self.is_infer(t) && self.ik(t) != I_ANY;
+        }
+        if (n == String.from("Eq") || n == String.from("Ord")) {
+            if (numeric || self.is_prim(t, ast.PrimKind.Char) || self.tk(t) == K_STR || is_string) { return true; }
+            if (n == String.from("Eq") && self.is_bool(t)) { return true; }
+            if (self.tk(t) == K_REF) {
+                var inner = self.shallow(self.inner(t));
+                if (self.is_infer(inner) && self.ik(inner) == I_ANY) { return false; }
+                var tr = TraitRef { trait_def: self.core_trait(name), args: Vec.new() };
+                return self.implements(inner, &tr);
+            }
+            return false;
+        }
+        if (n == String.from("Add") || n == String.from("Sub") || n == String.from("Mul") || n == String.from("Div") || n == String.from("Rem")) { return numeric; }
+        if (n == String.from("Neg")) { return self.is_float(t) || self.is_signed(t) || (self.is_infer(t) && self.ik(t) != I_ANY); }
+        if (n == String.from("Not")) { return self.is_bool(t) || self.is_integer(t); }
+        return false;
+    }
+    bool holds(&self, TypeId field, &const str which) {
+        var tr = TraitRef { trait_def: self.core_trait(which), args: Vec.new() }; return self.implements(field, &tr);
+    }
+    bool implements(&self, TypeId t0, &const TraitRef tr) {
+        if (tr.trait_def.index == NONE) { return true; }
+        var t = self.shallow(t0);
+        if (self.is_error(t) || self.is_never(t)) { return true; }
+        Vec<TypeId> args = Vec.new(); for (a in &const tr.args) { args.push(self.zonk(*a)); }
+        var zt = self.zonk(t); var dy = self.nominal(tr.trait_def, args);
+        var name = self.def_name(tr.trait_def);
+        bool auto_marker = name == String.from("Send") || name == String.from("Sync") || name == String.from("Owned");
+        auto_marker = auto_marker && (same_def(tr.trait_def, self.core_trait("Send")) || same_def(tr.trait_def, self.core_trait("Sync")) || same_def(tr.trait_def, self.core_trait("Owned")));
+        if (self.checking_traits.len() >= 128) { return false; }
+        for (pair in &const self.checking_traits) { if (pair.a.index == zt.index && pair.b.index == dy.index) { return auto_marker; } }
+        self.checking_traits.push(TypePair { a: zt, b: dy });
+        bool result = self.implements_inner(t, tr, auto_marker, name);
+        var unused = self.checking_traits.pop();
+        return result;
+    }
+    bool implements_inner(&self, TypeId t, &const TraitRef tr, bool auto_marker, String name) {
+        uint k = self.tk(t);
+        if (k == K_PARAM) {
+            match self.bounds_of(t) {
+                Some(bounds) => {
+                    for (b in &const bounds) {
+                        if (!same_def(b.trait_def, tr.trait_def) || b.args.len() != tr.args.len()) { continue; }
+                        usize mark = self.trail.len(); bool matched = true;
+                        for (i in 0..b.args.len()) { if (matched) { matched = self.unify(*b.args.get(i).unwrap(), *tr.args.get(i).unwrap()); } }
+                        if (matched) { return true; }
+                        self.rollback(mark);
+                    }
+                }
+                None => {}
+            }
+            return false;
+        }
+        if (k == K_DYN) {
+            if (!same_def(self.def_of(t), tr.trait_def) || self.n_elems(t) != tr.args.len()) { return false; }
+            for (i in 0..self.n_elems(t)) { if (!self.try_unify(self.elem(t, i), *tr.args.get(i).unwrap())) { return false; } }
+            return true;
+        }
+        if (auto_marker) {
+            bool structural = false;
+            if (k == K_PRIM || k == K_STR) { structural = true; }
+            else if (k == K_FN) { structural = name != String.from("Sync") && self.send_of(t); }
+            else if (k == K_REF) {
+                var which = if (name == String.from("Send") && self.const_of(t)) { String.from("Sync") } else { String.from(name) };
+                structural = (self.frame_refs && name == String.from("Send")) || (name != String.from("Owned") && self.holds(self.inner(t), which.as_str()));
+            }
+            else if (k == K_ARRAY || k == K_SLICE) { structural = self.holds(self.inner(t), name.as_str()); }
+            else if (k == K_TUPLE) { structural = true; var es = self.elems(t); for (e in &const es) { structural = self.holds(*e, name.as_str()) && structural; } }
+            else if (k == K_STRUCT || k == K_ENUM) {
+                var def = self.def_of(t); var s = self.owner_subst(def, t); structural = true;
+                var fields = self.field_types(def);
+                for (fd in &const fields) { var ft = self.apply(&s, *fd); structural = self.holds(ft, name.as_str()) && structural; }
+            }
+            if (structural) { return true; }
+        }
+        if (!auto_marker && self.builtin_implements(t, name.as_str())) { return true; }
+        for (i in 0..self.r.program.impls.len()) {
+            var im = DefId { kind: DefKind.Impl, index: i as uint };
+            if (!same_def(self.r.program.def(im).trait_ref.trait_def, tr.trait_def) || self.r.program.def(im).trait_ref.args.len() != tr.args.len()) { continue; }
+            var s = Subst.new(); usize ng = self.r.program.def(im).generics.len();
+            for (g in 0..ng) { var v = self.fresh(); s.bind(self.r.program.def(im).generics.get(g).unwrap().type, v); }
+            usize mark = self.trail.len();
+            var self_type = self.apply(&s, self.r.program.def(im).self_type);
+            bool matched = self.unify(self_type, t);
+            for (a in 0..tr.args.len()) {
+                if (!matched) { continue; }
+                var ia = self.apply(&s, *self.r.program.def(im).trait_ref.args.get(a).unwrap());
+                matched = self.unify(ia, *tr.args.get(a).unwrap());
+            }
+            for (g in 0..ng) {
+                var gt = self.apply(&s, self.r.program.def(im).generics.get(g).unwrap().type);
+                if (matched && self.is_unsized(self.shallow(gt))) { matched = false; }
+                usize nb = self.r.program.def(im).generics.get(g).unwrap().bounds.len();
+                for (b in 0..nb) {
+                    var raw = copy_trait(self.r.program.def(im).generics.get(g).unwrap().bounds.get(b).unwrap());
+                    var bound = TraitRef { trait_def: raw.trait_def, args: Vec.new() };
+                    for (x in &const raw.args) { bound.args.push(self.apply(&s, *x)); }
+                    if (matched && !self.implements(gt, &bound)) { matched = false; }
+                }
+            }
+            if (matched) { return true; }
+            self.rollback(mark);
+        }
+        return false;
+    }
+    void add_obligation(&self, TypeId t, TraitRef tr, Span span, String what) {
+        if (tr.trait_def.index == NONE) { return; }
+        self.obligations.push(Obligation { type: t, trait_ref: tr, span: span, what: what });
+    }
+    void check_obligations(&self) {
+        var obligations = mem_take_obligations(&self.obligations);
+        for (o in &const obligations) {
+            var t = self.zonk(o.type);
+            if (self.contains_infer(t)) { continue; }
+            if (!self.implements(t, &const o.trait_ref)) {
+                var tn = self.show(t); var tr = self.def_name(o.trait_ref.trait_def); var what = String.from(o.what);
+                self.error(o.span, "the type '{tn}' does not implement '{tr}', required for {what}", "");
+            }
+        }
+    }
+    uint function_body(&const self, DefId f) { return self.fn_syntax.get(f.index as usize).unwrap().body; }
+}
+
+Vec<ulong> mem_take_keys(&Vec<ulong> values) { return mem.replace(&*values, Vec.new()); }
+Vec<Obligation> mem_take_obligations(&Vec<Obligation> values) { return mem.replace(&*values, Vec.new()); }
+Vec<DefId> copy_ids_def(&const Vec<DefId> values) { Vec<DefId> out = Vec.new(); for (v in values) { out.push(*v); } return out; }
+Vec<uint> copy_uints(&const Vec<uint> values) { Vec<uint> out = Vec.new(); for (v in values) { out.push(*v); } return out; }
+void set_text(&String out, String value) { *out = value; }

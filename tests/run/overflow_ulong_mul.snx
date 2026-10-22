@@ -1,0 +1,1 @@
+main() { ulong a = 18446744073709551615; ulong b = 2; ulong result = a * b; if (result != 18446744073709551614) { panic("wrong release result"); } }

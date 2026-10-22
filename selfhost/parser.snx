@@ -1,0 +1,1649 @@
+/// Recursive descent parser. Source: compiler/src/parser.cpp.
+/// Parity: tests/selfhost_parser_test.cpp. Preserves recovery, speculation,
+/// span rules, and evaluation order of the bootstrap parser.
+///
+/// The parser owns its tokens, syntax tree, and diagnostic sink. Callers lex
+/// into a sink, move it in, and read ast and sink after parsing. Every parse
+/// function returns the index of the node it created; NONE means absent.
+import ast.{Ast, Type, Expr, Pattern, Stmt, Block, Param, Function, Field, Variant, Item, Path, PathSegment, Bound, GenericParam, FieldInit, MatchArm, InterpPart, Capture, ClosureParam, FieldPattern, TypeKind, ExprKind, PatternKind, StmtKind, ItemKind, VariantKind, SelfKind, CallMode, CaptureMode, PrimKind, UnaryOp, BinaryOp, AssignOp, NONE};
+import bytes;
+import source.{SourceFile, Span};
+import diagnostics.DiagnosticSink;
+import token.{Kind, Token};
+import token;
+
+enum FnContext { Item, Method, TraitMethod, Extern }
+
+struct BinaryInfo { int prec; BinaryOp op; usize length; }
+
+Function blank_function(Span span) {
+    return Function { span: span, doc: Vec.new(), is_pub: false, is_async: false, async_send: false, ret: NONE,
+                      name: Vec.new(), name_span: span, generics: Vec.new(), params: Vec.new(), body: NONE };
+}
+
+PrimKind? primitive_of(Kind kind) {
+    match kind {
+        Kind.KwBool => return Some(PrimKind.Bool),
+        Kind.KwByte => return Some(PrimKind.Byte),
+        Kind.KwShort => return Some(PrimKind.Short),
+        Kind.KwInt => return Some(PrimKind.Int),
+        Kind.KwLong => return Some(PrimKind.Long),
+        Kind.KwUint => return Some(PrimKind.Uint),
+        Kind.KwUlong => return Some(PrimKind.Ulong),
+        Kind.KwUsize => return Some(PrimKind.Usize),
+        Kind.KwFloat => return Some(PrimKind.Float),
+        Kind.KwDouble => return Some(PrimKind.Double),
+        Kind.KwChar => return Some(PrimKind.Char),
+        Kind.KwVoid => return Some(PrimKind.Void),
+        _ => return None,
+    }
+}
+
+AssignOp? assign_op_of(Kind kind) {
+    match kind {
+        Kind.Eq => return Some(AssignOp.Assign),
+        Kind.PlusEq => return Some(AssignOp.Add),
+        Kind.MinusEq => return Some(AssignOp.Sub),
+        Kind.StarEq => return Some(AssignOp.Mul),
+        Kind.SlashEq => return Some(AssignOp.Div),
+        Kind.PercentEq => return Some(AssignOp.Rem),
+        Kind.AmpEq => return Some(AssignOp.BitAnd),
+        Kind.PipeEq => return Some(AssignOp.BitOr),
+        Kind.CaretEq => return Some(AssignOp.BitXor),
+        Kind.ShlEq => return Some(AssignOp.Shl),
+        Kind.ShrEq => return Some(AssignOp.Shr),
+        _ => return None,
+    }
+}
+
+bool is_self_param(SelfKind kind) {
+    match kind { SelfKind.None => return false, _ => return true }
+}
+bool forbids_self(FnContext ctx) {
+    match ctx { FnContext.Item => return true, FnContext.Extern => return true, _ => return false }
+}
+bool is_extern_context(FnContext ctx) {
+    match ctx { FnContext.Extern => return true, _ => return false }
+}
+bool is_signature_context(FnContext ctx) {
+    match ctx { FnContext.TraitMethod => return true, FnContext.Extern => return true, _ => return false }
+}
+bool is_struct_variant(VariantKind kind) {
+    match kind { VariantKind.Struct => return true, _ => return false }
+}
+bool is_block_like_kind(ExprKind kind) {
+    match kind {
+        ExprKind.If => return true,
+        ExprKind.Match => return true,
+        ExprKind.Block => return true,
+        ExprKind.Unsafe => return true,
+        _ => return false,
+    }
+}
+bool is_name_kind(ExprKind kind) { match kind { ExprKind.Name => return true, _ => return false } }
+bool is_field_kind(ExprKind kind) { match kind { ExprKind.Field => return true, _ => return false } }
+
+Vec<byte> clone_bytes(&const Vec<byte> value) { return bytes.copy(value, 0, value.len()); }
+
+pub struct Parser {
+    Vec<Token> tokens;
+    usize pos;
+    int speculating;
+    int spec_errors;
+    int no_struct;
+    Span ident_span;
+    pub Ast ast;
+    pub DiagnosticSink sink;
+
+    /// Takes ownership of tokens and sink. Appends Eof when it is missing.
+    pub Parser new(&const SourceFile file, Vec<Token> tokens, DiagnosticSink sink) {
+        var list = tokens;
+        bool needs_eof = list.is_empty();
+        if (!needs_eof) { needs_eof = list.get(list.len() - 1).unwrap().kind != Kind.Eof; }
+        if (needs_eof) {
+            uint end = file.data().len() as uint;
+            list.push(Token.new(Kind.Eof, Span { start: end, end: end, file: file.id }));
+        }
+        return Parser { tokens: list, pos: 0, speculating: 0, spec_errors: 0, no_struct: 0,
+                        ident_span: Span { start: 0, end: 0, file: 0 }, ast: Ast.new(), sink: sink };
+    }
+
+    /// Index of the next unread token.
+    pub usize position(&const self) { return self.pos; }
+
+    // ----- token access -----
+
+    usize clamp(&const self, usize ahead) {
+        usize i = self.pos + ahead;
+        if (i < self.tokens.len()) { return i; }
+        return self.tokens.len() - 1;
+    }
+    Kind peek(&const self, usize ahead) { return self.tokens.get(self.clamp(ahead)).unwrap().kind; }
+    Span peek_span(&const self, usize ahead) { return self.tokens.get(self.clamp(ahead)).unwrap().span; }
+    Vec<byte> peek_text(&const self, usize ahead) { return clone_bytes(self.tokens.get(self.clamp(ahead)).unwrap().text); }
+    ulong peek_int(&const self, usize ahead) { return self.tokens.get(self.clamp(ahead)).unwrap().int_value; }
+    double peek_float(&const self, usize ahead) { return self.tokens.get(self.clamp(ahead)).unwrap().float_value; }
+    bool text_is(&const self, usize ahead, &const str value) {
+        return bytes.equals(self.tokens.get(self.clamp(ahead)).unwrap().text, value);
+    }
+    Kind kind_at(&const self, usize index) { return self.tokens.get(index).unwrap().kind; }
+    bool at(&const self, Kind kind) { return self.peek(0) == kind; }
+    bool at_end(&const self) { return self.peek(0) == Kind.Eof; }
+    void advance(&self) { if (self.pos + 1 < self.tokens.len()) { self.pos += 1; } }
+    bool accept(&self, Kind kind) {
+        if (!self.at(kind)) { return false; }
+        self.advance();
+        return true;
+    }
+    void error(&self, Span span, &const str message, &const str code) {
+        if (self.speculating > 0) { self.spec_errors += 1; return; }
+        self.sink.error(span, message, code);
+    }
+    void error_here(&self, &const str message, &const str code) { self.error(self.peek_span(0), message, code); }
+    bool expect(&self, Kind kind, &const str what) {
+        if (self.accept(kind)) { return true; }
+        self.error_here("expected {what}, found {token.name(self.peek(0))}", "SNX0201");
+        return false;
+    }
+    /// The span of the identifier is left in ident_span, also after a failure.
+    Vec<byte> expect_ident(&self, &const str what) {
+        if (self.at(Kind.Ident)) {
+            Span here = self.peek_span(0); self.ident_span = here;
+            var text = self.peek_text(0);
+            self.advance();
+            return text;
+        }
+        self.error_here("expected {what}, found {token.name(self.peek(0))}", "SNX0201");
+        Span here = self.peek_span(0); self.ident_span = here;
+        return Vec.new();
+    }
+    Span span_from(&const self, Span start) {
+        uint end = start.end;
+        if (self.pos > 0) { end = self.tokens.get(self.pos - 1).unwrap().span.end; }
+        if (end < start.start) { end = start.end; }
+        return Span { start: start.start, end: end, file: start.file };
+    }
+
+    // ----- lookahead -----
+
+    usize skip_generic_list(&const self, usize start) {
+        if (start >= self.tokens.len() || self.kind_at(start) != Kind.Lt) { return 0; }
+        usize i = start;
+        int depth = 0;
+        while (i < self.tokens.len()) {
+            Kind k = self.kind_at(i);
+            if (k == Kind.Lt) { depth += 1; }
+            else if (k == Kind.Gt) {
+                depth -= 1;
+                if (depth == 0) { return i + 1; }
+            } else if (k == Kind.LParen) {
+                usize after = self.skip_paren_group(i);
+                if (after == 0) { return 0; }
+                i = after - 1;
+            } else if (k == Kind.Eof || k == Kind.LBrace || k == Kind.RBrace || k == Kind.Semi ||
+                       k == Kind.RParen || k == Kind.Eq) {
+                return 0;
+            }
+            i += 1;
+        }
+        return 0;
+    }
+    usize skip_paren_group(&const self, usize start) {
+        if (start >= self.tokens.len() || self.kind_at(start) != Kind.LParen) { return 0; }
+        usize i = start;
+        int depth = 0;
+        while (i < self.tokens.len()) {
+            Kind k = self.kind_at(i);
+            if (k == Kind.LParen) { depth += 1; }
+            else if (k == Kind.RParen) {
+                depth -= 1;
+                if (depth == 0) { return i + 1; }
+            } else if (k == Kind.Eof) { return 0; }
+            i += 1;
+        }
+        return 0;
+    }
+    bool looks_like_function_name(&const self) {
+        if (!self.at(Kind.Ident)) { return false; }
+        usize i = self.pos + 1;
+        if (i < self.tokens.len() && self.kind_at(i) == Kind.Lt) {
+            i = self.skip_generic_list(i);
+            if (i == 0) { return false; }
+        }
+        return i < self.tokens.len() && self.kind_at(i) == Kind.LParen;
+    }
+    bool looks_like_var_decl(&self) {
+        Kind first = self.peek(0);
+        if (first == Kind.KwVar || first == Kind.KwConst) { return true; }
+        if (!(first == Kind.Ident || first == Kind.Amp || first == Kind.Star || first == Kind.LParen ||
+              first == Kind.KwFn || first == Kind.KwDyn || first == Kind.KwSelfType ||
+              token.is_primitive_type_keyword(first))) {
+            return false;
+        }
+        usize save = self.pos;
+        int save_errors = self.spec_errors;
+        self.speculating += 1;
+        self.spec_errors = 0;
+        uint t = self.parse_type();
+        bool ok = self.spec_errors == 0 && t != NONE && self.at(Kind.Ident) &&
+                  (self.peek(1) == Kind.Eq || self.peek(1) == Kind.Semi);
+        self.speculating -= 1;
+        self.spec_errors = save_errors;
+        self.pos = save;
+        return ok;
+    }
+    bool starts_type(&const self) {
+        return self.at(Kind.Ident) || self.at(Kind.Amp) || self.at(Kind.Star) || self.at(Kind.LParen) ||
+               self.at(Kind.KwFn) || self.at(Kind.KwDyn) || self.at(Kind.KwSelfType) ||
+               token.is_primitive_type_keyword(self.peek(0));
+    }
+
+    // ----- module and items -----
+
+    pub void parse_module(&self) {
+        while (!self.at_end()) {
+            usize before = self.pos;
+            usize errors_before = self.sink.errors;
+            Item? item = self.parse_item();
+            match item {
+                Some(value) => { self.ast.items.push(value); }
+                None => {}
+            }
+            if (self.sink.errors > errors_before) {
+                Kind k = self.peek(0);
+                bool item_start = k == Kind.Ident || k == Kind.KwPub || k == Kind.DocComment ||
+                                  k == Kind.KwImport || k == Kind.KwConst || k == Kind.KwStruct ||
+                                  k == Kind.KwEnum || k == Kind.KwTrait || k == Kind.KwImpl ||
+                                  k == Kind.KwExtern || k == Kind.KwAsync || k == Kind.Amp ||
+                                  k == Kind.Star || k == Kind.LParen || k == Kind.Eof ||
+                                  token.is_primitive_type_keyword(k);
+                if (!item_start) { self.sync_item(); }
+            }
+            if (self.pos == before) { self.advance(); }
+        }
+    }
+    void sync_item(&self) {
+        int depth = 0;
+        while (!self.at_end()) {
+            Kind k = self.peek(0);
+            if (k == Kind.LBrace) { depth += 1; }
+            if (k == Kind.RBrace) {
+                if (depth > 0) { depth -= 1; }
+                self.advance();
+                if (depth == 0) { return; }
+                continue;
+            }
+            if (depth == 0 && (k == Kind.KwImport || k == Kind.KwStruct || k == Kind.KwEnum ||
+                               k == Kind.KwTrait || k == Kind.KwImpl || k == Kind.KwExtern ||
+                               k == Kind.KwPub || k == Kind.DocComment)) {
+                return;
+            }
+            self.advance();
+        }
+    }
+    Item? parse_item(&self) {
+        Vec<byte> doc = Vec.new();
+        if (self.at(Kind.DocComment)) { doc = self.peek_text(0); self.advance(); }
+        Span start = self.peek_span(0);
+        bool is_pub = self.accept(Kind.KwPub);
+        Item built = Item.new(ItemKind.Import, start);
+        Kind k = self.peek(0);
+        match k {
+            Kind.KwImport => { built = self.parse_import(start); }
+            Kind.KwConst => { built = self.parse_const_item(start); }
+            Kind.KwStruct => { built = self.parse_struct(start); }
+            Kind.KwEnum => { built = self.parse_enum(start); }
+            Kind.KwTrait => { built = self.parse_trait(start); }
+            Kind.KwImpl => { built = self.parse_impl(start); }
+            Kind.KwUnsafe => {
+                self.advance();
+                if (!self.at(Kind.KwImpl)) { self.error_here("expected impl after unsafe", ""); return None; }
+                built = self.parse_impl(start);
+                built.is_unsafe = true;
+            }
+            Kind.KwExtern => { built = self.parse_extern(start); }
+            _ => {
+                uint id = self.parse_function(FnContext.Item, clone_bytes(doc), is_pub);
+                if (id == NONE) { return None; }
+                built = Item.new(ItemKind.Function, self.ast.function(id).span);
+                built.function = id;
+            }
+        }
+        built.doc = doc;
+        built.is_pub = is_pub;
+        return Some(built);
+    }
+    Item parse_import(&self, Span start) {
+        self.advance();
+        var item = Item.new(ItemKind.Import, start);
+        Vec<byte> first = self.expect_ident("module name");
+        Span segment_span = self.ident_span;
+        item.path.segments.push(PathSegment { span: segment_span, name: first });
+        while (self.accept(Kind.Dot)) {
+            if (self.accept(Kind.LBrace)) {
+                loop {
+                    if (self.at(Kind.RBrace)) { break; }
+                    Vec<byte> imported = self.expect_ident("imported name");
+                    Span imported_span = self.ident_span;
+                    item.names.push(PathSegment { span: imported_span, name: imported });
+                    if (!self.accept(Kind.Comma)) { break; }
+                }
+                self.expect(Kind.RBrace, "'\}'");
+                break;
+            }
+            Vec<byte> part = self.expect_ident("module or item name");
+            Span part_span = self.ident_span;
+            item.path.segments.push(PathSegment { span: part_span, name: part });
+        }
+        item.path.span = self.span_from(start);
+        self.expect(Kind.Semi, "';'");
+        item.span = self.span_from(start);
+        return item;
+    }
+    Item parse_const_item(&self, Span start) {
+        self.advance();
+        var item = Item.new(ItemKind.Const, start);
+        if (!(self.at(Kind.Ident) && self.peek(1) == Kind.Eq)) { item.a = self.parse_type(); }
+        item.text = self.expect_ident("constant name");
+        self.expect(Kind.Eq, "'='");
+        item.b = self.parse_expr();
+        self.expect(Kind.Semi, "';'");
+        item.span = self.span_from(start);
+        return item;
+    }
+    Vec<GenericParam> parse_generic_params(&self) {
+        Vec<GenericParam> out = Vec.new();
+        self.expect(Kind.Lt, "'<'");
+        while (!self.at(Kind.Gt) && !self.at_end()) {
+            Vec<byte> name = self.expect_ident("type parameter name");
+            Span span = self.ident_span;
+            Vec<Bound> bounds = Vec.new();
+            if (self.accept(Kind.Colon)) {
+                loop {
+                    bounds.push(self.parse_bound());
+                    if (!self.accept(Kind.Plus)) { break; }
+                }
+            }
+            out.push(GenericParam { span: span, name: name, bounds: bounds });
+            if (!self.accept(Kind.Comma)) { break; }
+        }
+        self.expect(Kind.Gt, "'>'");
+        return out;
+    }
+    Bound parse_bound(&self) {
+        Span start = self.peek_span(0);
+        var path = self.parse_path();
+        Vec<uint> args = Vec.new();
+        if (self.at(Kind.Lt)) { args = self.parse_type_args(); }
+        return Bound { span: self.span_from(start), path: path, args: args };
+    }
+    Vec<Param> parse_params(&self, FnContext ctx) {
+        Vec<Param> out = Vec.new();
+        self.expect(Kind.LParen, "'('");
+        while (!self.at(Kind.RParen) && !self.at_end()) {
+            Span start = self.peek_span(0);
+            SelfKind self_kind = SelfKind.None;
+            uint type = NONE;
+            Vec<byte> name = Vec.new();
+            if (self.at(Kind.KwSelf)) {
+                self.advance();
+                self_kind = SelfKind.Value;
+                bytes.text(&name, "self");
+            } else if (self.at(Kind.Amp) && (self.peek(1) == Kind.KwSelf ||
+                                             (self.peek(1) == Kind.KwConst && self.peek(2) == Kind.KwSelf))) {
+                self.advance();
+                self_kind = if (self.accept(Kind.KwConst)) { SelfKind.ConstRef } else { SelfKind.Ref };
+                self.advance();
+                bytes.text(&name, "self");
+            } else {
+                type = self.parse_type();
+                name = self.expect_ident("parameter name");
+            }
+            Span span = self.span_from(start);
+            if (is_self_param(self_kind)) {
+                if (forbids_self(ctx)) {
+                    self.error(span, "self parameter is only allowed in a method", "");
+                } else if (!out.is_empty()) {
+                    self.error(span, "self must be the first parameter", "");
+                }
+            }
+            out.push(Param { span: span, self_kind: self_kind, type: type, name: name });
+            if (!self.accept(Kind.Comma)) { break; }
+        }
+        self.expect(Kind.RParen, "')'");
+        return out;
+    }
+    uint parse_function(&self, FnContext ctx, Vec<byte> doc, bool is_pub) {
+        Span start = self.peek_span(0);
+        bool is_async = self.accept(Kind.KwAsync);
+        bool async_send = false;
+        if (is_async && self.at(Kind.Ident) && self.text_is(0, "send") && !self.looks_like_function_name()) {
+            self.advance();
+            async_send = true;
+        }
+        uint ret = NONE;
+        if (!self.looks_like_function_name()) {
+            if (!self.starts_type()) {
+                self.error_here("expected an item, found {token.name(self.peek(0))}", "SNX0201");
+                return NONE;
+            }
+            ret = self.parse_type();
+        }
+        Vec<byte> name = self.expect_ident("function name");
+        Span name_span = self.ident_span;
+        return self.parse_function_after_head(ctx, doc, is_pub, is_async, async_send, start, ret, name, name_span);
+    }
+    uint parse_function_after_head(&self, FnContext ctx, Vec<byte> doc, bool is_pub, bool is_async, bool async_send,
+                                   Span start, uint ret, Vec<byte> name, Span name_span) {
+        var func = blank_function(start);
+        func.doc = doc;
+        func.is_pub = is_pub;
+        func.is_async = is_async;
+        func.async_send = async_send;
+        func.ret = ret;
+        func.name = name;
+        func.name_span = name_span;
+        if (self.at(Kind.Lt)) { func.generics = self.parse_generic_params(); }
+        func.params = self.parse_params(ctx);
+        if (self.at(Kind.LBrace)) {
+            if (is_extern_context(ctx)) { self.error_here("extern functions have no body", ""); }
+            func.body = self.parse_block();
+        } else {
+            if (is_signature_context(ctx)) {
+                self.expect(Kind.Semi, "';' or a function body");
+            } else {
+                self.expect(Kind.LBrace, "function body");
+            }
+        }
+        func.span = self.span_from(start);
+        return self.ast.add_function(func);
+    }
+    /// Parses a field or method into target. Fields need allow_fields.
+    bool parse_member(&self, FnContext ctx, &Item target, bool allow_fields) {
+        Vec<byte> doc = Vec.new();
+        if (self.at(Kind.DocComment)) { doc = self.peek_text(0); self.advance(); }
+        Span start = self.peek_span(0);
+        bool is_pub = self.accept(Kind.KwPub);
+        bool is_async = self.accept(Kind.KwAsync);
+        bool async_send = false;
+        if (is_async && self.at(Kind.Ident) && self.text_is(0, "send") && !self.looks_like_function_name()) {
+            self.advance();
+            async_send = true;
+        }
+        if (self.looks_like_function_name()) {
+            Vec<byte> name = self.expect_ident("name");
+            Span name_span = self.ident_span;
+            uint id = self.parse_function_after_head(ctx, doc, is_pub, is_async, async_send, start, NONE, name, name_span);
+            target.methods.push(id);
+            return true;
+        }
+        if (!self.starts_type()) {
+            self.error_here("expected a field or method, found {token.name(self.peek(0))}", "SNX0201");
+            return false;
+        }
+        uint type = self.parse_type();
+        Vec<byte> name = self.expect_ident("name");
+        Span name_span = self.ident_span;
+        if (self.at(Kind.LParen) || self.at(Kind.Lt)) {
+            uint id = self.parse_function_after_head(ctx, doc, is_pub, is_async, async_send, start, type, name, name_span);
+            target.methods.push(id);
+            return true;
+        }
+        if (!allow_fields) {
+            self.error(self.span_from(start), "fields are not allowed here", "");
+            self.accept(Kind.Semi);
+            return true;
+        }
+        self.expect(Kind.Semi, "';' after field");
+        target.fields.push(Field { span: self.span_from(start), doc: doc, is_pub: is_pub, type: type, name: name });
+        return true;
+    }
+    Item parse_struct(&self, Span start) {
+        self.advance();
+        var item = Item.new(ItemKind.Struct, start);
+        item.text = self.expect_ident("struct name");
+        if (self.at(Kind.Lt)) { item.generics = self.parse_generic_params(); }
+        self.expect(Kind.LBrace, "'\{'");
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            usize before = self.pos;
+            if (!self.parse_member(FnContext.Method, &item, true) || self.pos == before) { self.advance(); }
+        }
+        self.expect(Kind.RBrace, "'\}'");
+        item.span = self.span_from(start);
+        return item;
+    }
+    Item parse_enum(&self, Span start) {
+        self.advance();
+        var item = Item.new(ItemKind.Enum, start);
+        item.text = self.expect_ident("enum name");
+        if (self.at(Kind.Lt)) { item.generics = self.parse_generic_params(); }
+        self.expect(Kind.LBrace, "'\{'");
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            usize before = self.pos;
+            bool is_variant = false;
+            usize i = self.pos;
+            if (self.kind_at(i) == Kind.DocComment) { i += 1; }
+            if (self.kind_at(i) == Kind.Ident) {
+                Kind next = self.kind_at(i + 1);
+                if (next == Kind.Comma || next == Kind.RBrace || next == Kind.LBrace) {
+                    is_variant = true;
+                } else if (next == Kind.LParen) {
+                    usize after = self.skip_paren_group(i + 1);
+                    is_variant = after != 0 && self.kind_at(after) != Kind.LBrace;
+                }
+            }
+            if (is_variant) {
+                Span variant_start = self.peek_span(0);
+                Vec<byte> doc = Vec.new();
+                if (self.at(Kind.DocComment)) { doc = self.peek_text(0); self.advance(); }
+                Vec<byte> name = self.expect_ident("variant name");
+                VariantKind kind = VariantKind.Unit;
+                Vec<uint> tuple_types = Vec.new();
+                Vec<Field> fields = Vec.new();
+                if (self.accept(Kind.LParen)) {
+                    kind = VariantKind.Tuple;
+                    while (!self.at(Kind.RParen) && !self.at_end()) {
+                        tuple_types.push(self.parse_type());
+                        if (!self.accept(Kind.Comma)) { break; }
+                    }
+                    self.expect(Kind.RParen, "')'");
+                } else if (self.accept(Kind.LBrace)) {
+                    kind = VariantKind.Struct;
+                    while (!self.at(Kind.RBrace) && !self.at_end()) {
+                        usize field_before = self.pos;
+                        Span field_start = self.peek_span(0);
+                        uint field_type = self.parse_type();
+                        Vec<byte> field_name = self.expect_ident("field name");
+                        self.expect(Kind.Semi, "';' after field");
+                        fields.push(Field { span: self.span_from(field_start), doc: Vec.new(), is_pub: false,
+                                            type: field_type, name: field_name });
+                        if (self.pos == field_before) { self.advance(); }
+                    }
+                    self.expect(Kind.RBrace, "'\}'");
+                }
+                item.variants.push(Variant { span: self.span_from(variant_start), doc: doc, name: name, kind: kind,
+                                             tuple_types: tuple_types, fields: fields });
+                if (!self.accept(Kind.Comma) && !self.at(Kind.RBrace)) {
+                    if (!is_struct_variant(kind)) { self.expect(Kind.Comma, "',' after variant"); }
+                }
+            } else {
+                self.parse_member(FnContext.Method, &item, false);
+            }
+            if (self.pos == before) { self.advance(); }
+        }
+        self.expect(Kind.RBrace, "'\}'");
+        item.span = self.span_from(start);
+        return item;
+    }
+    Item parse_trait(&self, Span start) {
+        self.advance();
+        var item = Item.new(ItemKind.Trait, start);
+        item.text = self.expect_ident("trait name");
+        if (self.at(Kind.Lt)) { item.generics = self.parse_generic_params(); }
+        self.expect(Kind.LBrace, "'\{'");
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            usize before = self.pos;
+            if (!self.parse_member(FnContext.TraitMethod, &item, false) || self.pos == before) { self.advance(); }
+        }
+        self.expect(Kind.RBrace, "'\}'");
+        item.span = self.span_from(start);
+        return item;
+    }
+    Item parse_impl(&self, Span start) {
+        self.advance();
+        var item = Item.new(ItemKind.Impl, start);
+        if (self.at(Kind.Lt)) { item.generics = self.parse_generic_params(); }
+        item.bound = self.parse_bound();
+        if (!self.accept(Kind.KwFor)) { self.error_here("expected 'for' after trait name in impl", ""); }
+        item.a = self.parse_type();
+        self.expect(Kind.LBrace, "'\{'");
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            usize before = self.pos;
+            if (!self.parse_member(FnContext.Method, &item, false) || self.pos == before) { self.advance(); }
+        }
+        self.expect(Kind.RBrace, "'\}'");
+        item.span = self.span_from(start);
+        return item;
+    }
+    Item parse_extern(&self, Span start) {
+        self.advance();
+        var item = Item.new(ItemKind.Extern, start);
+        if (self.at(Kind.StringLit)) {
+            item.text = self.peek_text(0);
+            self.advance();
+        } else {
+            self.error_here("expected ABI string after extern, for example \"C\"", "");
+        }
+        self.expect(Kind.LBrace, "'\{'");
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            usize before = self.pos;
+            if (!self.parse_member(FnContext.Extern, &item, false) || self.pos == before) { self.advance(); }
+        }
+        self.expect(Kind.RBrace, "'\}'");
+        item.span = self.span_from(start);
+        return item;
+    }
+
+    // ----- types -----
+
+    Path parse_path(&self) {
+        Span start = self.peek_span(0);
+        Vec<byte> first = self.expect_ident("name");
+        Span first_span = self.ident_span;
+        var path = Path { span: start, segments: Vec.new() };
+        path.segments.push(PathSegment { span: first_span, name: first });
+        while (self.at(Kind.Dot) && self.peek(1) == Kind.Ident) {
+            self.advance();
+            Span part_span = self.peek_span(0);
+            Vec<byte> part = self.peek_text(0);
+            self.advance();
+            path.segments.push(PathSegment { span: part_span, name: part });
+        }
+        path.span = self.span_from(start);
+        return path;
+    }
+    Vec<uint> parse_type_args(&self) {
+        Vec<uint> out = Vec.new();
+        self.expect(Kind.Lt, "'<'");
+        while (!self.at(Kind.Gt) && !self.at_end()) {
+            out.push(self.parse_type());
+            if (!self.accept(Kind.Comma)) { break; }
+        }
+        self.expect(Kind.Gt, "'>'");
+        return out;
+    }
+    /// "?" applies to the whole type in front of it, including a reference.
+    uint parse_type(&self) {
+        Span start = self.peek_span(0);
+        uint t = NONE;
+        if (self.accept(Kind.Amp)) {
+            bool is_const = self.accept(Kind.KwConst);
+            uint inner = self.parse_postfix_type();
+            var node = Type.new(TypeKind.Ref, self.span_from(start));
+            node.flag = is_const; node.a = inner;
+            t = self.ast.add_type(node);
+        } else if (self.accept(Kind.Star)) {
+            bool is_const = self.accept(Kind.KwConst);
+            uint inner = self.parse_postfix_type();
+            var node = Type.new(TypeKind.Ptr, self.span_from(start));
+            node.flag = is_const; node.a = inner;
+            t = self.ast.add_type(node);
+        } else {
+            t = self.parse_postfix_type();
+        }
+        while (self.at(Kind.Question)) {
+            self.advance();
+            var node = Type.new(TypeKind.Optional, self.span_from(start));
+            node.a = t;
+            t = self.ast.add_type(node);
+        }
+        return t;
+    }
+    uint parse_postfix_type(&self) {
+        Span start = self.peek_span(0);
+        uint t = self.parse_base_type();
+        while (self.at(Kind.LBracket)) {
+            self.advance();
+            if (self.accept(Kind.RBracket)) {
+                var node = Type.new(TypeKind.Slice, self.span_from(start));
+                node.a = t;
+                t = self.ast.add_type(node);
+            } else {
+                uint size = self.parse_expr();
+                self.expect(Kind.RBracket, "']'");
+                var node = Type.new(TypeKind.Array, self.span_from(start));
+                node.a = t; node.b = size;
+                t = self.ast.add_type(node);
+            }
+        }
+        return t;
+    }
+    uint parse_base_type(&self) {
+        Span start = self.peek_span(0);
+        Kind kind = self.peek(0);
+        PrimKind? prim = primitive_of(kind);
+        match prim {
+            Some(value) => {
+                self.advance();
+                var node = Type.new(TypeKind.Primitive, start);
+                node.prim = value;
+                return self.ast.add_type(node);
+            }
+            None => {}
+        }
+        match kind {
+            Kind.KwSelfType => {
+                self.advance();
+                return self.ast.add_type(Type.new(TypeKind.SelfType, start));
+            }
+            Kind.KwDyn => {
+                self.advance();
+                var node = Type.new(TypeKind.Dyn, start);
+                node.bound = self.parse_bound();
+                node.span = self.span_from(start);
+                return self.ast.add_type(node);
+            }
+            Kind.KwFn => {
+                self.advance();
+                var node = Type.new(TypeKind.Fn, start);
+                if (self.accept(Kind.KwConst)) { node.mode = CallMode.Shared; }
+                else if (self.accept(Kind.KwOnce)) { node.mode = CallMode.Once; }
+                if (self.at(Kind.Ident) && self.text_is(0, "send") && self.peek(1) == Kind.LParen) {
+                    self.advance();
+                    node.flag = true;
+                }
+                self.expect(Kind.LParen, "'('");
+                while (!self.at(Kind.RParen) && !self.at_end()) {
+                    node.items.push(self.parse_type());
+                    if (!self.accept(Kind.Comma)) { break; }
+                }
+                self.expect(Kind.RParen, "')'");
+                if (self.accept(Kind.Arrow)) { node.a = self.parse_type(); }
+                node.span = self.span_from(start);
+                return self.ast.add_type(node);
+            }
+            Kind.LParen => {
+                self.advance();
+                Vec<uint> elems = Vec.new();
+                bool trailing_comma = false;
+                while (!self.at(Kind.RParen) && !self.at_end()) {
+                    elems.push(self.parse_type());
+                    trailing_comma = self.accept(Kind.Comma);
+                    if (!trailing_comma) { break; }
+                }
+                self.expect(Kind.RParen, "')'");
+                if (elems.len() == 1 && !trailing_comma) { return *elems.get(0).unwrap(); }
+                var node = Type.new(TypeKind.Tuple, start);
+                node.items = elems;
+                node.span = self.span_from(start);
+                return self.ast.add_type(node);
+            }
+            Kind.Ident => {
+                var node = Type.new(TypeKind.Path, start);
+                node.path = self.parse_path();
+                if (self.at(Kind.Lt)) { node.items = self.parse_type_args(); }
+                node.span = self.span_from(start);
+                return self.ast.add_type(node);
+            }
+            _ => {
+                self.error_here("expected a type, found {token.name(kind)}", "SNX0201");
+                var node = Type.new(TypeKind.Primitive, start);
+                node.prim = PrimKind.Void;
+                return self.ast.add_type(node);
+            }
+        }
+    }
+
+    // ----- statements -----
+
+    uint parse_block(&self) {
+        Span start = self.peek_span(0);
+        self.expect(Kind.LBrace, "'\{'");
+        var block = Block { span: start, stmts: Vec.new(), tail: NONE };
+        self.parse_block_body(&block);
+        self.expect(Kind.RBrace, "'\}'");
+        block.span = self.span_from(start);
+        return self.ast.add_block(block);
+    }
+    bool is_block_like(&const self, uint id) {
+        ExprKind kind = self.ast.expr(id).kind;
+        return is_block_like_kind(kind);
+    }
+    void parse_block_body(&self, &Block block) {
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            usize before = self.pos;
+            usize errors_before = self.sink.errors;
+            Span start = self.peek_span(0);
+            if (self.accept(Kind.Semi)) { continue; }
+            if (self.at(Kind.KwWhile)) {
+                self.advance();
+                var stmt = Stmt.new(StmtKind.While, start);
+                self.expect(Kind.LParen, "'(' after while");
+                stmt.a = self.parse_expr();
+                self.expect(Kind.RParen, "')'");
+                stmt.b = self.parse_block();
+                stmt.span = self.span_from(start);
+                block.stmts.push(self.ast.add_stmt(stmt));
+            } else if (self.at(Kind.KwLoop)) {
+                self.advance();
+                var stmt = Stmt.new(StmtKind.Loop, start);
+                stmt.a = self.parse_block();
+                stmt.span = self.span_from(start);
+                block.stmts.push(self.ast.add_stmt(stmt));
+            } else if (self.at(Kind.KwFor)) {
+                self.advance();
+                var stmt = Stmt.new(StmtKind.For, start);
+                self.expect(Kind.LParen, "'(' after for");
+                stmt.a = self.parse_pattern();
+                self.expect(Kind.KwIn, "'in'");
+                stmt.b = self.parse_expr();
+                self.expect(Kind.RParen, "')'");
+                stmt.c = self.parse_block();
+                stmt.span = self.span_from(start);
+                block.stmts.push(self.ast.add_stmt(stmt));
+            } else if (self.looks_like_var_decl()) {
+                block.stmts.push(self.parse_var_decl());
+            } else {
+                uint e = self.parse_expr();
+                AssignOp? op = assign_op_of(self.peek(0));
+                match op {
+                    Some(assign) => {
+                        self.advance();
+                        uint value = self.parse_expr();
+                        self.expect(Kind.Semi, "';' after assignment");
+                        var stmt = Stmt.new(StmtKind.Assign, self.span_from(start));
+                        stmt.assign_op = assign; stmt.a = e; stmt.b = value;
+                        block.stmts.push(self.ast.add_stmt(stmt));
+                    }
+                    None => {
+                        if (self.accept(Kind.Semi)) {
+                            var stmt = Stmt.new(StmtKind.Expr, self.span_from(start));
+                            stmt.a = e; stmt.flag = true;
+                            block.stmts.push(self.ast.add_stmt(stmt));
+                        } else if (self.at(Kind.RBrace)) {
+                            block.tail = e;
+                        } else if (self.is_block_like(e)) {
+                            var stmt = Stmt.new(StmtKind.Expr, self.span_from(start));
+                            stmt.a = e; stmt.flag = false;
+                            block.stmts.push(self.ast.add_stmt(stmt));
+                        } else {
+                            self.expect(Kind.Semi, "';' after expression");
+                            var stmt = Stmt.new(StmtKind.Expr, self.span_from(start));
+                            stmt.a = e; stmt.flag = false;
+                            block.stmts.push(self.ast.add_stmt(stmt));
+                        }
+                    }
+                }
+            }
+            if (self.sink.errors > errors_before) {
+                while (!self.at_end() && !self.at(Kind.Semi) && !self.at(Kind.RBrace)) { self.advance(); }
+                self.accept(Kind.Semi);
+            }
+            if (self.pos == before) { self.advance(); }
+        }
+    }
+    uint parse_var_decl(&self) {
+        Span start = self.peek_span(0);
+        var stmt = Stmt.new(StmtKind.VarDecl, start);
+        if (self.accept(Kind.KwVar)) {
+        } else if (self.accept(Kind.KwConst)) {
+            stmt.flag = true;
+            if (!(self.at(Kind.Ident) && (self.peek(1) == Kind.Eq || self.peek(1) == Kind.Semi))) { stmt.a = self.parse_type(); }
+        } else {
+            stmt.a = self.parse_type();
+        }
+        stmt.text = self.expect_ident("variable name");
+        stmt.name_span = self.ident_span;
+        if (self.accept(Kind.Eq)) {
+            stmt.b = self.parse_expr();
+        } else if (stmt.a == NONE) {
+            self.error(stmt.name_span, "a variable without a type needs an initializer", "");
+        }
+        self.expect(Kind.Semi, "';' after declaration");
+        stmt.span = self.span_from(start);
+        return self.ast.add_stmt(stmt);
+    }
+
+    // ----- expressions -----
+
+    uint parse_expr(&self) { return self.parse_range(); }
+    uint parse_expr_no_struct(&self) {
+        self.no_struct += 1;
+        uint e = self.parse_range();
+        self.no_struct -= 1;
+        return e;
+    }
+    bool at_range_end(&const self) {
+        Kind k = self.peek(0);
+        return k == Kind.RParen || k == Kind.RBracket || k == Kind.RBrace || k == Kind.Semi ||
+               k == Kind.Comma || k == Kind.Eof || k == Kind.FatArrow || k == Kind.LBrace;
+    }
+    uint parse_range(&self) {
+        Span start = self.peek_span(0);
+        uint lhs = NONE;
+        if (!(self.at(Kind.DotDot) || self.at(Kind.DotDotEq))) { lhs = self.parse_binary(1); }
+        if (self.at(Kind.DotDot) || self.at(Kind.DotDotEq)) {
+            bool inclusive = self.peek(0) == Kind.DotDotEq;
+            self.advance();
+            uint rhs = NONE;
+            if (!self.at_range_end()) { rhs = self.parse_binary(1); }
+            if (inclusive && rhs == NONE) { self.error_here("inclusive range needs an end value", ""); }
+            var node = Expr.new(ExprKind.Range, self.span_from(start));
+            node.a = lhs; node.b = rhs; node.flag = inclusive;
+            return self.ast.add_expr(node);
+        }
+        return lhs;
+    }
+    /// Precedence 0 means the next token is not a binary operator.
+    BinaryInfo binary_prec(&const self) {
+        match self.peek(0) {
+            Kind.PipePipe => return BinaryInfo { prec: 1, op: BinaryOp.Or, length: 1 },
+            Kind.AmpAmp => return BinaryInfo { prec: 2, op: BinaryOp.And, length: 1 },
+            Kind.EqEq => return BinaryInfo { prec: 3, op: BinaryOp.Eq, length: 1 },
+            Kind.BangEq => return BinaryInfo { prec: 3, op: BinaryOp.Ne, length: 1 },
+            Kind.Lt => return BinaryInfo { prec: 3, op: BinaryOp.Lt, length: 1 },
+            Kind.LtEq => return BinaryInfo { prec: 3, op: BinaryOp.Le, length: 1 },
+            Kind.GtEq => return BinaryInfo { prec: 3, op: BinaryOp.Ge, length: 1 },
+            Kind.Gt => {
+                if (self.peek(1) == Kind.Gt && self.peek_span(1).start == self.peek_span(0).end) {
+                    return BinaryInfo { prec: 7, op: BinaryOp.Shr, length: 2 };
+                }
+                return BinaryInfo { prec: 3, op: BinaryOp.Gt, length: 1 };
+            }
+            Kind.Pipe => return BinaryInfo { prec: 4, op: BinaryOp.BitOr, length: 1 },
+            Kind.Caret => return BinaryInfo { prec: 5, op: BinaryOp.BitXor, length: 1 },
+            Kind.Amp => return BinaryInfo { prec: 6, op: BinaryOp.BitAnd, length: 1 },
+            Kind.Shl => return BinaryInfo { prec: 7, op: BinaryOp.Shl, length: 1 },
+            Kind.Plus => return BinaryInfo { prec: 8, op: BinaryOp.Add, length: 1 },
+            Kind.Minus => return BinaryInfo { prec: 8, op: BinaryOp.Sub, length: 1 },
+            Kind.Star => return BinaryInfo { prec: 9, op: BinaryOp.Mul, length: 1 },
+            Kind.Slash => return BinaryInfo { prec: 9, op: BinaryOp.Div, length: 1 },
+            Kind.Percent => return BinaryInfo { prec: 9, op: BinaryOp.Rem, length: 1 },
+            _ => return BinaryInfo { prec: 0, op: BinaryOp.Add, length: 1 },
+        }
+    }
+    uint parse_binary(&self, int min_prec) {
+        Span start = self.peek_span(0);
+        uint lhs = self.parse_cast();
+        loop {
+            BinaryInfo info = self.binary_prec();
+            if (info.prec == 0 || info.prec < min_prec) { break; }
+            for (i in 0..info.length) { self.advance(); }
+            uint rhs = self.parse_binary(info.prec + 1);
+            var node = Expr.new(ExprKind.Binary, self.span_from(start));
+            node.binary_op = info.op; node.a = lhs; node.b = rhs;
+            lhs = self.ast.add_expr(node);
+        }
+        return lhs;
+    }
+    uint parse_cast(&self) {
+        Span start = self.peek_span(0);
+        uint e = self.parse_unary();
+        while (self.accept(Kind.KwAs)) {
+            uint t = self.parse_type();
+            var node = Expr.new(ExprKind.Cast, self.span_from(start));
+            node.a = e; node.b = t;
+            e = self.ast.add_expr(node);
+        }
+        return e;
+    }
+    uint parse_unary(&self) {
+        Span start = self.peek_span(0);
+        Kind k = self.peek(0);
+        if (k == Kind.Minus || k == Kind.Bang || k == Kind.Tilde || k == Kind.Star) {
+            self.advance();
+            uint operand = self.parse_unary();
+            var node = Expr.new(ExprKind.Unary, self.span_from(start));
+            node.a = operand;
+            match k {
+                Kind.Minus => { node.unary_op = UnaryOp.Neg; }
+                Kind.Bang => { node.unary_op = UnaryOp.Not; }
+                Kind.Tilde => { node.unary_op = UnaryOp.BitNot; }
+                _ => { node.unary_op = UnaryOp.Deref; }
+            }
+            return self.ast.add_expr(node);
+        }
+        if (k == Kind.Amp) {
+            self.advance();
+            bool is_const = self.accept(Kind.KwConst);
+            uint operand = self.parse_unary();
+            var node = Expr.new(ExprKind.Ref, self.span_from(start));
+            node.flag = is_const; node.a = operand;
+            return self.ast.add_expr(node);
+        }
+        return self.parse_postfix();
+    }
+    Vec<uint> parse_call_args(&self) {
+        Vec<uint> args = Vec.new();
+        self.expect(Kind.LParen, "'('");
+        int saved = self.no_struct;
+        self.no_struct = 0;
+        while (!self.at(Kind.RParen) && !self.at_end()) {
+            args.push(self.parse_expr());
+            if (!self.accept(Kind.Comma)) { break; }
+        }
+        self.no_struct = saved;
+        self.expect(Kind.RParen, "')'");
+        return args;
+    }
+    /// Reads a dotted name expression into out. Fails for any other form.
+    bool expr_is_path(&const self, uint id, &Path out) {
+        var e = self.ast.expr(id);
+        if (is_name_kind(e.kind)) {
+            if (!e.type_args.is_empty()) { return false; }
+            out.segments.push(PathSegment { span: e.span, name: clone_bytes(e.text) });
+            out.span = e.span;
+            return true;
+        }
+        if (is_field_kind(e.kind)) {
+            if (!e.type_args.is_empty()) { return false; }
+            if (!self.expr_is_path(e.a, &*out)) { return false; }
+            out.segments.push(PathSegment { span: e.name_span, name: clone_bytes(e.text) });
+            out.span = Span.merge(out.span, e.name_span);
+            return true;
+        }
+        return false;
+    }
+    /// At "<" after a name: succeeds only when a type list closes and is
+    /// followed by "(" or ".".
+    bool try_parse_type_args_for_call(&self, &Vec<uint> out) {
+        usize after = self.skip_generic_list(self.pos);
+        if (after == 0) { return false; }
+        Kind next = self.kind_at(after);
+        if (next != Kind.LParen && next != Kind.Dot) { return false; }
+        usize save = self.pos;
+        int save_errors = self.spec_errors;
+        self.speculating += 1;
+        self.spec_errors = 0;
+        Vec<uint> args = self.parse_type_args();
+        bool ok = self.spec_errors == 0;
+        self.speculating -= 1;
+        self.spec_errors = save_errors;
+        if (ok) {
+            *out = args;
+            return true;
+        }
+        self.pos = save;
+        return false;
+    }
+    uint parse_postfix(&self) {
+        Span start = self.peek_span(0);
+        uint e = self.parse_primary();
+        loop {
+            if (self.at(Kind.LParen)) {
+                var node = Expr.new(ExprKind.Call, start);
+                node.a = e;
+                node.items = self.parse_call_args();
+                node.span = self.span_from(start);
+                e = self.ast.add_expr(node);
+            } else if (self.at(Kind.LBracket)) {
+                self.advance();
+                int saved = self.no_struct;
+                self.no_struct = 0;
+                uint index = self.parse_expr();
+                self.no_struct = saved;
+                self.expect(Kind.RBracket, "']'");
+                var node = Expr.new(ExprKind.Index, self.span_from(start));
+                node.a = e; node.b = index;
+                e = self.ast.add_expr(node);
+            } else if (self.at(Kind.Dot)) {
+                self.advance();
+                if (self.at(Kind.IntLit)) {
+                    Span number_span = self.peek_span(0);
+                    ulong value = self.peek_int(0);
+                    self.advance();
+                    var node = Expr.new(ExprKind.Field, self.span_from(start));
+                    node.a = e;
+                    bytes.text(&node.text, "{value}");
+                    node.name_span = number_span;
+                    e = self.ast.add_expr(node);
+                } else {
+                    Vec<byte> name = self.expect_ident("field or method name");
+                    Span name_span = self.ident_span;
+                    var node = Expr.new(ExprKind.Field, start);
+                    node.a = e; node.text = name; node.name_span = name_span;
+                    if (self.at(Kind.Lt)) { self.try_parse_type_args_for_call(&node.type_args); }
+                    node.span = self.span_from(start);
+                    e = self.ast.add_expr(node);
+                }
+            } else if (self.at(Kind.Lt) && is_name_kind(self.ast.expr(e).kind) && self.ast.expr(e).type_args.is_empty()) {
+                Vec<uint> args = Vec.new();
+                if (!self.try_parse_type_args_for_call(&args)) { break; }
+                Span widened = self.span_from(start);
+                var node = self.ast.exprs.get_mut(e as usize).unwrap();
+                node.type_args = args;
+                node.span = widened;
+            } else if (self.at(Kind.Question)) {
+                self.advance();
+                var node = Expr.new(ExprKind.Try, self.span_from(start));
+                node.a = e;
+                e = self.ast.add_expr(node);
+            } else if (self.at(Kind.QuestionDot)) {
+                self.advance();
+                Vec<byte> name = self.expect_ident("field name after '?.'");
+                var node = Expr.new(ExprKind.OptChain, self.span_from(start));
+                node.a = e; node.text = name;
+                e = self.ast.add_expr(node);
+            } else if (self.at(Kind.QuestionQuestion)) {
+                self.advance();
+                uint fallback = self.parse_unary();
+                var node = Expr.new(ExprKind.Coalesce, self.span_from(start));
+                node.a = e; node.b = fallback;
+                e = self.ast.add_expr(node);
+            } else if (self.at(Kind.LBrace) && self.no_struct == 0) {
+                var path = Path { span: start, segments: Vec.new() };
+                if (!self.expr_is_path(e, &path)) { break; }
+                e = self.parse_struct_lit(path, start);
+            } else {
+                break;
+            }
+        }
+        return e;
+    }
+    uint parse_struct_lit(&self, Path path, Span start) {
+        var node = Expr.new(ExprKind.StructLit, start);
+        node.path = path;
+        self.expect(Kind.LBrace, "'\{'");
+        int saved = self.no_struct;
+        self.no_struct = 0;
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            Vec<byte> name = self.expect_ident("field name");
+            Span name_span = self.ident_span;
+            uint value = NONE;
+            if (self.accept(Kind.Colon)) { value = self.parse_expr(); }
+            node.fields.push(FieldInit { span: name_span, name: name, value: value });
+            if (!self.accept(Kind.Comma)) { break; }
+        }
+        self.no_struct = saved;
+        self.expect(Kind.RBrace, "'\}'");
+        node.span = self.span_from(start);
+        return self.ast.add_expr(node);
+    }
+    uint parse_interp(&self) {
+        Span start = self.peek_span(0);
+        self.advance();
+        var node = Expr.new(ExprKind.Interp, start);
+        while (!self.at(Kind.StringEnd) && !self.at_end()) {
+            if (self.at(Kind.StringText)) {
+                node.parts.push(InterpPart { text: self.peek_text(0), expr: NONE });
+                self.advance();
+            } else if (self.accept(Kind.InterpStart)) {
+                int saved = self.no_struct;
+                self.no_struct = 0;
+                uint value = self.parse_expr();
+                self.no_struct = saved;
+                self.expect(Kind.InterpEnd, "'\}' to close interpolation");
+                node.parts.push(InterpPart { text: Vec.new(), expr: value });
+            } else {
+                self.error_here("unexpected token inside string", "");
+                self.advance();
+            }
+        }
+        self.expect(Kind.StringEnd, "end of string");
+        node.span = self.span_from(start);
+        return self.ast.add_expr(node);
+    }
+    uint parse_if(&self) {
+        Span start = self.peek_span(0);
+        self.advance();
+        var node = Expr.new(ExprKind.If, start);
+        self.expect(Kind.LParen, "'(' after if");
+        node.a = self.parse_expr();
+        self.expect(Kind.RParen, "')'");
+        node.b = self.parse_block();
+        if (self.accept(Kind.KwElse)) {
+            if (self.at(Kind.KwIf)) {
+                node.c = self.parse_if();
+            } else {
+                Span block_start = self.peek_span(0);
+                uint block = self.parse_block();
+                var wrapper = Expr.new(ExprKind.Block, self.span_from(block_start));
+                wrapper.a = block;
+                node.c = self.ast.add_expr(wrapper);
+            }
+        }
+        node.span = self.span_from(start);
+        return self.ast.add_expr(node);
+    }
+    uint parse_match(&self) {
+        Span start = self.peek_span(0);
+        self.advance();
+        var node = Expr.new(ExprKind.Match, start);
+        node.a = self.parse_expr_no_struct();
+        self.expect(Kind.LBrace, "'\{'");
+        while (!self.at(Kind.RBrace) && !self.at_end()) {
+            usize before = self.pos;
+            Span arm_start = self.peek_span(0);
+            uint pattern = self.parse_pattern();
+            uint guard = NONE;
+            if (self.accept(Kind.KwIf)) { guard = self.parse_expr_no_struct(); }
+            self.expect(Kind.FatArrow, "'=>'");
+            uint body = NONE;
+            if (self.at(Kind.LBrace)) {
+                Span block_start = self.peek_span(0);
+                uint block = self.parse_block();
+                var wrapper = Expr.new(ExprKind.Block, self.span_from(block_start));
+                wrapper.a = block;
+                body = self.ast.add_expr(wrapper);
+                self.accept(Kind.Comma);
+            } else {
+                body = self.parse_expr();
+                if (!self.accept(Kind.Comma) && !self.at(Kind.RBrace)) { self.expect(Kind.Comma, "',' after match arm"); }
+            }
+            node.arms.push(MatchArm { span: self.span_from(arm_start), pattern: pattern, guard: guard, body: body });
+            if (self.pos == before) { self.advance(); }
+        }
+        self.expect(Kind.RBrace, "'\}'");
+        node.span = self.span_from(start);
+        return self.ast.add_expr(node);
+    }
+    uint parse_closure(&self) {
+        Span start = self.peek_span(0);
+        var node = Expr.new(ExprKind.Closure, start);
+        if (self.accept(Kind.LBracket)) {
+            node.explicit_captures = true;
+            while (!self.at(Kind.RBracket) && !self.at_end()) {
+                Span capture_span = self.peek_span(0);
+                CaptureMode mode = CaptureMode.Move;
+                if (self.accept(Kind.Amp)) {
+                    mode = if (self.accept(Kind.KwConst)) { CaptureMode.Shared } else { CaptureMode.Writable };
+                }
+                Vec<byte> name = Vec.new();
+                if (self.accept(Kind.KwSelf)) { bytes.text(&name, "self"); }
+                else { name = self.expect_ident("captured variable"); }
+                node.captures.push(Capture { span: capture_span, name: name, mode: mode });
+                if (!self.accept(Kind.Comma)) { break; }
+            }
+            self.expect(Kind.RBracket, "']'");
+        }
+        if (self.at(Kind.Ident) && self.text_is(0, "send")) { self.advance(); node.is_send = true; }
+        if (self.accept(Kind.KwConst)) { node.mode = CallMode.Shared; }
+        else if (self.accept(Kind.KwOnce)) { node.mode = CallMode.Once; }
+        if (self.accept(Kind.PipePipe)) {
+        } else {
+            self.expect(Kind.Pipe, "'|'");
+            while (!self.at(Kind.Pipe) && !self.at_end()) {
+                Span param_start = self.peek_span(0);
+                uint type = NONE;
+                Vec<byte> name = Vec.new();
+                if (self.at(Kind.Ident) && (self.peek(1) == Kind.Comma || self.peek(1) == Kind.Pipe)) {
+                    name = self.peek_text(0);
+                    self.advance();
+                } else {
+                    type = self.parse_type();
+                    name = self.expect_ident("parameter name");
+                }
+                node.params.push(ClosureParam { span: self.span_from(param_start), type: type, name: name });
+                if (!self.accept(Kind.Comma)) { break; }
+            }
+            self.expect(Kind.Pipe, "'|'");
+        }
+        if (self.accept(Kind.Arrow)) { node.a = self.parse_type(); }
+        if (self.at(Kind.LBrace)) {
+            Span block_start = self.peek_span(0);
+            uint block = self.parse_block();
+            var wrapper = Expr.new(ExprKind.Block, self.span_from(block_start));
+            wrapper.a = block;
+            node.b = self.ast.add_expr(wrapper);
+        } else {
+            node.b = self.parse_expr();
+        }
+        node.span = self.span_from(start);
+        return self.ast.add_expr(node);
+    }
+    /// Checks the bracket list that opens an explicit-capture closure.
+    bool bracket_closure_ahead(&const self) {
+        usize end = self.pos + 1;
+        while (end < self.tokens.len()) {
+            Kind k = self.kind_at(end);
+            if (k == Kind.Ident || k == Kind.Amp || k == Kind.KwConst || k == Kind.KwSelf || k == Kind.Comma) { end += 1; }
+            else { break; }
+        }
+        if (end + 1 < self.tokens.len() && self.kind_at(end) == Kind.RBracket) {
+            usize next = end + 1;
+            if (self.kind_at(next) == Kind.Ident && bytes.equals(self.tokens.get(next).unwrap().text, "send")) { next += 1; }
+            if (next < self.tokens.len() && (self.kind_at(next) == Kind.KwConst || self.kind_at(next) == Kind.KwOnce)) { next += 1; }
+            if (next < self.tokens.len() && (self.kind_at(next) == Kind.Pipe || self.kind_at(next) == Kind.PipePipe)) { return true; }
+        }
+        return false;
+    }
+    uint literal_expr(&self, ExprKind kind, Span span) {
+        var node = Expr.new(kind, span);
+        return self.ast.add_expr(node);
+    }
+    uint parse_primary(&self) {
+        Kind kind = self.peek(0);
+        Span start = self.peek_span(0);
+        match kind {
+            Kind.IntLit => {
+                var node = Expr.new(ExprKind.IntLit, start);
+                node.number = self.peek_int(0); node.flag = false;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.LongLit => {
+                var node = Expr.new(ExprKind.IntLit, start);
+                node.number = self.peek_int(0); node.flag = true;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.FloatLit => {
+                var node = Expr.new(ExprKind.FloatLit, start);
+                node.real = self.peek_float(0); node.flag = true;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.DoubleLit => {
+                var node = Expr.new(ExprKind.FloatLit, start);
+                node.real = self.peek_float(0); node.flag = false;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.CharLit => {
+                var node = Expr.new(ExprKind.CharLit, start);
+                node.number = (self.peek_int(0) as uint) as ulong;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.StringLit => {
+                var node = Expr.new(ExprKind.StringLit, start);
+                node.text = self.peek_text(0);
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.StringStart => return self.parse_interp(),
+            Kind.KwTrue => {
+                var node = Expr.new(ExprKind.BoolLit, start);
+                node.flag = true;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.KwFalse => {
+                var node = Expr.new(ExprKind.BoolLit, start);
+                node.flag = false;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.Ident => {
+                if (self.text_is(0, "send") && (self.peek(1) == Kind.KwOnce || self.peek(1) == Kind.KwConst)) {
+                    return self.parse_closure();
+                }
+                var node = Expr.new(ExprKind.Name, start);
+                node.text = self.peek_text(0);
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.KwSelf => {
+                var node = Expr.new(ExprKind.Name, start);
+                bytes.text(&node.text, "self");
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.KwSelfType => {
+                var node = Expr.new(ExprKind.Name, start);
+                bytes.text(&node.text, "Self");
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.LParen => {
+                self.advance();
+                int saved = self.no_struct;
+                self.no_struct = 0;
+                if (self.accept(Kind.RParen)) {
+                    self.no_struct = saved;
+                    return self.ast.add_expr(Expr.new(ExprKind.Tuple, self.span_from(start)));
+                }
+                uint first = self.parse_expr();
+                if (self.accept(Kind.Comma)) {
+                    var tuple = Expr.new(ExprKind.Tuple, start);
+                    tuple.items.push(first);
+                    while (!self.at(Kind.RParen) && !self.at_end()) {
+                        tuple.items.push(self.parse_expr());
+                        if (!self.accept(Kind.Comma)) { break; }
+                    }
+                    self.no_struct = saved;
+                    self.expect(Kind.RParen, "')'");
+                    tuple.span = self.span_from(start);
+                    return self.ast.add_expr(tuple);
+                }
+                self.no_struct = saved;
+                self.expect(Kind.RParen, "')'");
+                Span widened = self.span_from(start);
+                var inner = self.ast.exprs.get_mut(first as usize).unwrap();
+                inner.span = widened;
+                return first;
+            }
+            Kind.LBracket => {
+                if (self.bracket_closure_ahead()) { return self.parse_closure(); }
+                self.advance();
+                int saved = self.no_struct;
+                self.no_struct = 0;
+                if (self.accept(Kind.RBracket)) {
+                    self.no_struct = saved;
+                    return self.ast.add_expr(Expr.new(ExprKind.Array, self.span_from(start)));
+                }
+                uint first = self.parse_expr();
+                if (self.accept(Kind.Semi)) {
+                    uint count = self.parse_expr();
+                    self.no_struct = saved;
+                    self.expect(Kind.RBracket, "']'");
+                    var repeat = Expr.new(ExprKind.ArrayRepeat, self.span_from(start));
+                    repeat.a = first; repeat.b = count;
+                    return self.ast.add_expr(repeat);
+                }
+                var array = Expr.new(ExprKind.Array, start);
+                array.items.push(first);
+                while (self.accept(Kind.Comma)) {
+                    if (self.at(Kind.RBracket)) { break; }
+                    array.items.push(self.parse_expr());
+                }
+                self.no_struct = saved;
+                self.expect(Kind.RBracket, "']'");
+                array.span = self.span_from(start);
+                return self.ast.add_expr(array);
+            }
+            Kind.LBrace => {
+                uint block = self.parse_block();
+                var node = Expr.new(ExprKind.Block, self.span_from(start));
+                node.a = block;
+                return self.ast.add_expr(node);
+            }
+            Kind.KwIf => return self.parse_if(),
+            Kind.KwMatch => return self.parse_match(),
+            Kind.Pipe => return self.parse_closure(),
+            Kind.KwOnce => return self.parse_closure(),
+            Kind.KwConst => return self.parse_closure(),
+            Kind.PipePipe => return self.parse_closure(),
+            Kind.KwUnsafe => {
+                self.advance();
+                uint block = self.parse_block();
+                var node = Expr.new(ExprKind.Unsafe, self.span_from(start));
+                node.a = block;
+                return self.ast.add_expr(node);
+            }
+            Kind.KwAwait => {
+                self.advance();
+                uint operand = self.parse_unary();
+                var node = Expr.new(ExprKind.Await, self.span_from(start));
+                node.a = operand;
+                return self.ast.add_expr(node);
+            }
+            Kind.KwReturn => {
+                self.advance();
+                uint value = NONE;
+                if (!self.at_range_end() || self.at(Kind.LBrace)) {
+                    if (!(self.at(Kind.Semi) || self.at(Kind.RBrace) || self.at(Kind.Comma) || self.at(Kind.RParen))) {
+                        value = self.parse_expr();
+                    }
+                }
+                var node = Expr.new(ExprKind.Return, self.span_from(start));
+                node.a = value;
+                return self.ast.add_expr(node);
+            }
+            Kind.KwBreak => {
+                self.advance();
+                return self.ast.add_expr(Expr.new(ExprKind.Break, start));
+            }
+            Kind.KwContinue => {
+                self.advance();
+                return self.ast.add_expr(Expr.new(ExprKind.Continue, start));
+            }
+            _ => {
+                self.error_here("expected an expression, found {token.name(kind)}", "SNX0201");
+                return self.ast.add_expr(Expr.new(ExprKind.Tuple, start));
+            }
+        }
+    }
+
+    // ----- patterns -----
+
+    /// Returns NONE after reporting an error.
+    uint parse_literal_for_pattern(&self) {
+        Kind kind = self.peek(0);
+        Span start = self.peek_span(0);
+        match kind {
+            Kind.IntLit => {
+                var node = Expr.new(ExprKind.IntLit, start);
+                node.number = self.peek_int(0); node.flag = false;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.LongLit => {
+                var node = Expr.new(ExprKind.IntLit, start);
+                node.number = self.peek_int(0); node.flag = true;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.FloatLit => {
+                var node = Expr.new(ExprKind.FloatLit, start);
+                node.real = self.peek_float(0); node.flag = true;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.DoubleLit => {
+                var node = Expr.new(ExprKind.FloatLit, start);
+                node.real = self.peek_float(0); node.flag = false;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.CharLit => {
+                var node = Expr.new(ExprKind.CharLit, start);
+                node.number = (self.peek_int(0) as uint) as ulong;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.StringLit => {
+                var node = Expr.new(ExprKind.StringLit, start);
+                node.text = self.peek_text(0);
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.KwTrue => {
+                var node = Expr.new(ExprKind.BoolLit, start);
+                node.flag = true;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.KwFalse => {
+                var node = Expr.new(ExprKind.BoolLit, start);
+                node.flag = false;
+                self.advance();
+                return self.ast.add_expr(node);
+            }
+            Kind.Minus => {
+                self.advance();
+                uint inner = self.parse_literal_for_pattern();
+                var node = Expr.new(ExprKind.Unary, self.span_from(start));
+                node.unary_op = UnaryOp.Neg; node.a = inner;
+                return self.ast.add_expr(node);
+            }
+            _ => {
+                self.error_here("expected a pattern, found {token.name(kind)}", "SNX0201");
+                return NONE;
+            }
+        }
+    }
+    uint parse_pattern(&self) {
+        Span start = self.peek_span(0);
+        uint first = self.parse_pattern_primary();
+        if (!self.at(Kind.Pipe)) { return first; }
+        var node = Pattern.new(PatternKind.Or, start);
+        node.items.push(first);
+        while (self.accept(Kind.Pipe)) { node.items.push(self.parse_pattern_primary()); }
+        node.span = self.span_from(start);
+        return self.ast.add_pattern(node);
+    }
+    uint parse_pattern_primary(&self) {
+        Span start = self.peek_span(0);
+        Kind kind = self.peek(0);
+        if (kind == Kind.Ident && self.text_is(0, "_")) {
+            self.advance();
+            return self.ast.add_pattern(Pattern.new(PatternKind.Wildcard, start));
+        }
+        if (kind == Kind.Ident) {
+            var path = self.parse_path();
+            if (self.at(Kind.LParen)) {
+                self.advance();
+                var node = Pattern.new(PatternKind.TupleStruct, start);
+                node.path = path;
+                while (!self.at(Kind.RParen) && !self.at_end()) {
+                    node.items.push(self.parse_pattern());
+                    if (!self.accept(Kind.Comma)) { break; }
+                }
+                self.expect(Kind.RParen, "')'");
+                node.span = self.span_from(start);
+                return self.ast.add_pattern(node);
+            }
+            if (self.at(Kind.LBrace)) {
+                self.advance();
+                var node = Pattern.new(PatternKind.Struct, start);
+                node.path = path;
+                while (!self.at(Kind.RBrace) && !self.at_end()) {
+                    Vec<byte> name = self.expect_ident("field name");
+                    Span name_span = self.ident_span;
+                    uint inner = NONE;
+                    if (self.accept(Kind.Colon)) { inner = self.parse_pattern(); }
+                    node.fields.push(FieldPattern { span: name_span, name: name, pattern: inner });
+                    if (!self.accept(Kind.Comma)) { break; }
+                }
+                self.expect(Kind.RBrace, "'\}'");
+                node.span = self.span_from(start);
+                return self.ast.add_pattern(node);
+            }
+            if (path.segments.len() == 1) {
+                var node = Pattern.new(PatternKind.Binding, path.span);
+                node.text = clone_bytes(path.segments.get(0).unwrap().name);
+                return self.ast.add_pattern(node);
+            }
+            var node = Pattern.new(PatternKind.Path, path.span);
+            node.path = path;
+            return self.ast.add_pattern(node);
+        }
+        if (kind == Kind.LParen) {
+            self.advance();
+            var node = Pattern.new(PatternKind.Tuple, start);
+            while (!self.at(Kind.RParen) && !self.at_end()) {
+                node.items.push(self.parse_pattern());
+                if (!self.accept(Kind.Comma)) { break; }
+            }
+            self.expect(Kind.RParen, "')'");
+            node.span = self.span_from(start);
+            return self.ast.add_pattern(node);
+        }
+        uint lit = self.parse_literal_for_pattern();
+        if (lit == NONE) {
+            self.advance();
+            return self.ast.add_pattern(Pattern.new(PatternKind.Wildcard, start));
+        }
+        if (self.at(Kind.DotDot) || self.at(Kind.DotDotEq)) {
+            bool inclusive = self.peek(0) == Kind.DotDotEq;
+            self.advance();
+            uint high = self.parse_literal_for_pattern();
+            if (high == NONE) { high = self.ast.add_expr(Expr.new(ExprKind.Tuple, self.peek_span(0))); }
+            var node = Pattern.new(PatternKind.Range, self.span_from(start));
+            node.a = lit; node.b = high; node.flag = inclusive;
+            return self.ast.add_pattern(node);
+        }
+        var node = Pattern.new(PatternKind.Literal, self.span_from(start));
+        node.a = lit;
+        return self.ast.add_pattern(node);
+    }
+
+    // ----- test entry points -----
+
+    pub uint parse_expression(&self) { return self.parse_expr(); }
+    pub uint parse_type_only(&self) { return self.parse_type(); }
+    pub uint parse_pattern_only(&self) { return self.parse_pattern(); }
+    /// Parses one block-body statement. NONE when nothing parsed.
+    pub uint parse_statement_only(&self) {
+        var block = Block { span: self.peek_span(0), stmts: Vec.new(), tail: NONE };
+        self.parse_block_body(&block);
+        if (!block.stmts.is_empty()) { return *block.stmts.get(0).unwrap(); }
+        if (block.tail != NONE) {
+            var node = Stmt.new(StmtKind.Expr, self.ast.expr(block.tail).span);
+            node.a = block.tail; node.flag = false;
+            return self.ast.add_stmt(node);
+        }
+        return NONE;
+    }
+}

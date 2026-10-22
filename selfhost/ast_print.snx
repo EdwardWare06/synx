@@ -1,0 +1,176 @@
+/// Human AST output. Source: compiler/src/ast_dump.cpp.
+/// Strict inspection stays in ast_dump.snx. Output retains decoded bytes.
+import ast;
+import bytes;
+import driver_io;
+
+pub &const str unary(ast.UnaryOp op) { match op { Neg => return "-", Not => return "!", BitNot => return "~", Deref => return "*" } }
+pub &const str binary(ast.BinaryOp op) {
+    match op { Add => return "+", Sub => return "-", Mul => return "*", Div => return "/", Rem => return "%", Eq => return "==", Ne => return "!=",
+        Lt => return "<", Gt => return ">", Le => return "<=", Ge => return ">=", And => return "&&", Or => return "||",
+        BitAnd => return "&", BitOr => return "|", BitXor => return "^", Shl => return "<<", Shr => return ">>" }
+}
+&const str assignment(ast.AssignOp op) {
+    match op { Assign => return "=", Add => return "+=", Sub => return "-=", Mul => return "*=", Div => return "/=", Rem => return "%=",
+        BitAnd => return "&=", BitOr => return "|=", BitXor => return "^=", Shl => return "<<=", Shr => return ">>=" }
+}
+&const str primitive(ast.PrimKind kind) {
+    match kind { Bool => return "bool", Byte => return "byte", Short => return "short", Int => return "int", Long => return "long", Uint => return "uint",
+        Ulong => return "ulong", Usize => return "usize", Float => return "float", Double => return "double", Char => return "char", Void => return "void" }
+}
+struct Writer {
+    Vec<byte> out;
+    void text(&self, &const str value) { bytes.text(&self.out, value); }
+    void raw(&self, &const Vec<byte> value) { bytes.append(&self.out, value); }
+    void space(&self) { self.out.push(32); }
+    void end(&self) { self.out.push(41); }
+    void quoted(&self, &const Vec<byte> value) { self.out.push(34); self.raw(value); self.out.push(34); }
+    void path(&self, &const ast.Path path) {
+        for (i in 0..path.segments.len()) { if (i != 0) { self.out.push(46); } self.raw(path.segments.get(i).unwrap().name); }
+    }
+    void type_list(&self, &const ast.Ast tree, &const Vec<uint> list, &const str separator) {
+        for (i in 0..list.len()) { if (i != 0) { self.text(separator); } self.type(tree, *list.get(i).unwrap()); }
+    }
+    void type(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("?"); return; }
+        var t = tree.type(id);
+        match t.kind {
+            Primitive => self.text(primitive(t.prim)),
+            Path => { self.path(t.path); if (!t.items.is_empty()) { self.text("<"); self.type_list(tree, t.items, ", "); self.text(">"); } },
+            Ref => { self.text(if (t.flag) { "&const " } else { "&" }); self.type(tree, t.a); },
+            Ptr => { self.text(if (t.flag) { "*const " } else { "*" }); self.type(tree, t.a); },
+            Array => { self.type(tree, t.a); self.text("["); self.expr(tree, t.b); self.text("]"); },
+            Slice => { self.type(tree, t.a); self.text("[]"); },
+            Optional => { self.type(tree, t.a); self.text("?"); },
+            Tuple => { self.text("("); self.type_list(tree, t.items, ", "); self.end(); },
+            Fn => {
+                self.text(match t.mode { Shared => "fn const", Once => "fn once", Writable => "fn" }); if (t.flag) { self.text(" send"); }
+                self.text("("); self.type_list(tree, t.items, ", "); self.end();
+                if (t.a != ast.NONE) { self.text(" -> "); self.type(tree, t.a); }
+            },
+            Dyn => { self.text("dyn "); self.bound(tree, t.bound); }, SelfType => self.text("Self"),
+        }
+    }
+    void bound(&self, &const ast.Ast tree, &const ast.Bound bound) {
+        self.path(bound.path); if (!bound.args.is_empty()) { self.text("<"); self.type_list(tree, bound.args, ", "); self.text(">"); }
+    }
+    void generics(&self, &const ast.Ast tree, &const Vec<ast.GenericParam> generics) {
+        if (generics.is_empty()) { return; } self.text(" (generics");
+        for (g in generics) { self.text(" ("); self.raw(g.name); for (b in &const g.bounds) { self.space(); self.bound(tree, b); } self.end(); } self.end();
+    }
+    void type_args(&self, &const ast.Ast tree, &const Vec<uint> args) {
+        if (args.is_empty()) { return; } self.text(" (targs"); for (t in args) { self.space(); self.type(tree, *t); } self.end();
+    }
+    void expr(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("?"); return; }
+        var e = tree.expr(id);
+        match e.kind {
+            IntLit => { self.text("{e.number}"); if (e.flag) { self.text("L"); } },
+            FloatLit => {
+                var value = driver_io.float_text(e.real); self.raw(value); bool point = false;
+                for (b in &const value) { if (*b == 46 || *b == 101) { point = true; } }
+                if (!point) { self.text(".0"); } if (e.flag) { self.text("f"); }
+            },
+            CharLit => self.text("(char {e.number})"), StringLit => self.quoted(e.text), BoolLit => self.text(if (e.flag) { "true" } else { "false" }),
+            Interp => { self.text("(interp"); for (p in &const e.parts) { self.space(); if (p.expr != ast.NONE) { self.expr(tree, p.expr); } else { self.quoted(p.text); } } self.end(); },
+            Name => { if (e.type_args.is_empty()) { self.raw(e.text); } else { self.text("(name "); self.raw(e.text); self.type_args(tree, e.type_args); self.end(); } },
+            Field => { self.text("(. "); self.expr(tree, e.a); self.space(); self.raw(e.text); self.type_args(tree, e.type_args); self.end(); },
+            Call => { self.text("(call "); self.expr(tree, e.a); for (a in &const e.items) { self.space(); self.expr(tree, *a); } self.end(); },
+            Index => { self.text("(index "); self.expr(tree, e.a); self.space(); self.expr(tree, e.b); self.end(); },
+            Unary => { self.text("(unary "); self.text(unary(e.unary_op)); self.space(); self.expr(tree, e.a); self.end(); },
+            Binary => { self.text("("); self.text(binary(e.binary_op)); self.space(); self.expr(tree, e.a); self.space(); self.expr(tree, e.b); self.end(); },
+            Cast => { self.text("(as "); self.expr(tree, e.a); self.space(); self.type(tree, e.b); self.end(); },
+            Try => { self.text("(try "); self.expr(tree, e.a); self.end(); },
+            OptChain => { self.text("(?. "); self.expr(tree, e.a); self.space(); self.raw(e.text); self.end(); },
+            Coalesce => { self.text("(?? "); self.expr(tree, e.a); self.space(); self.expr(tree, e.b); self.end(); },
+            Range => { self.text(if (e.flag) { "(..= " } else { "(.. " }); if (e.a == ast.NONE) { self.text("_"); } else { self.expr(tree, e.a); }
+                self.space(); if (e.b == ast.NONE) { self.text("_"); } else { self.expr(tree, e.b); } self.end(); },
+            Ref => { self.text(if (e.flag) { "(&const " } else { "(& " }); self.expr(tree, e.a); self.end(); },
+            StructLit => { self.text("(struct "); self.path(e.path); for (f in &const e.fields) { self.text(" ("); self.raw(f.name);
+                if (f.value != ast.NONE) { self.space(); self.expr(tree, f.value); } self.end(); } self.end(); },
+            Tuple => { self.text("(tuple"); for (item in &const e.items) { self.space(); self.expr(tree, *item); } self.end(); },
+            Array => { self.text("(array"); for (item in &const e.items) { self.space(); self.expr(tree, *item); } self.end(); },
+            ArrayRepeat => { self.text("(array-repeat "); self.expr(tree, e.a); self.space(); self.expr(tree, e.b); self.end(); },
+            Block => self.block(tree, e.a),
+            If => { self.text("(if "); self.expr(tree, e.a); self.space(); self.block(tree, e.b); if (e.c != ast.NONE) { self.space(); self.expr(tree, e.c); } self.end(); },
+            Match => { self.text("(match "); self.expr(tree, e.a); for (arm in &const e.arms) { self.text(" (arm "); self.pattern(tree, arm.pattern);
+                if (arm.guard != ast.NONE) { self.text(" (if "); self.expr(tree, arm.guard); self.end(); }
+                self.space(); self.expr(tree, arm.body); self.end(); } self.end(); },
+            Closure => {
+                self.text(match e.mode { Shared => "(closure const", Once => "(closure once", Writable => "(closure" }); if (e.is_send) { self.text(" send"); }
+                if (e.explicit_captures) { self.text(" (captures"); for (c in &const e.captures) { self.space();
+                    match c.mode { Shared => self.text("&const "), Writable => self.text("&"), Move => {} } self.raw(c.name); } self.end(); }
+                self.text(" (params"); for (p in &const e.params) { self.text(" ("); if (p.type != ast.NONE) { self.type(tree, p.type); self.space(); } self.raw(p.name); self.end(); } self.end();
+                if (e.a != ast.NONE) { self.text(" (ret "); self.type(tree, e.a); self.end(); } self.space(); self.expr(tree, e.b); self.end();
+            },
+            Unsafe => { self.text("(unsafe "); self.block(tree, e.a); self.end(); },
+            Await => { self.text("(await "); self.expr(tree, e.a); self.end(); },
+            Return => { self.text("(return"); if (e.a != ast.NONE) { self.space(); self.expr(tree, e.a); } self.end(); },
+            Break => self.text("(break)"), Continue => self.text("(continue)"),
+        }
+    }
+    void pattern(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("?"); return; } var p = tree.pattern(id);
+        match p.kind {
+            Wildcard => self.text("_"), Literal => self.expr(tree, p.a), Binding => self.raw(p.text), Path => self.path(p.path),
+            TupleStruct => { self.text("("); self.path(p.path); for (item in &const p.items) { self.space(); self.pattern(tree, *item); } self.end(); },
+            Struct => { self.text("(struct "); self.path(p.path); for (f in &const p.fields) { self.text(" ("); self.raw(f.name);
+                if (f.pattern != ast.NONE) { self.space(); self.pattern(tree, f.pattern); } self.end(); } self.end(); },
+            Tuple => { self.text("(tuple"); for (item in &const p.items) { self.space(); self.pattern(tree, *item); } self.end(); },
+            Or => { self.text("(or"); for (item in &const p.items) { self.space(); self.pattern(tree, *item); } self.end(); },
+            Range => { self.text(if (p.flag) { "(..= " } else { "(.. " }); self.expr(tree, p.a); self.space(); self.expr(tree, p.b); self.end(); },
+        }
+    }
+    void stmt(&self, &const ast.Ast tree, uint id) {
+        var s = tree.stmt(id);
+        match s.kind {
+            VarDecl => { self.text(if (s.flag) { "(const " } else { "(var " }); if (s.a != ast.NONE) { self.type(tree, s.a); self.space(); }
+                self.raw(s.text); if (s.b != ast.NONE) { self.space(); self.expr(tree, s.b); } self.end(); },
+            Expr => self.expr(tree, s.a),
+            Assign => { self.text("("); self.text(assignment(s.assign_op)); self.space(); self.expr(tree, s.a); self.space(); self.expr(tree, s.b); self.end(); },
+            While => { self.text("(while "); self.expr(tree, s.a); self.space(); self.block(tree, s.b); self.end(); },
+            Loop => { self.text("(loop "); self.block(tree, s.a); self.end(); },
+            For => { self.text("(for "); self.pattern(tree, s.a); self.space(); self.expr(tree, s.b); self.space(); self.block(tree, s.c); self.end(); },
+        }
+    }
+    void block(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("?"); return; } var b = tree.block(id);
+        self.text("(block"); for (s in &const b.stmts) { self.space(); self.stmt(tree, *s); }
+        if (b.tail != ast.NONE) { self.text(" (tail "); self.expr(tree, b.tail); self.end(); } self.end();
+    }
+    void function(&self, &const ast.Ast tree, uint id) {
+        var f = tree.function(id); self.text("(fn "); self.raw(f.name);
+        if (f.is_pub) { self.text(" pub"); } if (f.is_async) { self.text(if (f.async_send) { " async send" } else { " async" }); }
+        self.generics(tree, f.generics); if (f.ret != ast.NONE) { self.text(" (ret "); self.type(tree, f.ret); self.end(); }
+        self.text(" (params"); for (p in &const f.params) { self.text(" ("); match p.self_kind {
+            Value => self.text("self"), Ref => self.text("&self"), ConstRef => self.text("&const self"),
+            ast.SelfKind.None => { self.type(tree, p.type); self.space(); self.raw(p.name); }
+        } self.end(); } self.end(); if (f.body != ast.NONE) { self.space(); self.block(tree, f.body); } self.end();
+    }
+    void field(&self, &const ast.Ast tree, &const ast.Field field) {
+        self.text(" (field "); if (field.is_pub) { self.text("pub "); } self.type(tree, field.type); self.space(); self.raw(field.name); self.end();
+    }
+    void methods(&self, &const ast.Ast tree, &const Vec<uint> methods) { for (m in methods) { self.space(); self.function(tree, *m); } }
+    void item(&self, &const ast.Ast tree, &const ast.Item item) {
+        match item.kind {
+            Import => { self.text("(import "); self.path(item.path); if (!item.names.is_empty()) { self.text(" \{");
+                for (i in 0..item.names.len()) { if (i != 0) { self.text(", "); } self.raw(item.names.get(i).unwrap().name); } self.text("\}"); } self.end(); },
+            Const => { self.text("(const "); if (item.is_pub) { self.text("pub "); } if (item.a != ast.NONE) { self.type(tree, item.a); self.space(); }
+                self.raw(item.text); self.space(); self.expr(tree, item.b); self.end(); },
+            Function => self.function(tree, item.function),
+            Struct => { self.text("(struct "); self.raw(item.text); if (item.is_pub) { self.text(" pub"); } self.generics(tree, item.generics);
+                for (f in &const item.fields) { self.field(tree, f); } self.methods(tree, item.methods); self.end(); },
+            Enum => { self.text("(enum "); self.raw(item.text); if (item.is_pub) { self.text(" pub"); } self.generics(tree, item.generics);
+                for (v in &const item.variants) { self.text(" (variant "); self.raw(v.name); for (t in &const v.tuple_types) { self.space(); self.type(tree, *t); }
+                    for (f in &const v.fields) { self.field(tree, f); } self.end(); } self.methods(tree, item.methods); self.end(); },
+            Trait => { self.text("(trait "); self.raw(item.text); if (item.is_pub) { self.text(" pub"); } self.generics(tree, item.generics); self.methods(tree, item.methods); self.end(); },
+            Impl => { self.text(if (item.is_unsafe) { "(unsafe impl" } else { "(impl" }); self.generics(tree, item.generics); self.space(); self.bound(tree, item.bound);
+                self.text(" for "); self.type(tree, item.a); self.methods(tree, item.methods); self.end(); },
+            Extern => { self.text("(extern "); self.quoted(item.text); self.methods(tree, item.methods); self.end(); },
+        }
+    }
+}
+pub Vec<byte> module(&const ast.Ast tree) {
+    var writer = Writer { out: Vec.new() }; for (i in 0..tree.items.len()) { if (i != 0) { writer.out.push(10); } writer.item(tree, tree.items.get(i).unwrap()); }
+    return writer.out;
+}

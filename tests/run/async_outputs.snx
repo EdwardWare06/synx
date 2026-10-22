@@ -1,0 +1,20 @@
+import std.task.{block_on,yield_now};
+async fn once() -> String make_callback() {
+    var text=String.from("ready");
+    await yield_now();
+    return once || text;
+}
+async float floating(float value) { await yield_now(); return value+0.5f; }
+struct TextFuture { String? value; }
+impl Future<String> for TextFuture {
+    Poll<String> poll(&self,Waker wake) { return Poll.Ready(self.value.take().unwrap()); }
+}
+async String dynamic_text(&dyn Future<String> value) { return await value; }
+main() {
+    var call=block_on(make_callback()); print("callback {call()}");
+    if (block_on(floating(1.5f)) != 2.0f) { panic("async float result failed"); }
+    print("float ready");
+    var future=TextFuture { value:Some(String.from("dynamic string")) };
+    &dyn Future<String> view=&future;
+    print("{block_on(dynamic_text(view))}");
+}

@@ -1,0 +1,62 @@
+// Regressions for operator traits, once-closure captures, receivers
+// returned by calls, and indexed call destinations.
+
+struct Weight {
+    int pounds;
+}
+
+impl Eq for Weight {
+    bool eq(&const self, &const Weight other) { return self.pounds == other.pounds; }
+}
+
+impl Ord for Weight {
+    bool lt(&const self, &const Weight other) {
+        print("lt {self.pounds} {other.pounds}");
+        return self.pounds < other.pounds;
+    }
+}
+
+impl Neg for Weight {
+    Weight neg(self) { return Weight { pounds: 0 - self.pounds }; }
+}
+
+Weight make(int pounds) {
+    print("make {pounds}");
+    return Weight { pounds: pounds };
+}
+
+struct Handle {
+    int value;
+    int take(self) { return self.value; }
+}
+
+impl Drop for Handle {
+    void drop(&self) {}
+}
+
+&const Option<int> pick(&const Option<int> x) { return x; }
+
+int main() {
+    // a > b calls b.lt(a) and a <= b is !(b.lt(a)); operands run left to right.
+    print("{make(225) > make(245)}");
+    print("{make(225) <= make(245)}");
+    var heavy = Weight { pounds: 315 };
+    var light = Weight { pounds: 135 };
+    print("{heavy > light} {heavy <= light} {light < heavy} {light >= heavy}");
+
+    var negative = -Weight { pounds: 45 };
+    print("{negative.pounds}");
+
+    var title = String.from("Teardrop");
+    var once_text = once || "{title}!{title.len()}";
+    print(once_text());
+
+    Option<int> stored = Some(42);
+    print("{pick(&const stored).unwrap()}");
+
+    int[4] parts = [0; 4];
+    var handle = Handle { value: 7 };
+    parts[2] = handle.take();
+    print("{parts[0]} {parts[1]} {parts[2]} {parts[3]}");
+    return 0;
+}

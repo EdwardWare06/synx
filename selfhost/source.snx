@@ -1,0 +1,60 @@
+/// Source bytes and positions. Source: compiler/src/source.cpp.
+/// Parity: tests/selfhost_lexer_test.cpp. Positions count bytes.
+import bytes;
+import std.fs;
+
+pub struct Span {
+    pub uint start;
+    pub uint end;
+    pub uint file;
+    pub uint length(&const self) { return self.end - self.start; }
+    pub Span merge(Span a, Span b) {
+        return Span { start: if (a.start < b.start) { a.start } else { b.start },
+            end: if (a.end > b.end) { a.end } else { b.end }, file: a.file };
+    }
+}
+pub struct LineCol { pub uint line; pub uint col; }
+pub struct SourceFile {
+    pub uint id;
+    String path;
+    Vec<byte> data;
+    Vec<uint> starts;
+
+    /// Takes ownership. Accepts malformed UTF-8. Panics above the span limit.
+    pub SourceFile new(String path, Vec<byte> data, uint id) {
+        if (data.len() > 4294967291) { panic("source exceeds span limit"); }
+        Vec<uint> starts = Vec.new(); starts.push(0);
+        for (i in 0..data.len()) { if (bytes.at(data, i) == 10) { starts.push((i + 1) as uint); } }
+        return SourceFile { id: id, path: path, data: data, starts: starts };
+    }
+    pub Result<SourceFile, fs.IoError> load(&const str path, uint id) {
+        match fs.read(path) {
+            Ok(data) => return Ok(SourceFile.new(String.from(path), data, id)),
+            Err(error) => return Err(error),
+        }
+    }
+    pub &const str path(&const self) { return self.path.as_str(); }
+    pub &const Vec<byte> data(&const self) { return &const self.data; }
+    pub uint line_count(&const self) { return self.starts.len() as uint; }
+    /// Clamps offsets to EOF. Returns one-based line and byte column.
+    pub LineCol line_col(&const self, uint offset) {
+        uint position = if ((offset as usize) > self.data.len()) { self.data.len() as uint } else { offset };
+        usize low = 0; usize high = self.starts.len();
+        while (low < high) {
+            usize mid = low + (high - low) / 2;
+            uint start = *self.starts.get(mid).unwrap();
+            if (start <= position) { low = mid + 1; } else { high = mid; }
+        }
+        uint start = *self.starts.get(low - 1).unwrap();
+        return LineCol { line: low as uint, col: position - start + 1 };
+    }
+    /// Returns owned bytes without trailing CR/LF. Invalid line numbers return empty.
+    pub Vec<byte> line_text(&const self, uint line) {
+        if (line == 0 || (line as usize) > self.starts.len()) { return Vec.new(); }
+        uint start = *self.starts.get((line - 1) as usize).unwrap();
+        uint end = self.data.len() as uint;
+        if ((line as usize) < self.starts.len()) { end = *self.starts.get(line as usize).unwrap(); }
+        while (end > start && (bytes.at(self.data, (end - 1) as usize) == 10 || bytes.at(self.data, (end - 1) as usize) == 13)) { end -= 1; }
+        return bytes.copy(self.data, start as usize, end as usize);
+    }
+}

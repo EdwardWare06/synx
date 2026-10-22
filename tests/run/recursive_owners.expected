@@ -1,0 +1,46 @@
+scalar
+extracted 10
+ticket 10
+ticket 12
+ticket 11
+empty
+ticket 20
+node
+ticket 30
+node
+ticket 31
+node
+ticket 32
+ticket 3
+ticket 2
+ticket 1
+ticket 40
+ticket 41
+ticket 42
+ticket 50
+ticket 51
+ticket 52
+ticket 53
+ticket 54
+ticket 55
+consume 56
+ticket 56
+ticket 57
+ticket 60
+ticket 61
+replaced
+ticket 62
+captured
+node
+node
+in place
+ticket 70
+ticket 71
+enum
+ticket 80
+empty
+empty
+ticket 90
+deep 1024
+ticket 100
+done

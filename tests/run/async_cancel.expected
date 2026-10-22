@@ -1,0 +1,15 @@
+drop 10
+drop 21
+drop 20
+drop 32
+drop 31
+drop 30
+read 40
+drop 40
+drop 50
+drop 60
+body 70
+drop 70
+read 80
+drop 80
+complete

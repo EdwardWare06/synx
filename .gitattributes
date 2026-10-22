@@ -1,0 +1,11 @@
+* text=auto
+*.snx text eol=lf
+*.expected text eol=lf
+*.sh text eol=lf
+*.cmd text eol=crlf
+
+# Exact bytes matter for EOF and CRLF input fixtures.
+*.stdin binary
+scripts/synx text eol=lf
+# Preserve the exact bytes of the former embedded bootstrap prelude.
+compiler/prelude.snx whitespace=-blank-at-eof

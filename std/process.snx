@@ -1,0 +1,52 @@
+import std.fs.{IoError};
+
+extern "C" {
+    void synx_rt_exit(int code);
+    int synx_rt_command(*const byte blob, usize length, usize count, &long status);
+}
+pub void exit(int code) { unsafe { synx_rt_exit(code); } }
+
+/// A normal exit code or a POSIX termination signal. Windows uses an unsigned
+/// 32-bit process exit code. Only one field has a value.
+pub struct ExitStatus {
+    pub ulong? code;
+    pub int? signal;
+    pub bool success(&const self) {
+        match self.code { Some(code) => return code == 0, None => return false }
+    }
+}
+
+/// Run an executable with separate arguments. No shell expansion occurs.
+/// The child inherits the environment, working directory, and standard streams.
+/// status waits for the child and can run on a blocking pool or an OS thread.
+pub struct Command {
+    String program;
+    Vec<String> arguments;
+    pub Command new(&const str program) {
+        return Command { program: String.from(program), arguments: Vec.new() };
+    }
+    pub void arg(&self, &const str argument) { self.arguments.push(String.from(argument)); }
+    pub Result<ExitStatus, IoError> status(&const self) {
+        Vec<byte> bytes = Vec.new();
+        for (i in 0..self.program.len()) {
+            byte b = unsafe { *((self.program.as_str().as_ptr() as usize + i) as *const byte) };
+            // The adapter also rejects a malformed argument list.
+            if (b == 0) { return Err(IoError { kind: std.fs.ErrorKind.InvalidInput, os_code: 0 }); }
+            bytes.push(b);
+        }
+        bytes.push(0);
+        for (argument in &const self.arguments) {
+            for (i in 0..argument.len()) {
+                byte b = unsafe { *((argument.as_str().as_ptr() as usize + i) as *const byte) };
+                if (b == 0) { return Err(IoError { kind: std.fs.ErrorKind.InvalidInput, os_code: 0 }); }
+                bytes.push(b);
+            }
+            bytes.push(0);
+        }
+        long status = 0;
+        int error = unsafe { synx_rt_command(bytes.as_ptr(), bytes.len(), self.arguments.len() + 1, &status) };
+        if (error != 0) { return Err(IoError.from_os(error)); }
+        if (status < 0) { return Ok(ExitStatus { code: None, signal: Some((-status) as int) }); }
+        return Ok(ExitStatus { code: Some(status as ulong), signal: None });
+    }
+}

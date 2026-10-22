@@ -1,0 +1,2 @@
+import holder;
+pub int read() { var value = holder.Unit { n: 31 }; return value.read(); }

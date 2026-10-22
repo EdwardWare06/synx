@@ -1,0 +1,1 @@
+main() { long a = -9223372036854775808; long b = -1; long result = a / b; if (result != -9223372036854775808) { panic("wrong release result"); } }

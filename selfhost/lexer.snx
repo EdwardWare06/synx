@@ -1,0 +1,366 @@
+/// Lexer state machine. Source: compiler/src/lexer.cpp.
+/// Parity: tests/selfhost_lexer_test.cpp. Preserves recovery and token payloads.
+import bytes;
+import source.{SourceFile, Span};
+import diagnostics.{DiagnosticSink, Severity};
+import token.{Kind, Token, keyword};
+
+extern "C" { int synx_rt_parse_double(*const byte data, usize length, &double value); }
+
+bool digit(byte c) { return c >= 48 && c <= 57; }
+bool ident_start(byte c) { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c >= 128; }
+bool ident_char(byte c) { return ident_start(c) || digit(c); }
+bool hex_digit(byte c) { return digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70); }
+uint hex_value(byte c) {
+    if (digit(c)) { return (c - 48) as uint; }
+    if (c >= 97 && c <= 102) { return (c - 97) as uint + 10; }
+    return (c - 65) as uint + 10;
+}
+void append_utf8(&Vec<byte> output, uint cp) {
+    if (cp < 128) { output.push(cp as byte); }
+    else if (cp < 2048) { output.push((192 | (cp >> 6)) as byte); output.push((128 | (cp & 63)) as byte); }
+    else if (cp < 65536) {
+        output.push((224 | (cp >> 12)) as byte); output.push((128 | ((cp >> 6) & 63)) as byte); output.push((128 | (cp & 63)) as byte);
+    } else {
+        output.push((240 | (cp >> 18)) as byte); output.push((128 | ((cp >> 12) & 63)) as byte);
+        output.push((128 | ((cp >> 6) & 63)) as byte); output.push((128 | (cp & 63)) as byte);
+    }
+}
+struct Decoded { uint cp; uint length; }
+// Match the bootstrap decoder, including its acceptance of overlong sequences.
+Decoded decode_utf8(&const Vec<byte> data, usize start) {
+    if (start >= data.len()) { return Decoded { cp: 0, length: 0 }; }
+    byte c = bytes.at(data, start); uint length = 0; uint cp = 0;
+    if (c < 128) { return Decoded { cp: c as uint, length: 1 }; }
+    if ((c & 224) == 192) { length = 2; cp = (c & 31) as uint; }
+    else if ((c & 240) == 224) { length = 3; cp = (c & 15) as uint; }
+    else if ((c & 248) == 240) { length = 4; cp = (c & 7) as uint; }
+    else { return Decoded { cp: 0, length: 0 }; }
+    if (data.len() - start < length as usize) { return Decoded { cp: cp, length: 0 }; }
+    for (i in 1..length) {
+        byte next = bytes.at(data, start + i as usize);
+        if ((next & 192) != 128) { return Decoded { cp: cp, length: 0 }; }
+        cp = (cp << 6) | ((next & 63) as uint);
+    }
+    return Decoded { cp: cp, length: length };
+}
+
+struct Scanner {
+    uint pos;
+    bool in_string;
+    Vec<int> frames;
+
+    byte peek(&const self, &const SourceFile file, uint ahead) { return bytes.at(file.data(), self.pos as usize + ahead as usize); }
+    bool at_end(&const self, &const SourceFile file) { return self.pos as usize >= file.data().len(); }
+    Token make(&const self, &const SourceFile file, Kind kind, uint start) {
+        return Token.new(kind, Span { start: start, end: self.pos, file: file.id });
+    }
+    Token emit(&self, &const SourceFile file, Kind kind, uint start, uint length) { self.pos += length; return self.make(file, kind, start); }
+    Token error_bytes(&self, &const SourceFile file, &DiagnosticSink sink, uint start, Vec<byte> message, &const str code) {
+        var span = Span { start: start, end: if (self.pos > start) { self.pos } else { start + 1 }, file: file.id };
+        var data = bytes.copy(message, 0, message.len());
+        sink.add(Severity.Error, span, data, String.from(code));
+        var result = self.make(file, Kind.Error, start); result.text = message; return result;
+    }
+    Token error(&self, &const SourceFile file, &DiagnosticSink sink, uint start, &const str message, &const str code) {
+        Vec<byte> data = Vec.new(); bytes.text(&data, message); return self.error_bytes(file, &*sink, start, data, code);
+    }
+    void report(&self, &const SourceFile file, &DiagnosticSink sink, uint start, uint end, &const str message) {
+        sink.error(Span { start: start, end: end, file: file.id }, message, "");
+    }
+    void skip_block_comment(&self, &const SourceFile file, &DiagnosticSink sink) {
+        uint start = self.pos; self.pos += 2; int depth = 1;
+        while (!self.at_end(file) && depth > 0) {
+            if (self.peek(file, 0) == 47 && self.peek(file, 1) == 42) { self.pos += 2; depth += 1; }
+            else if (self.peek(file, 0) == 42 && self.peek(file, 1) == 47) { self.pos += 2; depth -= 1; }
+            else { self.pos += 1; }
+        }
+        if (depth > 0) { self.report(file, &*sink, start, start + 2, "unterminated block comment"); }
+    }
+    void skip(&self, &const SourceFile file, &DiagnosticSink sink) {
+        loop {
+            byte c = self.peek(file, 0);
+            if (c == 32 || c == 9 || c == 13 || c == 10) { self.pos += 1; }
+            else if (c == 47 && self.peek(file, 1) == 47 && (self.peek(file, 2) != 47 || self.peek(file, 3) == 47)) {
+                while (!self.at_end(file) && self.peek(file, 0) != 10) { self.pos += 1; }
+            } else if (c == 47 && self.peek(file, 1) == 42) { self.skip_block_comment(file, &*sink); }
+            else { return; }
+        }
+    }
+    Token doc_comment(&self, &const SourceFile file, uint start) {
+        Vec<byte> body = Vec.new();
+        loop {
+            self.pos += 3; if (self.peek(file, 0) == 32) { self.pos += 1; }
+            uint line_start = self.pos;
+            while (!self.at_end(file) && self.peek(file, 0) != 10) { self.pos += 1; }
+            var line = bytes.copy(file.data(), line_start as usize, self.pos as usize); bytes.append(&body, line);
+            uint save = self.pos;
+            while (self.peek(file, 0) == 10 || self.peek(file, 0) == 13 || self.peek(file, 0) == 32 || self.peek(file, 0) == 9) { self.pos += 1; }
+            if (self.peek(file, 0) == 47 && self.peek(file, 1) == 47 && self.peek(file, 2) == 47 && self.peek(file, 3) != 47) { body.push(10); continue; }
+            self.pos = save; break;
+        }
+        var result = self.make(file, Kind.DocComment, start); result.text = body; return result;
+    }
+    Token identifier(&self, &const SourceFile file, uint start) {
+        while (ident_char(self.peek(file, 0))) { self.pos += 1; }
+        var word = bytes.copy(file.data(), start as usize, self.pos as usize);
+        var kind = keyword(word); var result = self.make(file, kind, start);
+        if (kind == Kind.Ident) { result.text = word; }
+        return result;
+    }
+    Token number(&self, &const SourceFile file, &DiagnosticSink sink, uint start) {
+        Vec<byte> digits = Vec.new(); ulong base = 10; bool floating = false;
+        if (self.peek(file, 0) == 48 && (self.peek(file, 1) == 120 || self.peek(file, 1) == 88)) {
+            base = 16; self.pos += 2;
+            while (hex_digit(self.peek(file, 0)) || self.peek(file, 0) == 95) {
+                if (self.peek(file, 0) != 95) { digits.push(self.peek(file, 0)); } self.pos += 1;
+            }
+        } else if (self.peek(file, 0) == 48 && (self.peek(file, 1) == 98 || self.peek(file, 1) == 66)) {
+            base = 2; self.pos += 2;
+            while (self.peek(file, 0) == 48 || self.peek(file, 0) == 49 || self.peek(file, 0) == 95) {
+                if (self.peek(file, 0) != 95) { digits.push(self.peek(file, 0)); } self.pos += 1;
+            }
+        } else {
+            while (digit(self.peek(file, 0)) || self.peek(file, 0) == 95) {
+                if (self.peek(file, 0) != 95) { digits.push(self.peek(file, 0)); } self.pos += 1;
+            }
+            if (self.peek(file, 0) == 46 && digit(self.peek(file, 1))) {
+                floating = true; digits.push(46); self.pos += 1;
+                while (digit(self.peek(file, 0)) || self.peek(file, 0) == 95) {
+                    if (self.peek(file, 0) != 95) { digits.push(self.peek(file, 0)); } self.pos += 1;
+                }
+            }
+            if (self.peek(file, 0) == 101 || self.peek(file, 0) == 69) {
+                byte sign = self.peek(file, 1); uint after = if (sign == 43 || sign == 45) { 2 } else { 1 };
+                if (digit(self.peek(file, after))) {
+                    floating = true; digits.push(101); if (after == 2) { digits.push(sign); } self.pos += after;
+                    while (digit(self.peek(file, 0))) { digits.push(self.peek(file, 0)); self.pos += 1; }
+                }
+            }
+        }
+        if (digits.is_empty()) { return self.error(file, &*sink, start, "number has no digits", ""); }
+        Kind kind = Kind.IntLit;
+        if (self.peek(file, 0) == 102 || self.peek(file, 0) == 70) { self.pos += 1; kind = Kind.FloatLit; floating = true; }
+        else if (self.peek(file, 0) == 76) {
+            self.pos += 1; if (floating) { return self.error(file, &*sink, start, "L suffix is only valid on an integer literal", ""); }
+            kind = Kind.LongLit;
+        } else { kind = if (floating) { Kind.DoubleLit } else { Kind.IntLit }; }
+        if (ident_char(self.peek(file, 0))) {
+            while (ident_char(self.peek(file, 0))) { self.pos += 1; }
+            return self.error(file, &*sink, start, "invalid suffix on number literal", "");
+        }
+        var result = self.make(file, kind, start);
+        result.text = bytes.copy(file.data(), start as usize, self.pos as usize);
+        if (floating) {
+            if (base != 10) { return self.error(file, &*sink, start, "float literal must be decimal", ""); }
+            double value = 0.0;
+            int status = unsafe { synx_rt_parse_double(digits.as_ptr(), digits.len(), &value) };
+            if (status != 0) { return self.error(file, &*sink, start, "float literal out of range", ""); }
+            result.float_value = value; return result;
+        }
+        ulong value = 0;
+        for (d in &const digits) {
+            ulong v = hex_value(*d) as ulong;
+            if (value > (18446744073709551615 - v) / base) { return self.error(file, &*sink, start, "integer literal too large", ""); }
+            value = value * base + v;
+        }
+        result.int_value = value; return result;
+    }
+    bool escape(&self, &const SourceFile file, &DiagnosticSink sink, &Vec<byte> output) {
+        uint start = self.pos; self.pos += 1; byte c = self.peek(file, 0); self.pos += 1;
+        match c {
+            110 => { output.push(10); return true; }
+            116 => { output.push(9); return true; }
+            114 => { output.push(13); return true; }
+            48 => { output.push(0); return true; }
+            92 => { output.push(92); return true; }
+            39 => { output.push(39); return true; }
+            34 => { output.push(34); return true; }
+            123 => { output.push(123); return true; }
+            125 => { output.push(125); return true; }
+            117 => {
+                if (self.peek(file, 0) != 123) { self.report(file, &*sink, start, self.pos, "expected '\{' after \\u"); return false; }
+                self.pos += 1; uint cp = 0; int count = 0;
+                while (hex_digit(self.peek(file, 0))) {
+                    cp = (cp << 4) | hex_value(self.peek(file, 0)); self.pos += 1; count += 1; if (count > 6) { break; }
+                }
+                if (self.peek(file, 0) != 125 || count == 0 || count > 6 || cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
+                    while (!self.at_end(file) && self.peek(file, 0) != 125 && self.peek(file, 0) != 34 && self.peek(file, 0) != 10) { self.pos += 1; }
+                    if (self.peek(file, 0) == 125) { self.pos += 1; }
+                    self.report(file, &*sink, start, self.pos, "invalid unicode escape"); return false;
+                }
+                self.pos += 1; append_utf8(&*output, cp); return true;
+            }
+            _ => { self.report(file, &*sink, start, self.pos, "unknown escape sequence"); return false; }
+        }
+    }
+    Token character(&self, &const SourceFile file, &DiagnosticSink sink, uint start) {
+        self.pos += 1; Vec<byte> decoded = Vec.new();
+        if (self.peek(file, 0) == 92) {
+            if (!self.escape(file, &*sink, &decoded)) {
+                while (!self.at_end(file) && self.peek(file, 0) != 39 && self.peek(file, 0) != 10) { self.pos += 1; }
+                if (self.peek(file, 0) == 39) { self.pos += 1; } return self.make(file, Kind.Error, start);
+            }
+        } else if (self.peek(file, 0) == 39 || self.peek(file, 0) == 10 || self.at_end(file)) { return self.error(file, &*sink, start, "empty char literal", ""); }
+        else {
+            var decoded_cp = decode_utf8(file.data(), self.pos as usize);
+            if (decoded_cp.length == 0) { self.pos += 1; return self.error(file, &*sink, start, "invalid UTF-8 in char literal", ""); }
+            decoded = bytes.copy(file.data(), self.pos as usize, (self.pos + decoded_cp.length) as usize);
+            self.pos += decoded_cp.length;
+        }
+        if (self.peek(file, 0) != 39) {
+            while (!self.at_end(file) && self.peek(file, 0) != 39 && self.peek(file, 0) != 10) { self.pos += 1; }
+            if (self.peek(file, 0) == 39) { self.pos += 1; }
+            return self.error(file, &*sink, start, "char literal must contain exactly one character", "");
+        }
+        self.pos += 1; var cp = decode_utf8(decoded, 0); var result = self.make(file, Kind.CharLit, start);
+        result.int_value = cp.cp as ulong; result.text = decoded; return result;
+    }
+    Token string_open(&self, &const SourceFile file, &DiagnosticSink sink, uint start) {
+        bool interpolated = false; usize i = self.pos as usize + 1;
+        while (i < file.data().len()) {
+            byte c = bytes.at(file.data(), i);
+            if (c == 92) {
+                if (i + 2 < file.data().len() && bytes.at(file.data(), i + 1) == 117 && bytes.at(file.data(), i + 2) == 123) {
+                    i += 2;
+                    while (i < file.data().len() && bytes.at(file.data(), i) != 125 && bytes.at(file.data(), i) != 34 && bytes.at(file.data(), i) != 10) { i += 1; }
+                } else { i += 1; }
+                i += 1; continue;
+            }
+            if (c == 34 || c == 10) { break; }
+            if (c == 123) {
+                if (i + 1 < file.data().len() && bytes.at(file.data(), i + 1) == 123) { i += 2; continue; }
+                interpolated = true; break;
+            }
+            i += 1;
+        }
+        if (interpolated) { self.pos += 1; self.in_string = true; return self.make(file, Kind.StringStart, start); }
+        self.pos += 1; Vec<byte> decoded = Vec.new(); bool ok = true;
+        loop {
+            if (self.at_end(file) || self.peek(file, 0) == 10) { return self.error(file, &*sink, start, "unterminated string literal", "SNX0102"); }
+            byte c = self.peek(file, 0);
+            if (c == 34) { self.pos += 1; break; }
+            if (c == 92) { if (!self.escape(file, &*sink, &decoded)) { ok = false; } continue; }
+            if (c == 123 && self.peek(file, 1) == 123) { decoded.push(123); self.pos += 2; continue; }
+            if (c == 125 && self.peek(file, 1) == 125) { decoded.push(125); self.pos += 2; continue; }
+            if (c == 125) { self.report(file, &*sink, self.pos, self.pos + 1, "unmatched '\}' in string, write '\}\}' for a literal brace"); self.pos += 1; ok = false; continue; }
+            decoded.push(c); self.pos += 1;
+        }
+        if (!ok) { return self.make(file, Kind.Error, start); }
+        var result = self.make(file, Kind.StringLit, start); result.text = decoded; return result;
+    }
+    Token string_part(&self, &const SourceFile file, &DiagnosticSink sink) {
+        uint start = self.pos;
+        if (self.at_end(file) || self.peek(file, 0) == 10) {
+            self.in_string = false; self.frames.clear(); return self.error(file, &*sink, start, "unterminated string literal", "SNX0102");
+        }
+        if (self.peek(file, 0) == 34) { self.pos += 1; self.in_string = false; return self.make(file, Kind.StringEnd, start); }
+        if (self.peek(file, 0) == 123 && self.peek(file, 1) != 123) {
+            self.pos += 1; self.in_string = false; self.frames.push(0); return self.make(file, Kind.InterpStart, start);
+        }
+        Vec<byte> decoded = Vec.new(); bool ok = true;
+        loop {
+            if (self.at_end(file) || self.peek(file, 0) == 10 || self.peek(file, 0) == 34) { break; }
+            byte c = self.peek(file, 0);
+            if (c == 123) {
+                if (self.peek(file, 1) == 123) { decoded.push(123); self.pos += 2; continue; }
+                break;
+            }
+            if (c == 125 && self.peek(file, 1) == 125) { decoded.push(125); self.pos += 2; continue; }
+            if (c == 125) { self.report(file, &*sink, self.pos, self.pos + 1, "unmatched '\}' in string, write '\}\}' for a literal brace"); self.pos += 1; ok = false; continue; }
+            if (c == 92) { if (!self.escape(file, &*sink, &decoded)) { ok = false; } continue; }
+            decoded.push(c); self.pos += 1;
+        }
+        if (!ok) { return self.make(file, Kind.Error, start); }
+        var result = self.make(file, Kind.StringText, start); result.text = decoded; return result;
+    }
+    Token next(&self, &const SourceFile file, &DiagnosticSink sink) {
+        if (self.in_string) { return self.string_part(file, &*sink); }
+        self.skip(file, &*sink); uint start = self.pos;
+        if (self.at_end(file)) { return self.make(file, Kind.Eof, start); }
+        byte c = self.peek(file, 0);
+        if (c == 47 && self.peek(file, 1) == 47 && self.peek(file, 2) == 47) { return self.doc_comment(file, start); }
+        if (ident_start(c)) { return self.identifier(file, start); }
+        if (digit(c)) { return self.number(file, &*sink, start); }
+        if (c == 39) { return self.character(file, &*sink, start); }
+        if (c == 34) { return self.string_open(file, &*sink, start); }
+        byte second = self.peek(file, 1); byte third = self.peek(file, 2);
+        match c {
+            123 => {
+                if (!self.frames.is_empty()) { var frame = self.frames.get_mut(self.frames.len() - 1).unwrap(); *frame += 1; }
+                return self.emit(file, Kind.LBrace, start, 1);
+            }
+            125 => {
+                if (!self.frames.is_empty()) {
+                    int depth = *self.frames.get(self.frames.len() - 1).unwrap();
+                    if (depth == 0) { var removed = self.frames.pop(); self.in_string = true; return self.emit(file, Kind.InterpEnd, start, 1); }
+                    var frame = self.frames.get_mut(self.frames.len() - 1).unwrap(); *frame -= 1;
+                }
+                return self.emit(file, Kind.RBrace, start, 1);
+            }
+            40 => return self.emit(file, Kind.LParen, start, 1),
+            41 => return self.emit(file, Kind.RParen, start, 1),
+            91 => return self.emit(file, Kind.LBracket, start, 1),
+            93 => return self.emit(file, Kind.RBracket, start, 1),
+            44 => return self.emit(file, Kind.Comma, start, 1),
+            59 => return self.emit(file, Kind.Semi, start, 1),
+            126 => return self.emit(file, Kind.Tilde, start, 1),
+            58 => { if (second == 58) { return self.emit(file, Kind.ColonColon, start, 2); } return self.emit(file, Kind.Colon, start, 1); }
+            43 => { if (second == 61) { return self.emit(file, Kind.PlusEq, start, 2); } return self.emit(file, Kind.Plus, start, 1); }
+            42 => { if (second == 61) { return self.emit(file, Kind.StarEq, start, 2); } return self.emit(file, Kind.Star, start, 1); }
+            47 => { if (second == 61) { return self.emit(file, Kind.SlashEq, start, 2); } return self.emit(file, Kind.Slash, start, 1); }
+            37 => { if (second == 61) { return self.emit(file, Kind.PercentEq, start, 2); } return self.emit(file, Kind.Percent, start, 1); }
+            33 => { if (second == 61) { return self.emit(file, Kind.BangEq, start, 2); } return self.emit(file, Kind.Bang, start, 1); }
+            94 => { if (second == 61) { return self.emit(file, Kind.CaretEq, start, 2); } return self.emit(file, Kind.Caret, start, 1); }
+            46 => {
+                if (second == 46) { if (third == 61) { return self.emit(file, Kind.DotDotEq, start, 3); } return self.emit(file, Kind.DotDot, start, 2); }
+                return self.emit(file, Kind.Dot, start, 1);
+            }
+            63 => {
+                if (second == 46) { return self.emit(file, Kind.QuestionDot, start, 2); }
+                if (second == 63) { return self.emit(file, Kind.QuestionQuestion, start, 2); } return self.emit(file, Kind.Question, start, 1);
+            }
+            45 => {
+                if (second == 62) { return self.emit(file, Kind.Arrow, start, 2); }
+                if (second == 61) { return self.emit(file, Kind.MinusEq, start, 2); } return self.emit(file, Kind.Minus, start, 1);
+            }
+            61 => {
+                if (second == 61) { return self.emit(file, Kind.EqEq, start, 2); }
+                if (second == 62) { return self.emit(file, Kind.FatArrow, start, 2); } return self.emit(file, Kind.Eq, start, 1);
+            }
+            60 => {
+                if (second == 60) { if (third == 61) { return self.emit(file, Kind.ShlEq, start, 3); } return self.emit(file, Kind.Shl, start, 2); }
+                if (second == 61) { return self.emit(file, Kind.LtEq, start, 2); } return self.emit(file, Kind.Lt, start, 1);
+            }
+            62 => {
+                if (second == 62 && third == 61) { return self.emit(file, Kind.ShrEq, start, 3); }
+                if (second == 61) { return self.emit(file, Kind.GtEq, start, 2); } return self.emit(file, Kind.Gt, start, 1);
+            }
+            38 => {
+                if (second == 38) { return self.emit(file, Kind.AmpAmp, start, 2); }
+                if (second == 61) { return self.emit(file, Kind.AmpEq, start, 2); } return self.emit(file, Kind.Amp, start, 1);
+            }
+            124 => {
+                if (second == 124) { return self.emit(file, Kind.PipePipe, start, 2); }
+                if (second == 61) { return self.emit(file, Kind.PipeEq, start, 2); } return self.emit(file, Kind.Pipe, start, 1);
+            }
+            _ => {}
+        }
+        var decoded = decode_utf8(file.data(), self.pos as usize);
+        self.pos += if (decoded.length == 0) { 1 } else { decoded.length };
+        Vec<byte> message = Vec.new(); bytes.text(&message, "unexpected character '");
+        var raw = bytes.copy(file.data(), start as usize, self.pos as usize); bytes.append(&message, raw); message.push(39);
+        return self.error_bytes(file, &*sink, start, message, "SNX0101");
+    }
+}
+/// Appends diagnostics to sink. Returns owned tokens ending in Eof.
+/// Borrows file and sink only for this call. Does not validate source UTF-8.
+pub Vec<Token> tokenize(&const SourceFile file, &DiagnosticSink sink) {
+    var scanner = Scanner { pos: 0, in_string: false, frames: Vec.new() };
+    Vec<Token> result = Vec.new();
+    loop {
+        var next = scanner.next(file, &*sink); bool done = next.kind == Kind.Eof;
+        result.push(next); if (done) { break; }
+    }
+    return result;
+}

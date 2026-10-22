@@ -1,0 +1,19 @@
+struct Holder {
+    String text;
+    int tag;
+}
+impl Drop for Holder { void drop(&self) { print("drop {self.tag}"); } }
+Holder make(int tag) {
+    return Holder { text: String.from(if (tag == 2) { "end" } else { "owned" }), tag: tag };
+}
+bool equal() { return String.from("same") == String.from("same"); }
+main() {
+    if (!equal()) { panic("comparison failed"); }
+    { bool same = make(7).text == String.from("owned"); if (!same) { panic("field comparison failed"); } print("compared"); }
+    int i = 0;
+    while (make(i).text == String.from("owned")) { print("body {i}"); i += 1; }
+    i = 3;
+    while (make(i).text == String.from("owned")) { i += 1; if (i == 4) { continue; } break; }
+    while (make(2).text == String.from("owned")) { panic("false loop entered"); }
+    print("cleanup complete");
+}

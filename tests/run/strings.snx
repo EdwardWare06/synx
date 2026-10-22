@@ -1,0 +1,19 @@
+main() {
+    String s = String.from("ab");
+    s.push_str("cd");
+    s.push('e');
+    s.push('é');
+    print("{s} {s.len()} {s.is_empty()}");
+    Vec<int> v = Vec.new();
+    for (i in 0..5) { v.push(i * i); }
+    int total = 0;
+    for (x in &const v) { total += *x; }
+    print("{v.len()} {total} {v[3]}");
+    var last = v.pop() ?? -1;
+    print("{last} {v.len()}");
+    Vec<String> names = Vec.new();
+    names.push(String.from("ada"));
+    names.push(String.from("grace"));
+    for (n in &const names) { print(n); }
+    print("{names.len()}");
+}

@@ -1,0 +1,26 @@
+/// Byte-buffer operations. Source: compiler/src/source.cpp and lexer.cpp.
+/// Parity: tests/selfhost_lexer_test.cpp.
+/// Returns zero outside the buffer. Embedded zero bytes remain source data.
+pub byte at(&const Vec<byte> data, usize index) {
+    if (index >= data.len()) { return 0; }
+    return unsafe { *((data.as_ptr() as usize + index) as *const byte) };
+}
+pub Vec<byte> copy(&const Vec<byte> data, usize start, usize end) {
+    if (start > end || end > data.len()) { panic("invalid byte range"); }
+    Vec<byte> result = Vec.new();
+    for (i in start..end) { result.push(at(data, i)); }
+    return result;
+}
+pub void append(&Vec<byte> output, &const Vec<byte> data) {
+    for (b in data) { output.push(*b); }
+}
+pub void text(&Vec<byte> output, &const str value) {
+    for (i in 0..value.len()) { output.push(unsafe { *((value.as_ptr() as usize + i) as *const byte) }); }
+}
+pub bool equals(&const Vec<byte> data, &const str value) {
+    if (data.len() != value.len()) { return false; }
+    for (i in 0..data.len()) {
+        if (at(data, i) != unsafe { *((value.as_ptr() as usize + i) as *const byte) }) { return false; }
+    }
+    return true;
+}

@@ -1,0 +1,46 @@
+import std.task.pool.{Executor,BlockingPool};
+import std.task.{block_on,block_on_send,LocalExecutor};
+import std.time.{TimerService,TimerSpawner,Sleep,TimeoutError};
+import std.sync.{Arc,AtomicBool,AtomicUsize};
+import std.thread;
+import std.mem;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("timer error") } }
+void require(bool value) { if (!value) { panic("timer assertion failed"); } }
+async send int later(TimerSpawner time) { ok(await time.sleep(5)); return 7; }
+async send int immediate() { return 42; }
+async send int long_wait(TimerSpawner time) { ok(await time.sleep(100000)); return 0; }
+async send bool expires(TimerSpawner time) { return (await time.timeout(long_wait(time.clone()), 1)).is_err(); }
+async send bool wins(TimerSpawner time) { return (await time.timeout(immediate(), 0)).is_ok(); }
+async int local(TimerSpawner time) { ok(await time.sleep(1)); return 3; }
+async void local_count(TimerSpawner time, Arc<AtomicUsize> count) { ok(await time.sleep(1)); count.get().fetch_add(1); }
+async send void release(TimerSpawner time, Arc<AtomicBool> gate) { ok(await time.sleep(2)); gate.get().store(true); }
+async send bool closed(Sleep sleep) { return (await sleep).is_err(); }
+main() {
+    var timers = ok(TimerService.new());
+    print("{block_on(local(timers.spawner()))} {block_on_send(later(timers.spawner()))}");
+    var count = Arc.new(AtomicUsize.new(0));
+    var local = LocalExecutor.new();
+    local.spawn(local_count(timers.spawner(),count.clone()));
+    local.spawn(local_count(timers.spawner(),count.clone()));
+    local.run(); require(count.get().load() == 2);
+    var executor = ok(Executor.new(1));
+    require(ok(ok(executor.spawn(expires(timers.spawner()))).join()));
+    require(ok(ok(executor.spawn(wins(timers.spawner()))).join()));
+    print("timeouts complete");
+    var blocking = ok(BlockingPool.new(1));
+    var gate = Arc.new(AtomicBool.new(false));
+    var entered = Arc.new(AtomicBool.new(false));
+    var ready = gate.clone(); var started = entered.clone();
+    var job = ok(blocking.spawn(send once || { started.get().store(true); while (!ready.get().load()) { thread.sleep_ms(1); } return 11; }));
+    while (!entered.get().load()) { thread.sleep_ms(1); }
+    var signal = ok(executor.spawn(release(timers.spawner(),gate.clone())));
+    ok(signal.join()); require(ok(job.join()) == 11);
+    print("blocking worker kept separate");
+    var sleep = timers.sleep(100000);
+    var wait = ok(executor.spawn(closed(sleep)));
+    timers.shutdown();
+    require(ok(wait.join()));
+    for (i in 0..32) { var cancelled = timers.sleep(18446744073709551615 as usize); mem.drop(cancelled); }
+    executor.wait(); blocking.wait();
+    print("timer shutdown complete");
+}

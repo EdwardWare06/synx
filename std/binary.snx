@@ -1,0 +1,21 @@
+/// Fixed-width unsigned integers. Offsets and widths are checked before access.
+/// Encoders append bytes. A value that does not fit returns false unchanged.
+pub bool write_uint(&Vec<byte> bytes, ulong value, usize width, bool little_endian) {
+    if (width == 0 || width > 8) { return false; }
+    if (width < 8 && (value >> (width * 8)) != 0) { return false; }
+    for (i in 0..width) {
+        usize shift = if (little_endian) { i * 8 } else { (width - i - 1) * 8 };
+        bytes.push(((value >> shift) & 255) as byte);
+    }
+    return true;
+}
+pub ulong? read_uint(&const Vec<byte> bytes, usize offset, usize width, bool little_endian) {
+    if (width == 0 || width > 8 || offset > bytes.len() || width > bytes.len() - offset) { return None; }
+    ulong value = 0;
+    for (i in 0..width) {
+        byte part = unsafe { *((bytes.as_ptr() as usize + offset + i) as *const byte) };
+        usize shift = if (little_endian) { i * 8 } else { (width - i - 1) * 8 };
+        value |= (part as ulong) << shift;
+    }
+    return Some(value);
+}

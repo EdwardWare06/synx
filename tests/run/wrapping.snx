@@ -1,0 +1,7 @@
+main() {
+    byte b = 255; b += 1;
+    short s = 32767; s += 1;
+    int n = 2147483647; n += 1;
+    uint u = 4294967295; u += 1;
+    print("wrapping {b} {s} {n} {u}");
+}

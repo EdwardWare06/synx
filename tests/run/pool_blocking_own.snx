@@ -1,0 +1,3 @@
+import std.task.pool.BlockingPool;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("pool error") } }
+main() { var pool=ok(BlockingPool.new(1)); var worker=pool.spawner(); var job=ok(pool.spawn(send once || { var child=ok(worker.spawn(send once || 3)); return ok(child.join()); })); job.join(); }

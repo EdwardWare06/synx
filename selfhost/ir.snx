@@ -1,0 +1,272 @@
+/// Dendrite intermediate representation. Source: compiler/include/synx/ir.hpp.
+/// Parity: tests/selfhost_modules_test.cpp (lower, borrow, async stages).
+/// Functions and vtables are arena indexes into Module; NONE is absent.
+/// Enum orders match C++ because the strict dump prints ordinals.
+import ids.{TypeId, DefId, NONE};
+import ast.{BinaryOp, UnaryOp};
+import source.Span;
+import check_data;
+import std.collections.HashMap;
+
+pub enum ProjKind { Field, Index, Deref, Downcast }
+pub struct Projection { pub ProjKind kind; pub uint index; }
+/// local NONE is the destination of a call that writes nowhere.
+pub struct Place {
+    pub uint local;
+    pub Vec<Projection> proj;
+    pub Place of(uint local) { return Place { local: local, proj: Vec.new() }; }
+    pub Place none() { return Place.of(NONE); }
+    pub bool is_none(&const self) { return self.local == NONE; }
+    pub bool is_local(&const self) { return self.proj.is_empty(); }
+    pub Place copy(&const self) { var p = Place.of(self.local); for (x in &const self.proj) { p.proj.push(Projection { kind: x.kind, index: x.index }); } return p; }
+    pub Place with(&const self, ProjKind kind, uint index) { var p = self.copy(); p.proj.push(Projection { kind: kind, index: index }); return p; }
+    pub Place field(&const self, uint i) { return self.with(ProjKind.Field, i); }
+    pub Place index(&const self, uint local) { return self.with(ProjKind.Index, local); }
+    pub Place deref(&const self) { return self.with(ProjKind.Deref, 0); }
+    pub Place downcast(&const self, uint variant) { return self.with(ProjKind.Downcast, variant); }
+}
+pub uint proj_index(ProjKind kind) { match kind { ProjKind.Field => return 0, ProjKind.Index => return 1, ProjKind.Deref => return 2, ProjKind.Downcast => return 3 } }
+
+pub enum ConstantKind { Int, Float, Bool, Str, Unit, Fn, Char }
+pub struct Constant {
+    pub ConstantKind kind;
+    pub ulong int_value;
+    pub double float_value;
+    pub Vec<byte> str_value;
+    /// Function index for Fn constants.
+    pub uint fn_index;
+    pub TypeId type;
+    pub Constant new(ConstantKind kind, TypeId type) {
+        return Constant { kind: kind, int_value: 0, float_value: 0.0, str_value: Vec.new(), fn_index: NONE, type: type };
+    }
+    pub Constant copy(&const self) {
+        Vec<byte> text = Vec.new(); for (b in &const self.str_value) { text.push(*b); }
+        return Constant { kind: self.kind, int_value: self.int_value, float_value: self.float_value, str_value: text, fn_index: self.fn_index, type: self.type };
+    }
+}
+pub uint constant_index(ConstantKind kind) {
+    match kind { ConstantKind.Int => return 0, ConstantKind.Float => return 1, ConstantKind.Bool => return 2, ConstantKind.Str => return 3,
+        ConstantKind.Unit => return 4, ConstantKind.Fn => return 5, ConstantKind.Char => return 6 }
+}
+
+pub enum OperandKind { Copy, Move, Const }
+pub struct Operand {
+    pub OperandKind kind;
+    pub Place place;
+    pub Constant constant;
+    /// The default operand: a unit constant without a type, as Operand() in C++.
+    pub Operand empty() { return Operand { kind: OperandKind.Const, place: Place.of(0), constant: Constant.new(ConstantKind.Unit, TypeId.none()) }; }
+    pub Operand copy_of(Place p) { return Operand { kind: OperandKind.Copy, place: p, constant: Constant.new(ConstantKind.Unit, TypeId.none()) }; }
+    pub Operand move_of(Place p) { return Operand { kind: OperandKind.Move, place: p, constant: Constant.new(ConstantKind.Unit, TypeId.none()) }; }
+    pub Operand constant_of(Constant k) { return Operand { kind: OperandKind.Const, place: Place.of(0), constant: k }; }
+    pub Operand copy(&const self) { return Operand { kind: self.kind, place: self.place.copy(), constant: self.constant.copy() }; }
+    pub bool is_const(&const self) { match self.kind { OperandKind.Const => return true, _ => return false } }
+    pub bool is_move(&const self) { match self.kind { OperandKind.Move => return true, _ => return false } }
+}
+pub uint operand_index(OperandKind kind) { match kind { OperandKind.Copy => return 0, OperandKind.Move => return 1, OperandKind.Const => return 2 } }
+pub Vec<Operand> copy_operands(&const Vec<Operand> values) { Vec<Operand> out = Vec.new(); for (o in values) { out.push(o.copy()); } return out; }
+
+pub enum RvalueKind { Use, Ref, Binary, Unary, Cast, Aggregate, Discriminant, Len, StrFromString, ArrayToSlice, VecToSlice, ToDyn }
+pub uint rvalue_index(RvalueKind kind) {
+    match kind {
+        RvalueKind.Use => return 0, RvalueKind.Ref => return 1, RvalueKind.Binary => return 2, RvalueKind.Unary => return 3,
+        RvalueKind.Cast => return 4, RvalueKind.Aggregate => return 5, RvalueKind.Discriminant => return 6, RvalueKind.Len => return 7,
+        RvalueKind.StrFromString => return 8, RvalueKind.ArrayToSlice => return 9, RvalueKind.VecToSlice => return 10, RvalueKind.ToDyn => return 11,
+    }
+}
+pub enum AggregateKind { Struct, Tuple, Array, Variant }
+pub uint aggregate_index(AggregateKind kind) { match kind { AggregateKind.Struct => return 0, AggregateKind.Tuple => return 1, AggregateKind.Array => return 2, AggregateKind.Variant => return 3 } }
+pub struct Rvalue {
+    pub RvalueKind kind;
+    pub Operand a;
+    pub Operand b;
+    pub Place place;
+    pub bool is_const;
+    pub BinaryOp bop;
+    pub UnaryOp uop;
+    pub TypeId type;
+    pub AggregateKind agg;
+    pub uint variant;
+    pub Vec<Operand> elems;
+    pub Vec<Operand> captures;
+    pub uint vtable;
+    pub Rvalue new(RvalueKind kind) {
+        return Rvalue { kind: kind, a: Operand.empty(), b: Operand.empty(), place: Place.of(0), is_const: false, bop: BinaryOp.Add,
+            uop: UnaryOp.Neg, type: TypeId.none(), agg: AggregateKind.Struct, variant: 0, elems: Vec.new(), captures: Vec.new(), vtable: NONE };
+    }
+    pub Rvalue use_of(Operand a) { var r = Rvalue.new(RvalueKind.Use); r.a = a; return r; }
+    pub Rvalue copy(&const self) {
+        return Rvalue { kind: self.kind, a: self.a.copy(), b: self.b.copy(), place: self.place.copy(), is_const: self.is_const, bop: self.bop,
+            uop: self.uop, type: self.type, agg: self.agg, variant: self.variant, elems: copy_operands(&const self.elems),
+            captures: copy_operands(&const self.captures), vtable: self.vtable };
+    }
+}
+
+pub enum StatementKind { Assign, Drop, DropIf, StorageDead, Nop }
+pub uint statement_index(StatementKind kind) {
+    match kind { StatementKind.Assign => return 0, StatementKind.Drop => return 1, StatementKind.DropIf => return 2, StatementKind.StorageDead => return 3, StatementKind.Nop => return 4 }
+}
+pub struct Statement {
+    pub StatementKind kind;
+    pub Place place;
+    pub Rvalue rvalue;
+    pub uint flag_local;
+    pub Span span;
+    pub Statement new(StatementKind kind, Place place, Span span) {
+        return Statement { kind: kind, place: place, rvalue: Rvalue.new(RvalueKind.Use), flag_local: 0, span: span };
+    }
+    pub Statement copy(&const self) {
+        return Statement { kind: self.kind, place: self.place.copy(), rvalue: self.rvalue.copy(), flag_local: self.flag_local, span: self.span };
+    }
+}
+
+pub enum CalleeKind { Direct, Builtin, Indirect, Virtual }
+pub uint callee_index(CalleeKind kind) { match kind { CalleeKind.Direct => return 0, CalleeKind.Builtin => return 1, CalleeKind.Indirect => return 2, CalleeKind.Virtual => return 3 } }
+pub struct Callee {
+    pub CalleeKind kind;
+    pub uint fn_index;
+    pub String builtin;
+    pub Vec<TypeId> type_args;
+    pub Operand fn_operand;
+    pub uint vtable_slot;
+    pub Callee new(CalleeKind kind) {
+        return Callee { kind: kind, fn_index: NONE, builtin: String.new(), type_args: Vec.new(), fn_operand: Operand.empty(), vtable_slot: 0 };
+    }
+    pub Callee builtin_of(&const str name) { var c = Callee.new(CalleeKind.Builtin); c.builtin = String.from(name); return c; }
+    pub Callee direct(uint fn_index) { var c = Callee.new(CalleeKind.Direct); c.fn_index = fn_index; return c; }
+    pub Callee copy(&const self) {
+        Vec<TypeId> args = Vec.new(); for (t in &const self.type_args) { args.push(*t); }
+        return Callee { kind: self.kind, fn_index: self.fn_index, builtin: String.from(self.builtin), type_args: args, fn_operand: self.fn_operand.copy(), vtable_slot: self.vtable_slot };
+    }
+}
+
+pub enum TerminatorKind { Goto, Switch, Call, Assert, Return, Unreachable }
+pub uint terminator_index(TerminatorKind kind) {
+    match kind { TerminatorKind.Goto => return 0, TerminatorKind.Switch => return 1, TerminatorKind.Call => return 2, TerminatorKind.Assert => return 3,
+        TerminatorKind.Return => return 4, TerminatorKind.Unreachable => return 5 }
+}
+pub struct Case { pub ulong value; pub uint block; }
+pub struct Terminator {
+    pub TerminatorKind kind;
+    pub uint target;
+    pub Operand discr;
+    pub Vec<Case> cases;
+    pub uint otherwise;
+    pub Callee callee;
+    pub Vec<Operand> args;
+    pub Place dest;
+    pub bool diverges;
+    pub Operand cond;
+    pub String message;
+    pub Span span;
+    pub Terminator new(TerminatorKind kind) {
+        return Terminator { kind: kind, target: 0, discr: Operand.empty(), cases: Vec.new(), otherwise: 0, callee: Callee.new(CalleeKind.Direct),
+            args: Vec.new(), dest: Place.of(0), diverges: false, cond: Operand.empty(), message: String.new(), span: Span { start: 0, end: 0, file: 0 } };
+    }
+    pub Terminator copy(&const self) {
+        Vec<Case> cases = Vec.new(); for (c in &const self.cases) { cases.push(Case { value: c.value, block: c.block }); }
+        return Terminator { kind: self.kind, target: self.target, discr: self.discr.copy(), cases: cases, otherwise: self.otherwise,
+            callee: self.callee.copy(), args: copy_operands(&const self.args), dest: self.dest.copy(), diverges: self.diverges,
+            cond: self.cond.copy(), message: String.from(self.message), span: self.span };
+    }
+}
+pub struct BasicBlock {
+    pub Vec<Statement> stmts;
+    pub Terminator term;
+    pub BasicBlock new() { return BasicBlock { stmts: Vec.new(), term: Terminator.new(TerminatorKind.Unreachable) }; }
+}
+pub struct Local {
+    pub TypeId type;
+    pub String name;
+    pub bool is_arg;
+    pub Span span;
+    pub bool escape_boundary;
+    pub Local new(TypeId type, &const str name, bool is_arg, Span span) {
+        return Local { type: type, name: String.from(name), is_arg: is_arg, span: span, escape_boundary: false };
+    }
+}
+/// Sorted map entries; maps stay ordered by key like std::map.
+pub struct Pair { pub uint key; pub uint value; }
+pub struct LiveSet { pub uint block; pub Vec<uint> locals; }
+pub struct BorrowSet { pub uint block; pub Vec<Pair> pairs; }
+/// One concrete function. locals[0] is the return slot, then the arguments.
+pub struct Function {
+    pub String name;
+    pub DefId def;
+    pub Vec<TypeId> owner_args;
+    pub Vec<TypeId> type_args;
+    pub TypeId ret;
+    pub uint arg_count;
+    pub Vec<Local> locals;
+    pub Vec<BasicBlock> blocks;
+    pub bool lowered;
+    /// Closure expression node key, or check_data.NO_KEY.
+    pub ulong closure;
+    pub TypeId closure_type;
+    pub TypeId environment_type;
+    pub bool async_body;
+    pub uint async_poll;
+    pub uint async_cancel;
+    pub uint async_waker;
+    pub Vec<Pair> async_suspends;
+    pub Vec<uint> async_drop_locals;
+    pub Vec<Pair> async_drop_flags;
+    pub Vec<LiveSet> async_live;
+    pub Vec<BorrowSet> async_borrows;
+    pub Function new(String name) {
+        return Function { name: name, def: DefId.none(), owner_args: Vec.new(), type_args: Vec.new(), ret: TypeId.none(), arg_count: 0,
+            locals: Vec.new(), blocks: Vec.new(), lowered: false, closure: check_data.NO_KEY, closure_type: TypeId.none(),
+            environment_type: TypeId.none(), async_body: false, async_poll: NONE, async_cancel: NONE, async_waker: NONE,
+            async_suspends: Vec.new(), async_drop_locals: Vec.new(), async_drop_flags: Vec.new(), async_live: Vec.new(), async_borrows: Vec.new() };
+    }
+}
+/// Inserts or replaces key in a map sorted by key.
+pub void map_put(&Vec<Pair> map, uint key, uint value) {
+    for (i in 0..map.len()) { if (map.get(i).unwrap().key == key) { map.get_mut(i).unwrap().value = value; return; } }
+    map.push(Pair { key: key, value: value });
+    usize i = map.len() - 1;
+    while (i > 0 && map.get(i - 1).unwrap().key > key) { map.swap(i, i - 1); i -= 1; }
+}
+/// Inserts value into a sorted set.
+pub void set_insert(&Vec<uint> set, uint value) {
+    for (v in &const *set) { if (*v == value) { return; } }
+    set.push(value);
+    usize i = set.len() - 1;
+    while (i > 0 && *set.get(i - 1).unwrap() > value) { set.swap(i, i - 1); i -= 1; }
+}
+pub struct Vtable { pub String name; pub TypeId concrete; pub TypeId dyn_type; pub Vec<uint> methods; }
+pub struct DropImpl { pub TypeId type; pub uint fn_index; }
+pub struct Module {
+    pub Vec<Function> functions;
+    pub uint entry;
+    pub Vec<DropImpl> drop_impls;
+    HashMap<ulong, usize> drop_impl_index;
+    pub Vec<TypeId> drop_types;
+    HashMap<ulong, bool> drop_type_index;
+    pub Vec<Vtable> vtables;
+    pub Module new() {
+        return Module { functions: Vec.new(), entry: NONE, drop_impls: Vec.new(), drop_impl_index: HashMap.new(),
+            drop_types: Vec.new(), drop_type_index: HashMap.new(), vtables: Vec.new() };
+    }
+    pub bool has_drop_impl(&const self, TypeId t) { ulong key = t.index as ulong; return self.drop_impl_index.contains_key(&key); }
+    pub void put_drop_impl(&self, TypeId t, uint fn_index) {
+        ulong key = t.index as ulong;
+        match self.drop_impl_index.get(&key) { Some(i) => { self.drop_impls.get_mut(*i).unwrap().fn_index = fn_index; return; }, None => {} }
+        self.drop_impl_index.insert(key, self.drop_impls.len()); self.drop_impls.push(DropImpl { type: t, fn_index: fn_index });
+    }
+    pub bool has_drop_type(&const self, TypeId t) { ulong key = t.index as ulong; return self.drop_type_index.contains_key(&key); }
+    pub void add_drop_type(&self, TypeId t) {
+        ulong key = t.index as ulong;
+        if (self.drop_type_index.contains_key(&key)) { return; }
+        self.drop_type_index.insert(key, true); self.drop_types.push(t);
+    }
+}
+pub uint binary_index(BinaryOp op) {
+    match op {
+        BinaryOp.Add => return 0, BinaryOp.Sub => return 1, BinaryOp.Mul => return 2, BinaryOp.Div => return 3, BinaryOp.Rem => return 4,
+        BinaryOp.Eq => return 5, BinaryOp.Ne => return 6, BinaryOp.Lt => return 7, BinaryOp.Gt => return 8, BinaryOp.Le => return 9,
+        BinaryOp.Ge => return 10, BinaryOp.And => return 11, BinaryOp.Or => return 12, BinaryOp.BitAnd => return 13,
+        BinaryOp.BitOr => return 14, BinaryOp.BitXor => return 15, BinaryOp.Shl => return 16, BinaryOp.Shr => return 17,
+    }
+}
+pub uint unary_index(UnaryOp op) { match op { UnaryOp.Neg => return 0, UnaryOp.Not => return 1, UnaryOp.BitNot => return 2, UnaryOp.Deref => return 3 } }

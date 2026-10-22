@@ -1,0 +1,4 @@
+pub const OFFSET = 10;
+pub struct Same { pub int n; pub int read(&const self) { return self.n; } }
+pub Same make() { return Same { n: OFFSET + 1 }; }
+int secret() { return 900; }

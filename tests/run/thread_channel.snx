@@ -1,0 +1,35 @@
+import std.thread;
+import std.channel;
+import std.mem;
+thread.JoinHandle<T> started<T: Send + Owned>(Result<thread.JoinHandle<T>, thread.ThreadError> result) {
+    match result { Ok(handle) => return handle, Err(_) => panic("spawn failed") }
+}
+struct Message { channel.Sender<Message>? reply; }
+main() {
+    var pair = channel.channel<int>();
+    var sender = pair.sender();
+    var receiver = pair.receiver();
+    var workers = Vec<thread.JoinHandle<void>>.new();
+    for (index in 0..4) {
+        var out = sender.clone();
+        workers.push(started(thread.spawn(send once || {
+            for (i in 0..100) { match out.send(index * 100 + i) { Ok(_) => {}, Err(_) => panic("receiver closed") } }
+        })));
+    }
+    mem.drop(sender);
+    int count = 0; int total = 0;
+    loop { match receiver.recv() { Some(value) => { count += 1; total += value; }, None => break } }
+    while (!workers.is_empty()) { workers.pop().unwrap().join(); }
+    print("{count} {total}");
+    var cycle = channel.channel<Message>();
+    var cycle_sender = cycle.sender();
+    var cycle_receiver = cycle.receiver();
+    cycle_sender.send(Message { reply: Some(cycle_sender.clone()) });
+    mem.drop(cycle_receiver);
+    print("recursive sender dropped");
+    var closed = channel.channel<String>();
+    var sender = closed.sender();
+    var receiver = closed.receiver();
+    mem.drop(receiver);
+    match sender.send(String.from("preserved")) { Err(value) => print(value), Ok(_) => panic("closed send succeeded") }
+}

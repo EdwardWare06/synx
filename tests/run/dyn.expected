@@ -1,0 +1,11 @@
+area 9 double 18
+area 20 double 40
+direct 9 20
+mutable 25 50
+nested 20 side 4
+bounded 20 erased 20 relay 20
+generic 17 inferred 17
+generic bool true
+echo 21 22 default 23 24
+bundle 4 5 9
+drop 5

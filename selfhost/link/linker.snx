@@ -1,0 +1,51 @@
+/// Complete built-in link entry. Checked object records feed platform writers;
+/// host adapters publish complete files atomically and set execute permission.
+import link.model.{Object, Failure, Code};
+import link.model;
+import link.objects;
+import link.startup;
+import link.imports;
+import link.pe;
+import link.elf;
+import link.macho;
+import link.capsule;
+import std.fs;
+import std.path.Path;
+extern "C" { int synx_rt_link_write(*const byte path, usize length, *const byte data, usize count); }
+
+pub &const str runtime_name(int os) { return match os { 1 => "synx_rt.dll", 2 => "libsynx_rt.dylib", _ => "libsynx_rt.so" }; }
+pub Result<Vec<byte>, Failure> bytes(&const Vec<Object> inputs, int os) {
+    var runtime = if (os == 2) { "@rpath/libsynx_rt.dylib" } else { runtime_name(os) };
+    var catalog = imports.collect(inputs, runtime, os)?;
+    if (os == 1) { return pe.write_dynamic(inputs, "__synx_start", catalog); }
+    if (os == 0) { return elf.write_dynamic(inputs, "__synx_start", catalog); }
+    if (os == 2) { return macho.write_dynamic(inputs, "__synx_start", catalog); }
+    return Err(model.fail(Code.Unsupported, 0, 0));
+}
+bool equal(&const Vec<byte> a, &const Vec<byte> b) {
+    if (a.len() != b.len()) { return false; }
+    for (i in 0..a.len()) { if (*a.get(i).unwrap() != *b.get(i).unwrap()) { return false; } }
+    return true;
+}
+pub Result<bool, Failure> publish(&const str output, &const Vec<byte> data) {
+    int status = unsafe { synx_rt_link_write(output.as_ptr(), output.len(), data.as_ptr(), data.len()) };
+    if (status != 0) { return Err(model.fail(Code.Invalid, 0, status as usize)); }
+    return Ok(true);
+}
+pub Result<bool, Failure> file(&const str object_path, &const str executable, &const str runtime_path, int os) {
+    if (runtime_path.len() == 0) { return Err(model.fail(Code.Unresolved, 0, 0)); }
+    var data = match fs.read(object_path) { Ok(value) => value, Err(error) => return Err(model.fail(Code.Invalid, 0, error.os_code as usize)) };
+    var inputs = objects.load(data, object_path, os)?; inputs.push(startup.make(os));
+    var output = bytes(inputs, os)?;
+    var runtime = match fs.read(runtime_path) { Ok(value) => value, Err(error) => return Err(model.fail(Code.Invalid, 0, error.os_code as usize)) };
+    var required = imports.collect(inputs, if (os == 2) { "@rpath/libsynx_rt.dylib" } else { runtime_name(os) }, os)?;
+    var verified = capsule.validate(runtime, required, os)?;
+    var parent = Path.from(executable).parent().unwrap_or(Path.from("."));
+    var destination = parent.join(runtime_name(os));
+    bool same = match fs.same_file(runtime_path, destination.as_str()) { Ok(value) => value, Err(_) => false };
+    if (!same) {
+        match fs.read(destination.as_str()) { Ok(existing) => { same = equal(existing, runtime); }, Err(_) => {} }
+        if (!same) { var copied = publish(destination.as_str(), runtime)?; }
+    }
+    return publish(executable, output);
+}

@@ -1,0 +1,60 @@
+import std.task.{block_on,yield_now};
+import std.mem;
+struct Ticket { int id; }
+impl Drop for Ticket { void drop(&self) { print("drop {self.id}"); } }
+struct ReadOnDrop { &const Ticket ticket; }
+impl Drop for ReadOnDrop { void drop(&self) { print("read {self.ticket.id}"); } }
+async void arguments(Ticket ticket) { await yield_now(); print("body {ticket.id}"); }
+async void stages(Ticket ticket) {
+    var first=Ticket { id:ticket.id+1 };
+    await yield_now();
+    var second=Ticket { id:ticket.id+2 };
+    await yield_now();
+    print("finish {first.id} {second.id}");
+}
+async void order() {
+    ReadOnDrop? older=None;
+    var younger=Ticket { id:40 };
+    older=Some(ReadOnDrop { ticket:&const younger });
+    await yield_now();
+    mem.drop(older);
+}
+int combine(Ticket first, int second) { return first.id+second; }
+async int delayed() { await yield_now(); return 2; }
+async int temporary() { return combine(Ticket { id:50 }, await delayed()); }
+async void condition(bool own) {
+    Ticket ticket;
+    if (own) { ticket=Ticket { id:60 }; }
+    await yield_now();
+}
+async void child(&const Ticket ticket) {
+    var reader=ReadOnDrop { ticket:ticket };
+    await yield_now();
+    print("child {reader.ticket.id}");
+}
+async void parent() {
+    var ticket=Ticket { id:80 };
+    await child(&const ticket);
+}
+void pending(Poll<void> value) { match value { Poll.Pending => {}, Poll.Ready(_) => panic("expected pending") } }
+main() {
+    { var never=arguments(Ticket { id:10 }); }
+    {
+        var task=stages(Ticket { id:20 }); var wake=Waker.new();
+        pending(task.poll(wake.clone()));
+    }
+    {
+        var task=stages(Ticket { id:30 }); var wake=Waker.new();
+        pending(task.poll(wake.clone())); pending(task.poll(wake.clone()));
+    }
+    { var task=order(); var wake=Waker.new(); pending(task.poll(wake.clone())); }
+    {
+        var task=temporary(); var wake=Waker.new();
+        match task.poll(wake.clone()) { Poll.Pending => {}, Poll.Ready(_) => panic("expected pending") }
+    }
+    { var task=condition(false); var wake=Waker.new(); pending(task.poll(wake.clone())); }
+    { var task=condition(true); var wake=Waker.new(); pending(task.poll(wake.clone())); }
+    block_on(arguments(Ticket { id:70 }));
+    { var task=parent(); var wake=Waker.new(); pending(task.poll(wake.clone())); }
+    print("complete");
+}

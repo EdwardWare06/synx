@@ -1,0 +1,29 @@
+/// Purpose: values partly moved out of locals and temporaries drop their
+/// remaining owned fields. Linux CI runs this under the allocation check.
+struct Two { String a; String b; int n; }
+struct Outer { Two inner; String tail; }
+enum Pairs { Both(String, String), Named { String left; String right; }, Empty }
+Two make() { return Two { a: String.from("first value"), b: String.from("second value"), n: 3 }; }
+Outer outer() { return Outer { inner: make(), tail: String.from("tail value") }; }
+String take_a() { var t = make(); return t.a; }
+String take_nested() { var o = outer(); return o.inner.b; }
+void consume(String s, &const String keep) { print("{s} {keep}"); }
+void branch(bool c) { var t = make(); if (c) { var a = t.a; print("{a}"); } }
+void pairs() {
+    var p = Pairs.Both(String.from("one"), String.from("two"));
+    match p { Pairs.Both(x, _) => print("{x}"), _ => {} }
+    var q = Pairs.Named { left: String.from("left"), right: String.from("right") };
+    match q { Pairs.Named { left, right: _ } => print("{left}"), _ => {} }
+}
+void call_arg() { var t = make(); consume(t.a, &t.b); }
+main() {
+    int n = make().n;
+    var a = take_a();
+    var b = take_nested();
+    var c = String.from("c");
+    branch(true); branch(false);
+    pairs();
+    call_arg();
+    var len = make().a.len();
+    print("{n} {a} {b} {c} {len}");
+}

@@ -1,0 +1,88 @@
+int increment(int x) { return x + 1; }
+int recurse(int n) { if (n == 0) { return 1; } return n + recurse(n - 1); }
+byte return_byte() { return 255 as byte; }
+short return_short() { return -1 as short; }
+uint return_uint() { return 4294967295 as uint; }
+
+struct Cleanup { int id; }
+impl Drop for Cleanup {
+    void drop(&self) { print("cleanup {self.id}"); }
+}
+
+int pressure(int x) {
+    int a = x + 1;
+    int b = x + 2;
+    int c = x + 3;
+    int d = x + 4;
+    int e = x + 5;
+    int f = x + 6;
+    int g = x + 7;
+    int h = increment(x);
+    { var cleanup = Cleanup { id: 8 }; }
+    return a + b + c + d + e + f + g + h;
+}
+
+main() {
+    int total = 0;
+    int i = 0;
+    while (i < 10) {
+        i += 1;
+        if (i == 3) { continue; }
+        if (i == 8) { break; }
+        total += increment(i);
+    }
+    print("loop {total} {i} pressure {pressure(10)} recursion {recurse(5)}");
+    byte b = 255 as byte;
+    b = (b as int + 1) as byte;
+    short s = 32767 as short;
+    s = (s as int + 1) as short;
+    int n = 2147483647;
+    n = (n as long + 1) as int;
+    uint u = 4294967295 as uint;
+    u = (u as ulong + 1) as uint;
+    print("narrow {b} {s} {n} {u}");
+    int right = 9;
+    right = 20 - right;
+    int div = 100 / right;
+    int rem = 100 % right;
+    print("ops {right} {div} {rem} {-right} {~right} {right << 2}");
+    int[4] values = [4, 8, 12, 16];
+    usize index = 0;
+    int indexed = 0;
+    while (index < 4) { indexed += values[index]; index += 1; }
+    int address = 5;
+    { &int reference = &address; *reference = 19; }
+    print("memory {indexed} {address}");
+    long widened = return_short() as long;
+    long unsigned_widened = return_uint() as long;
+    print("returns {return_byte()} {widened} {unsigned_widened}");
+    bool condition = (right == 11);
+    char letter = 'A';
+    if (condition && !false || false) { print("bool {condition} char {letter}"); }
+
+    int outer = 0;
+    int nested = 0;
+    while (outer < 3) {
+        outer += 1;
+        int inner = 0;
+        while (inner < 3) {
+            inner += 1;
+            { var cleanup = Cleanup { id: outer * 10 + inner }; }
+            if (inner == 1) { continue; }
+            nested += increment(inner);
+            if (outer == 2) { break; }
+        }
+    }
+    print("nested {outer} {nested}");
+
+    // The cleanup tree needs more than fourteen scratch slots.
+    var v0 = Vec<String>.new(); v0.push(String.from("deep"));
+    var v1 = Vec<Vec<String>>.new(); v1.push(v0);
+    var v2 = Vec<Vec<Vec<String>>>.new(); v2.push(v1);
+    var v3 = Vec<Vec<Vec<Vec<String>>>>.new(); v3.push(v2);
+    var v4 = Vec<Vec<Vec<Vec<Vec<String>>>>>.new(); v4.push(v3);
+    var v5 = Vec<Vec<Vec<Vec<Vec<Vec<String>>>>>>.new(); v5.push(v4);
+    var v6 = Vec<Vec<Vec<Vec<Vec<Vec<Vec<String>>>>>>>.new(); v6.push(v5);
+    var v7 = Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<String>>>>>>>>.new(); v7.push(v6);
+    print("deep {v7.len()}");
+}

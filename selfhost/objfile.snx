@@ -1,0 +1,323 @@
+/// ELF64, COFF and Mach-O object serialization. Source: compiler/src/objfile.cpp.
+/// Parity: tests/selfhost_backend_test.cpp, selfhost_backend_0..3.
+/// Input owns text, read-only data, symbols and section-relative relocations.
+/// Output owns the complete file bytes; input remains unchanged.
+/// Relocation fields must fit their selected section. Sizes must fit the target
+/// format. Symbol order, duplicate-name lookup and addends follow stage 0.
+import x64.RelocKind;
+import bytes;
+import std.collections.HashMap;
+
+pub enum ObjectFormat { Elf, Coff, MachO }
+pub struct ObjSymbol {
+    pub String name;
+    pub ulong offset;
+    pub bool is_text;
+    pub bool global;
+    pub bool defined;
+}
+pub struct ObjReloc {
+    pub usize offset;
+    pub String symbol;
+    pub RelocKind kind;
+    pub long addend;
+    pub bool is_text;
+}
+pub struct ObjectFile {
+    pub Vec<byte> text;
+    pub Vec<byte> rodata;
+    pub Vec<ObjSymbol> symbols;
+    pub Vec<ObjReloc> relocs;
+    pub ObjectFile new() {
+        return ObjectFile { text: Vec.new(), rodata: Vec.new(), symbols: Vec.new(), relocs: Vec.new() };
+    }
+}
+
+struct Bytes {
+    Vec<byte> data;
+    Bytes new() { return Bytes { data: Vec.new() }; }
+    usize size(&const self) { return self.data.len(); }
+    void u8(&self, byte value) { self.data.push(value); }
+    void word(&self, ulong value, usize width) {
+        for (i in 0..width) { self.data.push(((value >> (8 * i as ulong)) & 255) as byte); }
+    }
+    void u16(&self, uint value) { self.word(value as ulong, 2); }
+    void u32(&self, uint value) { self.word(value as ulong, 4); }
+    void u64(&self, ulong value) { self.word(value, 8); }
+    void append(&self, &const Vec<byte> value) { bytes.append(&self.data, value); }
+    void zeros(&self, usize count) { for (i in 0..count) { self.data.push(0); } }
+    void align(&self, usize alignment) { while (self.data.len() % alignment != 0) { self.data.push(0); } }
+    void patch(&self, usize at, ulong value, usize width) {
+        for (i in 0..width) { *self.data.get_mut(at + i).unwrap() = ((value >> (8 * i as ulong)) & 255) as byte; }
+    }
+    void fixed_name(&self, &const str name, usize width) {
+        for (i in 0..width) {
+            byte value = if (i < name.len()) { unsafe { *((name.as_ptr() as usize + i) as *const byte) } } else { 0 };
+            self.data.push(value);
+        }
+    }
+    void string(&self, &const str name) { bytes.text(&self.data, name); self.u8(0); }
+}
+
+struct StringTable {
+    Bytes bytes;
+    HashMap<String, uint> offsets;
+    StringTable new() {
+        var result = StringTable { bytes: Bytes.new(), offsets: HashMap.new() };
+        result.bytes.u8(0); return result;
+    }
+    uint add(&self, &const str name) {
+        String key = String.from(name);
+        match self.offsets.get(key) { Some(value) => return *value, None => {} }
+        uint offset = self.bytes.size() as uint;
+        self.bytes.string(name); self.offsets.insert(key, offset); return offset;
+    }
+}
+
+struct Symbol {
+    String name;
+    ulong value;
+    uint section;
+    byte info;
+    bool ext;
+    bool defined;
+    Symbol new(&const str name, ulong value, uint section, byte info, bool ext, bool defined) {
+        return Symbol { name: String.from(name), value: value, section: section, info: info, ext: ext, defined: defined };
+    }
+}
+struct Section { ulong offset; ulong size; }
+Section place(&Bytes out, &const Vec<byte> data, usize alignment) {
+    out.align(alignment);
+    var result = Section { offset: out.size() as ulong, size: data.len() as ulong };
+    out.append(data); return result;
+}
+void elf_section(&Bytes out, uint name, uint kind, ulong flags, Section section,
+                 uint link, uint info, ulong alignment, ulong entry_size) {
+    out.u32(name); out.u32(kind); out.u64(flags); out.u64(0);
+    out.u64(section.offset); out.u64(section.size);
+    out.u32(link); out.u32(info); out.u64(alignment); out.u64(entry_size);
+}
+void elf_reloc(&Bytes out, &const ObjReloc reloc, uint symbol) {
+    uint kind = match reloc.kind { Abs64 => 1, Call32 => 4, Pc32 => 2 };
+    out.u64(reloc.offset as ulong); out.u64((symbol as ulong << 32) | kind as ulong);
+    out.u64(reloc.addend as ulong);
+}
+Vec<byte> write_elf(&const ObjectFile obj) {
+    var strtab = StringTable.new();
+    Vec<Symbol> syms = Vec.new();
+    syms.push(Symbol.new("", 0, 0, 0, false, false));
+    syms.push(Symbol.new("", 0, 1, 3, false, true));
+    syms.push(Symbol.new("", 0, 2, 3, false, true));
+    HashMap<String, uint> indexes = HashMap.new();
+    for (s in &const obj.symbols) {
+        if (s.global) { continue; }
+        indexes.insert(String.from(s.name), syms.len() as uint);
+        syms.push(Symbol.new(s.name, s.offset, if (s.is_text) { 1 } else { 2 }, if (s.is_text) { 2 } else { 1 }, false, true));
+    }
+    uint first_global = syms.len() as uint;
+    for (s in &const obj.symbols) {
+        if (!s.global) { continue; }
+        indexes.insert(String.from(s.name), syms.len() as uint);
+        if (s.defined) {
+            syms.push(Symbol.new(s.name, s.offset, if (s.is_text) { 1 } else { 2 }, if (s.is_text) { 0x12 } else { 0x11 }, true, true));
+        } else { syms.push(Symbol.new(s.name, 0, 0, 0x10, true, false)); }
+    }
+    for (r in &const obj.relocs) {
+        if (indexes.contains_key(r.symbol)) { continue; }
+        indexes.insert(String.from(r.symbol), syms.len() as uint);
+        syms.push(Symbol.new(r.symbol, 0, 0, 0x10, true, false));
+    }
+    var symtab = Bytes.new();
+    for (s in &const syms) {
+        uint offset = if (s.name.is_empty()) { 0 } else { strtab.add(s.name) };
+        symtab.u32(offset); symtab.u8(s.info); symtab.u8(0); symtab.u16(s.section);
+        symtab.u64(s.value); symtab.u64(0);
+    }
+    var rela = Bytes.new(); var rela_rodata = Bytes.new();
+    for (r in &const obj.relocs) {
+        uint symbol = *indexes.get(r.symbol).unwrap();
+        if (r.is_text) { elf_reloc(&rela, r, symbol); } else { elf_reloc(&rela_rodata, r, symbol); }
+    }
+    var shstr = StringTable.new();
+    uint n_text = shstr.add(".text"); uint n_rodata = shstr.add(".rodata"); uint n_rela = shstr.add(".rela.text");
+    uint n_sym = shstr.add(".symtab"); uint n_str = shstr.add(".strtab"); uint n_shstr = shstr.add(".shstrtab");
+    uint n_rela_rodata = shstr.add(".rela.rodata");
+    var out = Bytes.new();
+    out.u8(0x7F); out.u8(69); out.u8(76); out.u8(70); out.u8(2); out.u8(1); out.u8(1); out.u8(0);
+    out.zeros(8); out.u16(1); out.u16(0x3E); out.u32(1); out.u64(0); out.u64(0);
+    usize shoff_at = out.size(); out.u64(0); out.u32(0); out.u16(64); out.u16(0); out.u16(0);
+    out.u16(64); out.u16(8); out.u16(6);
+    Section s_text = place(&out, obj.text, 16); Section s_rodata = place(&out, obj.rodata, 16);
+    Section s_rela = place(&out, rela.data, 8); Section s_rela_rodata = place(&out, rela_rodata.data, 8);
+    Section s_sym = place(&out, symtab.data, 8); Section s_str = place(&out, strtab.bytes.data, 1);
+    Section s_shstr = place(&out, shstr.bytes.data, 1);
+    out.align(8); out.patch(shoff_at, out.size() as ulong, 8);
+    elf_section(&out, 0, 0, 0, Section { offset: 0, size: 0 }, 0, 0, 0, 0);
+    elf_section(&out, n_text, 1, 6, s_text, 0, 0, 16, 0);
+    elf_section(&out, n_rodata, 1, 2, s_rodata, 0, 0, 16, 0);
+    elf_section(&out, n_rela, 4, 0x40, s_rela, 4, 1, 8, 24);
+    elf_section(&out, n_sym, 2, 0, s_sym, 5, first_global, 8, 24);
+    elf_section(&out, n_str, 3, 0, s_str, 0, 0, 1, 0);
+    elf_section(&out, n_shstr, 3, 0, s_shstr, 0, 0, 1, 0);
+    elf_section(&out, n_rela_rodata, 4, 0x40, s_rela_rodata, 4, 2, 8, 24);
+    return out.data;
+}
+
+void coff_reloc(&Bytes out, &const ObjReloc reloc, uint symbol) {
+    out.u32(reloc.offset as uint); out.u32(symbol);
+    out.u16(match reloc.kind { Abs64 => 1, _ => 4 });
+}
+/// COFF and Mach-O store implicit addends inside section data. ELF uses RELA.
+Vec<byte> patched_data(&const ObjectFile obj, bool is_text) {
+    Vec<byte> data = if (is_text) { bytes.copy(obj.text, 0, obj.text.len()) } else { bytes.copy(obj.rodata, 0, obj.rodata.len()) };
+    for (r in &const obj.relocs) {
+        if (r.is_text != is_text) { continue; }
+        bool absolute = match r.kind { Abs64 => true, _ => false };
+        ulong value = (r.addend + if (absolute) { 0 } else { 4 }) as ulong;
+        usize width = if (absolute) { 8 } else { 4 };
+        for (i in 0..width) { *data.get_mut(r.offset + i).unwrap() = ((value >> (8 * i as ulong)) & 255) as byte; }
+    }
+    return data;
+}
+void coff_section(&Bytes out, usize at, &const str name, uint size, uint data_offset,
+                  uint reloc_offset, uint reloc_count, uint flags) {
+    var header = Bytes.new(); header.fixed_name(name, 8); header.u32(0); header.u32(0);
+    header.u32(size); header.u32(data_offset); header.u32(reloc_offset); header.u32(0);
+    header.u16(reloc_count); header.u16(0); header.u32(flags);
+    for (i in 0..40) { *out.data.get_mut(at + i).unwrap() = bytes.at(header.data, i); }
+}
+Vec<byte> write_coff(&const ObjectFile obj) {
+    var strtab = Bytes.new(); strtab.u32(0);
+    Vec<Symbol> syms = Vec.new();
+    syms.push(Symbol.new(".text", 0, 1, 3, false, true));
+    syms.push(Symbol.new(".rdata", 0, 2, 3, false, true));
+    HashMap<String, uint> indexes = HashMap.new();
+    for (s in &const obj.symbols) {
+        indexes.insert(String.from(s.name), syms.len() as uint);
+        if (s.defined) {
+            syms.push(Symbol.new(s.name, (s.offset as uint) as ulong, if (s.is_text) { 1 } else { 2 }, if (s.global) { 2 } else { 3 }, s.global, true));
+        } else { syms.push(Symbol.new(s.name, 0, 0, 2, true, false)); }
+    }
+    for (r in &const obj.relocs) {
+        if (indexes.contains_key(r.symbol)) { continue; }
+        indexes.insert(String.from(r.symbol), syms.len() as uint);
+        syms.push(Symbol.new(r.symbol, 0, 0, 2, true, false));
+    }
+    var symtab = Bytes.new();
+    for (s in &const syms) {
+        if (s.name.len() <= 8) { symtab.fixed_name(s.name, 8); }
+        else { uint offset = strtab.size() as uint; strtab.string(s.name); symtab.u32(0); symtab.u32(offset); }
+        symtab.u32(s.value as uint); symtab.u16(s.section);
+        bool section_symbol = s.info == 3 && s.section > 0 && s.name.len() > 0 && unsafe { *s.name.as_str().as_ptr() } == 46;
+        symtab.u16(if (section_symbol) { 0 } else { 0x20 }); symtab.u8(s.info); symtab.u8(0);
+    }
+    strtab.patch(0, strtab.size() as ulong, 4);
+    var relocs = Bytes.new(); var rdata_relocs = Bytes.new();
+    for (r in &const obj.relocs) {
+        uint symbol = *indexes.get(r.symbol).unwrap();
+        if (r.is_text) { coff_reloc(&relocs, r, symbol); } else { coff_reloc(&rdata_relocs, r, symbol); }
+    }
+    var out = Bytes.new(); out.u16(0x8664); out.u16(2); out.u32(0);
+    usize symptr_at = out.size(); out.u32(0); out.u32(syms.len() as uint); out.u16(0); out.u16(0);
+    usize sh_text = out.size(); out.zeros(40); usize sh_rdata = out.size(); out.zeros(40);
+    usize text_offset = out.size(); out.append(patched_data(obj, true)); out.align(16);
+    usize reloc_offset = out.size(); out.append(relocs.data);
+    usize rdata_offset = out.size(); out.append(patched_data(obj, false)); out.align(16);
+    usize rdata_reloc_offset = out.size(); out.append(rdata_relocs.data);
+    usize sym_offset = out.size(); out.append(symtab.data); out.append(strtab.data);
+    out.patch(symptr_at, sym_offset as ulong, 4);
+    coff_section(&out, sh_text, ".text", obj.text.len() as uint, text_offset as uint, reloc_offset as uint, (relocs.size() / 10) as uint, 0x60500020);
+    coff_section(&out, sh_rdata, ".rdata", obj.rodata.len() as uint, rdata_offset as uint, rdata_reloc_offset as uint, (rdata_relocs.size() / 10) as uint, 0x40500040);
+    return out.data;
+}
+
+void macho_reloc(&Bytes out, &const ObjReloc reloc, uint symbol) {
+    uint kind = match reloc.kind { Abs64 => 0, Call32 => 2, Pc32 => 1 };
+    bool absolute = match reloc.kind { Abs64 => true, _ => false };
+    uint info = (symbol & 0xFFFFFF) | (if (absolute) { 0 } else { 1 as uint << 24 }) |
+                ((if (absolute) { 3 as uint } else { 2 as uint }) << 25) | (1 as uint << 27) | (kind << 28);
+    out.u32(reloc.offset as uint); out.u32(info);
+}
+Vec<byte> write_macho(&const ObjectFile obj) {
+    Vec<Symbol> syms = Vec.new(); HashMap<String, uint> indexes = HashMap.new();
+    for (s in &const obj.symbols) {
+        if (s.defined && !s.global) {
+            indexes.insert(String.from(s.name), syms.len() as uint);
+            String name = String.from("_"); name.push_str(s.name);
+            syms.push(Symbol.new(name, s.offset, if (s.is_text) { 1 } else { 2 }, 0, false, true));
+        }
+    }
+    uint n_local = syms.len() as uint;
+    for (s in &const obj.symbols) {
+        if (s.defined && s.global) {
+            indexes.insert(String.from(s.name), syms.len() as uint);
+            String name = String.from("_"); name.push_str(s.name);
+            syms.push(Symbol.new(name, s.offset, if (s.is_text) { 1 } else { 2 }, 0, true, true));
+        }
+    }
+    uint n_ext = syms.len() as uint - n_local;
+    for (s in &const obj.symbols) {
+        if (!s.defined) {
+            indexes.insert(String.from(s.name), syms.len() as uint);
+            String name = String.from("_"); name.push_str(s.name);
+            syms.push(Symbol.new(name, 0, 0, 0, true, false));
+        }
+    }
+    for (r in &const obj.relocs) {
+        if (indexes.contains_key(r.symbol)) { continue; }
+        indexes.insert(String.from(r.symbol), syms.len() as uint);
+        String name = String.from("_"); name.push_str(r.symbol);
+        syms.push(Symbol.new(name, 0, 0, 0, true, false));
+    }
+    uint n_undef = syms.len() as uint - n_local - n_ext;
+    var strtab = Bytes.new(); strtab.u8(0); Vec<uint> name_offsets = Vec.new();
+    for (s in &const syms) { name_offsets.push(strtab.size() as uint); strtab.string(s.name); }
+    strtab.align(8);
+    ulong text_size = obj.text.len() as ulong;
+    ulong const_offset = (text_size + 15) / 16 * 16;
+    ulong seg_size = const_offset + obj.rodata.len() as ulong;
+    var relocs = Bytes.new(); var const_relocs = Bytes.new();
+    for (r in &const obj.relocs) {
+        uint symbol = *indexes.get(r.symbol).unwrap();
+        if (r.is_text) { macho_reloc(&relocs, r, symbol); } else { macho_reloc(&const_relocs, r, symbol); }
+    }
+    uint seg_cmd_size = 72 + 2 * 80; uint sizeofcmds = seg_cmd_size + 24 + 80;
+    ulong data_offset = (32 + sizeofcmds as ulong + 15) / 16 * 16;
+    ulong reloc_offset = data_offset + (seg_size + 7) / 8 * 8;
+    ulong const_reloc_offset = reloc_offset + relocs.size() as ulong;
+    ulong sym_offset = const_reloc_offset + const_relocs.size() as ulong;
+    ulong str_offset = sym_offset + syms.len() as ulong * 16;
+    var out = Bytes.new();
+    out.u32(0xFEEDFACF); out.u32(0x01000007); out.u32(3); out.u32(1);
+    out.u32(3); out.u32(sizeofcmds); out.u32(0x2000); out.u32(0);
+    out.u32(0x19); out.u32(seg_cmd_size); out.fixed_name("", 16);
+    out.u64(0); out.u64(seg_size); out.u64(data_offset); out.u64(seg_size);
+    out.u32(7); out.u32(7); out.u32(2); out.u32(0);
+    out.fixed_name("__text", 16); out.fixed_name("__TEXT", 16);
+    out.u64(0); out.u64(text_size); out.u32(data_offset as uint); out.u32(4);
+    out.u32(reloc_offset as uint); out.u32((relocs.size() / 8) as uint); out.u32(0x80000400);
+    out.u32(0); out.u32(0); out.u32(0);
+    out.fixed_name("__const", 16); out.fixed_name("__DATA_CONST", 16);
+    out.u64(const_offset); out.u64(obj.rodata.len() as ulong); out.u32((data_offset + const_offset) as uint);
+    out.u32(4); out.u32(const_reloc_offset as uint); out.u32((const_relocs.size() / 8) as uint);
+    out.u32(0); out.u32(0); out.u32(0); out.u32(0);
+    out.u32(2); out.u32(24); out.u32(sym_offset as uint); out.u32(syms.len() as uint);
+    out.u32(str_offset as uint); out.u32(strtab.size() as uint);
+    out.u32(0xB); out.u32(80); out.u32(0); out.u32(n_local); out.u32(n_local); out.u32(n_ext);
+    out.u32(n_local + n_ext); out.u32(n_undef); for (i in 0..12) { out.u32(0); }
+    out.zeros(data_offset as usize - out.size()); out.append(patched_data(obj, true));
+    out.zeros((const_offset - text_size) as usize); out.append(patched_data(obj, false));
+    out.zeros(reloc_offset as usize - out.size()); out.append(relocs.data); out.append(const_relocs.data);
+    for (i in 0..syms.len()) {
+        var s = syms.get(i).unwrap(); out.u32(*name_offsets.get(i).unwrap());
+        byte kind = if (s.defined) { 0x0E } else { 0 };
+        if (s.ext) { kind |= 1; }
+        out.u8(kind); out.u8(s.section as byte); out.u16(0);
+        out.u64(if (s.defined) { if (s.section == 1) { s.value } else { const_offset + s.value } } else { 0 });
+    }
+    out.append(strtab.data); return out.data;
+}
+
+pub Vec<byte> write_object(&const ObjectFile obj, ObjectFormat format) {
+    match format { Elf => return write_elf(obj), Coff => return write_coff(obj), MachO => return write_macho(obj) }
+}

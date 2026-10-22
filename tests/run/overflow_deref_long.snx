@@ -1,0 +1,1 @@
+main() { long value=9223372036854775807; { var p=&value; *p += 1; } if (value != -9223372036854775808L) { panic("wrong reference result"); } }

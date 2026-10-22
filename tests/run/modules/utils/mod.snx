@@ -1,0 +1,2 @@
+pub T id<T>(T value) { return value; }
+pub struct Tag { pub int n; }

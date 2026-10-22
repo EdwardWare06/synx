@@ -1,0 +1,27 @@
+/// Cross-host Mach-O image fixture: function import, pointer rebase, and ad-hoc
+/// code signature. The Python harness checks dyld metadata and every page hash.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind};
+import link.macho;
+import link.imports.Import;
+import link.macho_sha256;
+import std.fs;
+import std.env;
+import std.path.Path;
+import std.utf8;
+pub void run() {
+    var empty = Vec<byte>.new(); var hash = macho_sha256.digest(empty, 0, 0);
+    if (*hash.get(0).unwrap() != 0xe3 || *hash.get(31).unwrap() != 0x55) { panic("SHA256 empty"); }
+    var input = Object.new("Mach-O fixture", false);
+    Vec<byte> code = Vec.new(); code.push(0xb8); code.push(42); code.push(0); code.push(0); code.push(0); code.push(0xc3);
+    input.sections.push(Section.new(SectionKind.Text, 16, code));
+    Vec<byte> pointer = Vec.new(); for (i in 0..8) { pointer.push(0); }
+    input.sections.push(Section.new(SectionKind.ReadOnly, 8, pointer));
+    input.symbols.push(Symbol.new("entry", Binding.Global, Definition.Section(0, 0)));
+    input.relocations.push(Relocation { section: 1, offset: 0, symbol: 0, kind: RelocKind.Abs64, addend: 0 });
+    Vec<Object> inputs = Vec.new(); inputs.push(input);
+    Vec<Import> catalog = Vec.new(); catalog.push(Import { name: utf8.encode("_getpid"), library: String.from("/usr/lib/libSystem.B.dylib") });
+    var data = match macho.write_dynamic(inputs, "entry", catalog) { Ok(data) => data, Err(_) => panic("Mach-O writer") };
+    var args = env.args(); if (args.len() != 2) { panic("usage: macho_probe <output-directory>"); }
+    var path = Path.from(args.get(1).unwrap().as_str()).join("dynamic-macho");
+    match fs.write(path.as_str(), data) { Ok(_) => {}, Err(_) => panic("Mach-O write") }
+}

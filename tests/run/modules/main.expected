@@ -1,0 +1,9 @@
+kinds 31 90
+traits 11 12
+same names 11 24 10
+values 30 24 reexport 11
+enum 4 6 0 8
+cycle 7
+math 9.0 5.0
+constants 8 7 text 9
+shadow 2

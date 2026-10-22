@@ -1,0 +1,51 @@
+// User Not calls consume their operands and return Self.
+struct Flag { bool value; }
+impl Not for Flag {
+    Flag not(self) {
+        print("not flag");
+        return Flag { value: !self.value };
+    }
+}
+
+enum Switch { On, Off }
+impl Not for Switch {
+    Switch not(self) {
+        print("not switch");
+        return match self { On => Switch.Off, Off => Switch.On };
+    }
+}
+
+struct OwnedFlag {
+    String label;
+    bool value;
+}
+impl Not for OwnedFlag {
+    OwnedFlag not(self) {
+        print("not {self.label}");
+        self.value = !self.value;
+        return self;
+    }
+}
+impl Drop for OwnedFlag {
+    void drop(&self) { print("drop {self.label} {self.value}"); }
+}
+
+T invert<T: Not>(T value) { return !value; }
+
+main() {
+    var flag = !Flag { value: true };
+    print("{flag.value}");
+    match !Switch.On {
+        On => print("on"),
+        Off => print("off"),
+    }
+    var generic = invert(Flag { value: false });
+    print("{generic.value}");
+    {
+        var owned = OwnedFlag { label: String.from("owned"), value: true };
+        var inverted = !owned;
+        print("{inverted.value}");
+    }
+    int bits = 1;
+    print("{!true} {!bits}");
+}

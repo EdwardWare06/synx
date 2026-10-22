@@ -1,0 +1,2367 @@
+/// Dendrite lowering. Source: compiler/src/lower.cpp, a function-by-function port.
+/// Parity: tests/selfhost_modules_test.cpp (lower stage).
+/// Lowers every non-generic user function plus everything reachable from them,
+/// one concrete instantiation at a time from a worklist. Syntax nodes are node
+/// keys (file << 32 | index); the lowerer keeps no references into trees.
+/// The Lowerer owns the Checker, so lowering can intern types and report.
+import ast;
+import ids.{TypeId, DefId, DefKind, ModuleId, NONE};
+import defs.{Symbol, TraitRef, FnOwner};
+import defs;
+import types.{Subst};
+import types;
+import check.{Checker, K_PRIM, K_STR, K_DYN, K_STRUCT, K_ENUM, K_REF, K_PTR, K_ARRAY, K_SLICE, K_TUPLE, K_FN, K_PARAM, K_INFER, K_NEVER, K_ERROR, same_def};
+import check;
+import check_data.{NameRef, RefKind, Coercion, CoercionKind, node_key, key_file, key_index};
+import check_data;
+import ir.{Place, ProjKind, Constant, ConstantKind, Operand, OperandKind, Rvalue, RvalueKind, AggregateKind, Statement, StatementKind,
+    Callee, CalleeKind, Terminator, TerminatorKind, Case, BasicBlock, Local, Function, Vtable, Module};
+import ir;
+import source.Span;
+import bytes;
+import std.collections.HashMap;
+import std.mem;
+
+struct LoopCtx { uint break_block; uint continue_block; usize scope_depth; }
+struct CaptureSlot { uint id; Place place; }
+/// State while lowering one body (FnCtx in C++).
+pub struct FnCtx {
+    uint fn_index;
+    DefId constant;
+    Subst subst;
+    uint current;
+    Vec<uint> local_map;
+    Vec<CaptureSlot> captures;
+    Vec<LoopCtx> loops;
+    uint return_block;
+    /// Locals declared in each open scope, innermost last, for drops.
+    Vec<Vec<uint>> scopes;
+    FnCtx new(uint fn_index) {
+        return FnCtx { fn_index: fn_index, constant: DefId.none(), subst: Subst.new(), current: 0, local_map: Vec.new(), captures: Vec.new(),
+            loops: Vec.new(), return_block: 0, scopes: Vec.new() };
+    }
+}
+Span zero() { return Span { start: 0, end: 0, file: 0 }; }
+ulong child(ulong parent, uint index) { return node_key(key_file(parent), index); }
+Vec<TypeId> ids_copy(&const Vec<TypeId> values) { Vec<TypeId> out = Vec.new(); for (v in values) { out.push(*v); } return out; }
+Vec<uint> uints_copy(&const Vec<uint> values) { Vec<uint> out = Vec.new(); for (v in values) { out.push(*v); } return out; }
+uint binary_index(ast.BinaryOp op) {
+    match op {
+        ast.BinaryOp.Add => return 0, ast.BinaryOp.Sub => return 1, ast.BinaryOp.Mul => return 2, ast.BinaryOp.Div => return 3, ast.BinaryOp.Rem => return 4,
+        ast.BinaryOp.Eq => return 5, ast.BinaryOp.Ne => return 6, ast.BinaryOp.Lt => return 7, ast.BinaryOp.Gt => return 8, ast.BinaryOp.Le => return 9,
+        ast.BinaryOp.Ge => return 10, ast.BinaryOp.And => return 11, ast.BinaryOp.Or => return 12, ast.BinaryOp.BitAnd => return 13,
+        ast.BinaryOp.BitOr => return 14, ast.BinaryOp.BitXor => return 15, ast.BinaryOp.Shl => return 16, ast.BinaryOp.Shr => return 17,
+    }
+}
+
+pub struct Lowerer {
+    pub Checker ck;
+    pub Module module;
+    HashMap<String, uint> instances;
+    HashMap<ulong, uint> closure_ids;
+    Vec<uint> worklist;
+    HashMap<ulong, bool> drop_cache;
+    /// Per function definition: has a body. Filled before lowering.
+    Vec<bool> has_body;
+    pub bool ok;
+
+    pub Lowerer new(Checker ck) {
+        return Lowerer { ck: ck, module: Module.new(), instances: HashMap.new(), closure_ids: HashMap.new(), worklist: Vec.new(),
+            drop_cache: HashMap.new(), has_body: Vec.new(), ok: true };
+    }
+    void error(&self, Span span, &const str message) { self.ck.r.sink.error(span, message, "SNX0601"); self.ok = false; }
+
+    // ---------- shorthands ----------
+
+    &Function fun(&self, &const FnCtx c) { return self.module.functions.get_mut(c.fn_index as usize).unwrap(); }
+    TypeId local_type(&const self, &const FnCtx c, uint local) { return self.module.functions.get(c.fn_index as usize).unwrap().locals.get(local as usize).unwrap().type; }
+    bool local_named(&const self, &const FnCtx c, uint local) { return !self.module.functions.get(c.fn_index as usize).unwrap().locals.get(local as usize).unwrap().name.is_empty(); }
+    usize local_count(&const self, &const FnCtx c) { return self.module.functions.get(c.fn_index as usize).unwrap().locals.len(); }
+    &const ast.Expr ex(&const self, &const Vec<ast.Ast> t, ulong e) { return t.get(key_file(e) as usize).unwrap().expr(key_index(e)); }
+    TypeId tref(&self, TypeId inner, bool is_const) { return self.ck.r.types.ref_type(inner, is_const); }
+    TypeId tptr(&self, TypeId inner, bool is_const) { return self.ck.r.types.ptr(inner, is_const); }
+    TypeId tstr(&const self) { return self.ck.r.types.str(); }
+    TypeId tnever(&const self) { return self.ck.r.types.never(); }
+    TypeId tstruct(&self, DefId def, Vec<TypeId> args) { return self.ck.nominal(def, args); }
+    String show(&const self, TypeId t) { return self.ck.r.types.to_string(t); }
+    bool is_copy_type(&self, TypeId t) { return self.ck.is_copy_type(t); }
+    Constant unit(&const self, TypeId t) { return Constant.new(ConstantKind.Unit, t); }
+    Constant int_const(&const self, ulong value, TypeId t) { var k = Constant.new(ConstantKind.Int, t); k.int_value = value; return k; }
+    bool def_is_async(&const self, &const Vec<ast.Ast> t, DefId def) {
+        var d = self.ck.r.program.def(def); if (d.ast_file == NONE) { return false; }
+        return t.get(d.ast_file as usize).unwrap().function(d.ast_index).is_async;
+    }
+    bool def_async_send(&const self, &const Vec<ast.Ast> t, DefId def) {
+        var d = self.ck.r.program.def(def); if (d.ast_file == NONE) { return false; }
+        return t.get(d.ast_file as usize).unwrap().function(d.ast_index).async_send;
+    }
+    /// Body block of a function definition, or NONE.
+    uint def_body(&const self, &const Vec<ast.Ast> t, DefId def) {
+        var d = self.ck.r.program.def(def); if (d.ast_file == NONE) { return NONE; }
+        return t.get(d.ast_file as usize).unwrap().function(d.ast_index).body;
+    }
+    TypeId def_ret(&const self, DefId def) { return self.ck.r.program.def(def).ret; }
+    FnOwner def_owner(&const self, DefId def) { return self.ck.r.program.def(def).owner; }
+
+    // ---------- instances ----------
+
+    String args_str(&const self, &const Vec<TypeId> args) {
+        if (args.is_empty()) { return String.new(); }
+        var s = String.from("<");
+        for (i in 0..args.len()) { if (i != 0) { s.push_str(", "); } var text = self.show(*args.get(i).unwrap()); s.push_str(text); }
+        s.push('>'); return s;
+    }
+    String instance_name(&self, DefId def, &const Vec<TypeId> owner_args, &const Vec<TypeId> type_args) {
+        var name = String.new(); var d = self.ck.r.program.def(def);
+        var dname = String.from(d.name); var module = d.module;
+        match d.owner {
+            FnOwner.Struct => { var on = String.from(self.ck.r.program.def(d.owner_struct).name); var a = self.args_str(owner_args); name = "{on}{a}.{dname}"; }
+            FnOwner.Enum => { var on = String.from(self.ck.r.program.def(d.owner_enum).name); var a = self.args_str(owner_args); name = "{on}{a}.{dname}"; }
+            FnOwner.Impl => {
+                var im = d.owner_impl; var self_type = d.self_type;
+                var self_text = if (self_type.index == NONE) { String.from("?") } else { self.show(self_type) };
+                var s = Subst.new(); usize ng = self.ck.r.program.def(im).generics.len();
+                for (i in 0..ng) { if (i < owner_args.len()) { s.bind(self.ck.r.program.def(im).generics.get(i).unwrap().type, *owner_args.get(i).unwrap()); } }
+                if (!owner_args.is_empty()) { var applied = self.ck.apply(&s, self_type); self_text = self.show(applied); }
+                Vec<TypeId> trait_args = Vec.new();
+                var raw = ids_copy(&const self.ck.r.program.def(im).trait_ref.args);
+                for (a in &const raw) { trait_args.push(self.ck.apply(&s, *a)); }
+                var tr = self.ck.r.program.def(im).trait_ref.trait_def;
+                var middle = String.new();
+                if (tr.index != NONE) {
+                    var q = self.ck.r.program.qualified_name(self.ck.r.program.def(tr).module, self.ck.r.program.def(tr).name);
+                    var a = self.args_str(&trait_args); middle = "{q}{a}.";
+                }
+                name = "{self_text}.{middle}{dname}";
+            }
+            FnOwner.Trait => {
+                Vec<TypeId> trait_args = Vec.new(); for (i in 1..owner_args.len()) { trait_args.push(*owner_args.get(i).unwrap()); }
+                var first = if (owner_args.is_empty()) { String.from("?") } else { self.show(*owner_args.get(0).unwrap()) };
+                var tn = String.from(self.ck.r.program.def(d.owner_trait).name); var a = self.args_str(&trait_args);
+                name = "{first}.{tn}{a}.{dname}";
+            }
+            FnOwner.Module => {
+                bool scoped = module.index != NONE && !self.ck.r.program.module(module).is_prelude && !self.ck.r.program.module(module).name.is_empty();
+                name = if (scoped) { "@fn.{dname}" } else { String.from(dname) };
+            }
+            _ => { name = String.from(dname); }
+        }
+        var a = self.args_str(type_args); var full = "{name}{a}";
+        return self.ck.r.program.qualified_name(module, full);
+    }
+    pub uint instance(&self, DefId def, Vec<TypeId> owner_args, Vec<TypeId> type_args) {
+        var name = self.instance_name(def, &owner_args, &type_args);
+        match self.instances.get(&name) { Some(i) => return *i, None => {} }
+        uint index = self.module.functions.len() as uint;
+        var f = Function.new(String.from(name)); f.def = def; f.owner_args = owner_args; f.type_args = type_args;
+        self.module.functions.push(f); self.instances.insert(name, index); self.worklist.push(index);
+        return index;
+    }
+    pub bool lower_program(&self, &const Vec<ast.Ast> t, bool require_main) {
+        for (i in 0..self.ck.r.program.functions.len()) { self.has_body.push(self.def_body(t, DefId { kind: DefKind.Function, index: i as uint }) != ast.NONE); }
+        bool found_main = false; DefId main = DefId.none();
+        match self.ck.r.program.find("main") {
+            Some(symbol) => {
+                if (symbol.kind == 3) {
+                    var d = DefId { kind: DefKind.Function, index: symbol.fn_def };
+                    if (self.ck.r.program.def(d).module.index == self.ck.r.program.root_module.index) { found_main = true; main = d; }
+                }
+            }
+            None => {}
+        }
+        if (found_main) {
+            var d = self.ck.r.program.def(main); var ret = d.ret; Span span = d.span;
+            bool bad = !d.params.is_empty() || !d.generics.is_empty() ||
+                (!self.ck.is_void(ret) && !self.ck.is_never(ret) && !self.ck.is_prim(ret, ast.PrimKind.Int));
+            if (bad) { self.ck.r.sink.error(span, "main must have no parameters or type parameters and return int or void", "SNX0701"); return false; }
+            self.module.entry = self.instance(main, Vec.new(), Vec.new());
+        } else if (require_main) {
+            var root = self.ck.r.program.root_module;
+            uint file = if (root.index != NONE) { self.ck.r.program.module(root).file } else { 0 };
+            self.ck.r.sink.error(Span { start: 0, end: 0, file: file }, "no main function", "SNX0701"); return false;
+        }
+        for (i in 0..self.ck.r.program.functions.len()) {
+            var def = DefId { kind: DefKind.Function, index: i as uint };
+            var d = self.ck.r.program.def(def);
+            if (d.is_prelude || d.is_builtin || d.ast_file == NONE || self.def_body(t, def) == ast.NONE) { continue; }
+            if (!d.generics.is_empty()) { continue; }
+            bool owner_generic = false;
+            match d.owner {
+                FnOwner.Struct => { owner_generic = !self.ck.r.program.def(d.owner_struct).generics.is_empty(); }
+                FnOwner.Enum => { owner_generic = !self.ck.r.program.def(d.owner_enum).generics.is_empty(); }
+                FnOwner.Impl => { owner_generic = !self.ck.r.program.def(d.owner_impl).generics.is_empty(); }
+                FnOwner.Trait => { owner_generic = true; }
+                _ => {}
+            }
+            if (owner_generic) { continue; }
+            self.instance(def, Vec.new(), Vec.new());
+        }
+        self.drain(t);
+        return self.ok;
+    }
+    void drain(&self, &const Vec<ast.Ast> t) {
+        while (!self.worklist.is_empty()) {
+            uint f = self.worklist.pop().unwrap();
+            Vec<TypeId> pending = Vec.new(); Vec<uint> depths = Vec.new();
+            for (a in &const self.module.functions.get(f as usize).unwrap().owner_args) { pending.push(*a); depths.push(0); }
+            for (a in &const self.module.functions.get(f as usize).unwrap().type_args) { pending.push(*a); depths.push(0); }
+            while (!pending.is_empty()) {
+                var ty = pending.pop().unwrap(); uint depth = depths.pop().unwrap();
+                if (depth == 64) {
+                    Span span = self.ck.r.program.def(self.module.functions.get(f as usize).unwrap().def).span;
+                    self.error(span, "generic instantiation exceeds 64 nested type arguments"); return;
+                }
+                var es = self.ck.elems(ty); for (e in &const es) { pending.push(*e); depths.push(depth + 1); }
+                var inner = self.ck.inner(ty); if (inner.index != NONE) { pending.push(inner); depths.push(depth + 1); }
+                var ret = self.ck.ret_of(ty); if (ret.index != NONE) { pending.push(ret); depths.push(depth + 1); }
+            }
+            if (!self.module.functions.get(f as usize).unwrap().lowered) { self.lower_body(t, f); }
+        }
+    }
+
+    // ---------- building blocks ----------
+
+    uint new_block(&self, &const FnCtx c) {
+        self.fun(c).blocks.push(BasicBlock.new()); return (self.fun(c).blocks.len() - 1) as uint;
+    }
+    uint new_temp(&self, &const FnCtx c, TypeId t, Span span) {
+        self.fun(c).locals.push(Local.new(t, "", false, span)); return (self.fun(c).locals.len() - 1) as uint;
+    }
+    bool block_terminated(&const self, &const FnCtx c) {
+        var term = &const self.module.functions.get(c.fn_index as usize).unwrap().blocks.get(c.current as usize).unwrap().term;
+        match term.kind { TerminatorKind.Unreachable => return term.span.end != 0, _ => return true }
+    }
+    void emit(&self, &const FnCtx c, Statement s) {
+        if (self.block_terminated(c)) { return; }
+        uint b = c.current; self.fun(c).blocks.get_mut(b as usize).unwrap().stmts.push(s);
+    }
+    void assign(&self, &const FnCtx c, Place p, Rvalue r, Span span) {
+        var s = Statement.new(StatementKind.Assign, p, span); s.rvalue = r; self.emit(c, s);
+    }
+    void set_term(&self, &const FnCtx c, Terminator t) {
+        if (self.block_terminated(c)) { return; }
+        var term = t; if (term.span.end == 0) { term.span.end = 1; }
+        uint b = c.current; self.fun(c).blocks.get_mut(b as usize).unwrap().term = term;
+    }
+    void goto_block(&self, &FnCtx c, uint target) {
+        var t = Terminator.new(TerminatorKind.Goto); t.target = target; self.set_term(&*c, t); c.current = target;
+    }
+    void push_scope(&self, &FnCtx c) { c.scopes.push(Vec.new()); }
+    bool scoped(&const self, &const FnCtx c, uint local) {
+        for (scope in &const c.scopes) { for (l in scope) { if (*l == local) { return true; } } }
+        return false;
+    }
+    void scope_temporary(&self, &FnCtx c, uint local) {
+        if (self.local_named(&*c, local)) { return; }
+        if (self.scoped(&*c, local)) { return; }
+        usize n = c.scopes.len(); c.scopes.get_mut(n - 1).unwrap().push(local);
+    }
+    void push_local(&self, &FnCtx c, uint local) { usize n = c.scopes.len(); c.scopes.get_mut(n - 1).unwrap().push(local); }
+    void emit_drops_to(&self, &FnCtx c, usize depth, Span span) {
+        usize i = c.scopes.len();
+        while (i > depth) {
+            var locals = uints_copy(c.scopes.get(i - 1).unwrap());
+            usize k = locals.len();
+            while (k > 0) {
+                k -= 1; uint local = *locals.get(k).unwrap();
+                var lt = self.local_type(&*c, local);
+                if (self.needs_drop(lt)) { self.emit(&*c, Statement.new(StatementKind.Drop, Place.of(local), span)); }
+                var l = self.module.functions.get(c.fn_index as usize).unwrap().locals.get(local as usize).unwrap();
+                bool keep = l.is_arg || l.escape_boundary;
+                if (!keep) { self.emit(&*c, Statement.new(StatementKind.StorageDead, Place.of(local), span)); }
+            }
+            i -= 1;
+        }
+    }
+    void pop_scope(&self, &FnCtx c, Span span) {
+        usize n = c.scopes.len(); self.emit_drops_to(&*c, n - 1, span); var unused = c.scopes.pop();
+    }
+    void drop_scope(&self, &FnCtx c) { var unused = c.scopes.pop(); }
+    void call(&self, &FnCtx c, Callee callee, Vec<Operand> args, Place dest, bool diverges, Span span) {
+        var t = Terminator.new(TerminatorKind.Call); t.callee = callee; t.args = args; t.dest = dest; t.diverges = diverges; t.span = span;
+        if (!diverges) {
+            uint next = self.new_block(&*c); t.target = next; self.set_term(&*c, t); c.current = next;
+        } else { self.set_term(&*c, t); }
+    }
+
+    // ---------- types ----------
+
+    TypeId subst_type(&self, &const FnCtx c, TypeId t) { return self.ck.apply(&const c.subst, t); }
+    TypeId type_of(&self, &const FnCtx c, ulong e) {
+        TypeId raw = TypeId.none();
+        match self.ck.result.expr_types.get(e) { Some(found) => { raw = *found; }, None => {} }
+        if (raw.index == NONE) { return self.ck.error_t(); }
+        return self.subst_type(c, raw);
+    }
+    pub bool needs_drop(&self, TypeId root) {
+        ulong root_key = root.index as ulong;
+        match self.drop_cache.get(&root_key) { Some(v) => return *v, None => {} }
+        Vec<TypeId> order = Vec.new(); Vec<Vec<TypeId>> children = Vec.new(); HashMap<ulong, usize> index = HashMap.new();
+        HashMap<ulong, bool> droppable = HashMap.new();
+        Vec<TypeId> pending = Vec.new(); pending.push(root);
+        while (!pending.is_empty()) {
+            var t = pending.pop().unwrap(); ulong key = t.index as ulong;
+            if (index.contains_key(&key)) { continue; }
+            if (order.len() == 512) { self.error(zero(), "cleanup type expansion exceeds 512 types"); return false; }
+            index.insert(key, order.len()); order.push(t);
+            Vec<TypeId> kids = Vec.new();
+            uint k = self.ck.tk(t);
+            if (k == K_FN) { droppable.insert(key, true); }
+            if (k == K_STRUCT || k == K_ENUM) {
+                bool structure = k == K_STRUCT; var def = self.ck.def_of(t);
+                bool builtin = structure && (same_def(def, self.ck.r.program.string_def) || same_def(def, self.ck.r.program.vec_def));
+                if (builtin) { droppable.insert(key, true); }
+                var drop = self.ck.core_trait("Drop");
+                for (i in 0..self.ck.r.program.impls.len()) {
+                    var im = DefId { kind: DefKind.Impl, index: i as uint };
+                    var st = self.ck.r.program.def(im).self_type;
+                    bool matches = if (structure) { self.ck.tk(st) == K_STRUCT && same_def(self.ck.def_of(st), def) } else { self.ck.tk(st) == K_ENUM && same_def(self.ck.def_of(st), def) };
+                    if (!builtin && same_def(self.ck.r.program.def(im).trait_ref.trait_def, drop) && matches) {
+                        droppable.insert(key, true);
+                        if (!self.module.has_drop_impl(t)) {
+                            var method = self.ck.find_method(drop, "drop");
+                            uint inst = if (method.index != NONE) { self.resolve_trait_method(method, t, Vec.new(), zero(), false, Vec.new()) } else { NONE };
+                            if (inst != NONE) { self.module.put_drop_impl(t, inst); }
+                        }
+                        break;
+                    }
+                }
+                var s = self.ck.owner_subst(def, t);
+                var fields = self.ck.field_types(def);
+                for (f in &const fields) { kids.push(self.ck.apply(&s, *f)); }
+                if (structure && same_def(def, self.ck.r.program.vec_def)) { kids.push(self.ck.elem(t, 0)); }
+            } else if (k == K_TUPLE) { kids = self.ck.elems(t); }
+            else if (k == K_ARRAY) { kids.push(self.ck.inner(t)); }
+            for (kid in &const kids) { pending.push(*kid); }
+            children.push(kids);
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (i in 0..order.len()) {
+                ulong key = order.get(i).unwrap().index as ulong;
+                if (droppable.contains_key(&key)) { continue; }
+                for (kid in children.get(i).unwrap()) {
+                    ulong kk = kid.index as ulong;
+                    if (droppable.contains_key(&kk)) { droppable.insert(key, true); changed = true; break; }
+                }
+            }
+        }
+        for (t in &const order) { ulong key = t.index as ulong; if (droppable.contains_key(&key)) { self.module.add_drop_type(*t); } }
+        for (t in &const order) { ulong key = t.index as ulong; self.drop_cache.insert(key, droppable.contains_key(&key)); }
+        return droppable.contains_key(&root_key);
+    }
+
+    // ---------- checker tables ----------
+
+    usize checker_local_count(&const self, &const FnCtx c) {
+        if (c.constant.index != NONE) { return self.ck.result.const_locals.get(c.constant.index as ulong).unwrap().len(); }
+        var f = self.module.functions.get(c.fn_index as usize).unwrap();
+        if (f.closure != check_data.NO_KEY) { return self.ck.result.closure_locals.get(f.closure).unwrap().len(); }
+        return self.ck.result.fn_locals.get(f.def.index as ulong).unwrap().len();
+    }
+    &const check_data.LocalVar checker_local(&const self, &const FnCtx c, uint id) {
+        if (c.constant.index != NONE) { return self.ck.result.const_locals.get(c.constant.index as ulong).unwrap().get(id as usize).unwrap(); }
+        var f = self.module.functions.get(c.fn_index as usize).unwrap();
+        if (f.closure != check_data.NO_KEY) { return self.ck.result.closure_locals.get(f.closure).unwrap().get(id as usize).unwrap(); }
+        return self.ck.result.fn_locals.get(f.def.index as ulong).unwrap().get(id as usize).unwrap();
+    }
+    Place checker_place(&const self, &const FnCtx c, uint id) {
+        for (slot in &const c.captures) { if (slot.id == id) { return slot.place.copy(); } }
+        if (id as usize >= c.local_map.len() || *c.local_map.get(id as usize).unwrap() == NONE) { return Place.none(); }
+        return Place.of(*c.local_map.get(id as usize).unwrap());
+    }
+    void map_local(&self, &FnCtx c, uint id, uint local) {
+        while (c.local_map.len() <= id as usize) { c.local_map.push(NONE); }
+        *c.local_map.get_mut(id as usize).unwrap() = local;
+    }
+    void set_capture(&self, &FnCtx c, uint id, Place place) {
+        for (i in 0..c.captures.len()) { if (c.captures.get(i).unwrap().id == id) { c.captures.get_mut(i).unwrap().place = place; return; } }
+        c.captures.push(CaptureSlot { id: id, place: place });
+    }
+    Vec<uint> closure_captures(&const self, ulong closure) {
+        match self.ck.result.closure_captures.get(closure) { Some(v) => return uints_copy(v), None => return Vec.new() }
+    }
+    /// Capture mode of a local in a closure; Move when absent.
+    ast.CaptureMode capture_mode(&const self, ulong closure, uint id) {
+        match self.ck.result.closure_capture_modes.get(closure) {
+            Some(modes) => { match check_data.capture_mode(modes, id) { Some(m) => return m, None => return ast.CaptureMode.Move } }
+            None => return ast.CaptureMode.Move,
+        }
+    }
+    bool is_move_capture(&const self, ulong closure, uint id) { match self.capture_mode(closure, id) { ast.CaptureMode.Move => return true, _ => return false } }
+    NameRef? ref_of(&const self, ulong e) { match self.ck.result.refs.get(e) { Some(r) => return Some(r.copy()), None => return None } }
+    bool has_coercion(&const self, ulong e) { return self.ck.result.coercions.has(e); }
+
+    // ---------- function bodies ----------
+
+    void lower_body(&self, &const Vec<ast.Ast> t, uint f) {
+        self.module.functions.get_mut(f as usize).unwrap().lowered = true;
+        var def = self.module.functions.get(f as usize).unwrap().def;
+        var c = FnCtx.new(f);
+        var owner_args = ids_copy(&const self.module.functions.get(f as usize).unwrap().owner_args);
+        var type_args = ids_copy(&const self.module.functions.get(f as usize).unwrap().type_args);
+        var d = self.ck.r.program.def(def);
+        match d.owner {
+            FnOwner.Struct => { var o = d.owner_struct; self.bind_generics(&c, o, &owner_args, 0); }
+            FnOwner.Enum => { var o = d.owner_enum; self.bind_generics(&c, o, &owner_args, 0); }
+            FnOwner.Impl => {
+                var o = d.owner_impl; self.bind_generics(&c, o, &owner_args, 0);
+                var tr = self.ck.r.program.def(o).trait_ref.trait_def;
+                if (tr.index != NONE) {
+                    var raw_self = self.ck.r.program.def(o).self_type; var st = self.ck.apply(&const c.subst, raw_self);
+                    c.subst.bind(self.ck.r.program.def(tr).self_type, st);
+                }
+            }
+            FnOwner.Trait => {
+                var o = self.ck.r.program.def(def).owner_trait;
+                if (!owner_args.is_empty()) { c.subst.bind(self.ck.r.program.def(o).self_type, *owner_args.get(0).unwrap()); }
+                self.bind_generics(&c, o, &owner_args, 1);
+            }
+            _ => {}
+        }
+        self.bind_generics(&c, def, &type_args, 0);
+        ulong closure = self.module.functions.get(f as usize).unwrap().closure;
+        bool is_closure = closure != check_data.NO_KEY;
+        var closure_type = self.module.functions.get(f as usize).unwrap().closure_type;
+        bool async_body = self.module.functions.get(f as usize).unwrap().async_body;
+        TypeId ret = TypeId.none();
+        if (is_closure) { ret = self.ck.ret_of(closure_type); }
+        else { var declared = self.def_ret(def); var raw = if (declared.index != NONE) { declared } else { self.ck.void_t() }; ret = self.subst_type(&c, raw); }
+        bool async_factory = !is_closure && !async_body && self.def_is_async(t, def);
+        if (async_factory) {
+            var task = if (self.def_async_send(t, def)) { self.ck.r.program.send_task_def } else { self.ck.r.program.task_def };
+            Vec<TypeId> args = Vec.new(); args.push(ret); ret = self.tstruct(task, args);
+        }
+        self.module.functions.get_mut(f as usize).unwrap().ret = ret;
+        self.fun(&c).locals.push(Local.new(ret, "return", false, zero()));
+        if (is_closure) {
+            var env_type = self.module.functions.get(f as usize).unwrap().environment_type;
+            uint mode = check.mode_index(self.ck.mode_of(closure_type));
+            var env = if (mode == 2) { self.tptr(env_type, false) } else { self.tref(env_type, mode == 1) };
+            self.fun(&c).locals.push(Local.new(env, "environment", true, zero()));
+            var ids = uints_copy(self.ck.result.closure_params.get(closure).unwrap());
+            var node = self.ex(t, closure);
+            for (i in 0..ids.len()) {
+                var p = node.params.get(i).unwrap(); var pt = self.ck.elem(closure_type, i);
+                self.fun(&c).locals.push(Local.new(pt, defs.name(p.name).as_str(), true, p.span));
+            }
+            self.fun(&c).arg_count = (ids.len() + 1) as uint;
+        } else {
+            usize np = self.ck.r.program.def(def).params.len();
+            for (i in 0..np) {
+                var p = self.ck.r.program.def(def).params.get(i).unwrap(); var pt = p.type; var pn = String.from(p.name); Span ps = p.span;
+                var lt = self.subst_type(&c, pt);
+                self.fun(&c).locals.push(Local.new(lt, pn.as_str(), true, ps));
+            }
+            self.fun(&c).arg_count = np as uint;
+        }
+        if (async_factory) { self.lower_async_factory(t, &c); return; }
+        if (async_body) {
+            uint waker = self.local_count(&c) as uint;
+            self.fun(&c).async_waker = waker;
+            var wake = self.tstruct(self.ck.r.program.waker_def, Vec.new()); Span ds = self.ck.r.program.def(def).span;
+            self.fun(&c).locals.push(Local.new(wake, "@wake", true, ds));
+            self.fun(&c).arg_count += 1;
+        }
+        uint body = self.def_body(t, def);
+        if (self.ck.r.program.def(def).is_builtin || body == ast.NONE) {
+            self.fun(&c).blocks.push(BasicBlock.new());
+            var term = Terminator.new(TerminatorKind.Unreachable); term.span = Span { start: 0, end: 1, file: 0 };
+            self.fun(&c).blocks.get_mut(0).unwrap().term = term;
+            return;
+        }
+        usize count = self.checker_local_count(&c);
+        for (i in 0..count) { c.local_map.push(NONE); }
+        uint arg_count = self.module.functions.get(f as usize).unwrap().arg_count;
+        if (is_closure) {
+            var ids = uints_copy(self.ck.result.closure_params.get(closure).unwrap());
+            for (i in 0..ids.len()) { self.map_local(&c, *ids.get(i).unwrap(), (i + 2) as uint); }
+            var captures = self.closure_captures(closure);
+            for (i in 0..captures.len()) {
+                uint id = *captures.get(i).unwrap();
+                var field = Place.of(1).deref().field((i + 1) as uint);
+                if (!self.is_move_capture(closure, id)) { field = field.deref(); }
+                self.set_capture(&c, id, field);
+            }
+        } else {
+            usize np = self.ck.r.program.def(def).params.len();
+            for (i in 0..np) { if (i < count) { *c.local_map.get_mut(i).unwrap() = (i + 1) as uint; } }
+        }
+        uint fresh_block = self.new_block(&c); c.current = fresh_block;
+        uint fresh_block = self.new_block(&c); c.return_block = fresh_block;
+        self.push_scope(&c);
+        uint waker = self.module.functions.get(f as usize).unwrap().async_waker;
+        for (i in 1..arg_count + 1) { if (i != waker) { self.push_local(&c, i); } }
+        if (is_closure && check.mode_index(self.ck.mode_of(closure_type)) == 2 && !self.closure_captures(closure).is_empty()) {
+            Vec<uint> owned = Vec.new();
+            var env_type = self.module.functions.get(f as usize).unwrap().environment_type;
+            var fields = self.ck.elems(env_type);
+            var captures = self.closure_captures(closure);
+            Span cs = self.ex(t, closure).span;
+            for (i in 0..captures.len()) {
+                var ft = *fields.get(i + 1).unwrap();
+                uint local = self.new_temp(&c, ft, cs);
+                self.fun(&c).locals.get_mut(local as usize).unwrap().escape_boundary = true;
+                var value = self.operand_from_place(Place.of(1).deref().field((i + 1) as uint), ft);
+                self.assign(&c, Place.of(local), Rvalue.use_of(value), cs);
+                uint id = *captures.get(i).unwrap();
+                var place = if (self.is_move_capture(closure, id)) { Place.of(local) } else { Place.of(local).deref() };
+                self.set_capture(&c, id, place);
+                owned.push(local);
+            }
+            usize n = c.scopes.len(); var top = c.scopes.get_mut(n - 1).unwrap();
+            Vec<uint> merged = Vec.new(); for (o in &const owned) { merged.push(*o); } for (x in &const *top) { merged.push(*x); }
+            *top = merged;
+            Vec<Operand> args = Vec.new(); args.push(Operand.copy_of(Place.of(1)));
+            self.call(&c, Callee.builtin_of("synx_rt_free"), args, Place.none(), false, cs);
+        }
+        var ret_place = Place.of(0);
+        Span body_span = if (is_closure) { self.ex(t, child(closure, self.ex(t, closure).b)).span }
+            else { t.get(self.ck.r.program.def(def).ast_file as usize).unwrap().block(body).span };
+        if (is_closure) {
+            ulong body_expr = child(closure, self.ex(t, closure).b);
+            if (self.ck.is_void(ret)) { var ignored = self.lower_operand(t, &c, body_expr); }
+            else { self.lower_into(t, &c, body_expr, ret_place); }
+        } else {
+            ulong block = node_key(self.ck.r.program.def(def).ast_file, body);
+            if (self.ck.is_void(ret)) { self.lower_block_into(t, &c, block, Place.none(), false); }
+            else { self.lower_block_into(t, &c, block, ret_place, true); }
+        }
+        if (!self.block_terminated(&c)) { self.pop_scope(&c, body_span); uint rb = c.return_block; self.goto_block(&c, rb); }
+        else { self.drop_scope(&c); }
+        c.current = c.return_block;
+        var r = Terminator.new(TerminatorKind.Return); r.span = body_span; self.set_term(&c, r);
+        if (async_body) {
+            usize n = self.local_count(&c);
+            for (i in 1..n) {
+                var lt = self.local_type(&c, i as uint);
+                if (i as uint != waker && self.needs_drop(lt)) { ir.set_insert(&self.fun(&c).async_drop_locals, i as uint); }
+            }
+        }
+    }
+    /// Binds owner generics to args[offset..].
+    void bind_generics(&self, &FnCtx c, DefId owner, &const Vec<TypeId> args, usize offset) {
+        usize ng = self.ck.r.program.def(owner).generics.len();
+        for (i in 0..ng) {
+            if (i + offset < args.len()) { c.subst.bind(self.ck.r.program.def(owner).generics.get(i).unwrap().type, *args.get(i + offset).unwrap()); }
+        }
+    }
+    Operand operand_from_place(&self, Place p, TypeId t) {
+        if (self.is_copy_type(t)) { return Operand.copy_of(p); }
+        return Operand.move_of(p);
+    }
+    Operand fn_address(&const self, uint fn_index, TypeId t) { var k = Constant.new(ConstantKind.Fn, t); k.fn_index = fn_index; return Operand.constant_of(k); }
+
+    void lower_async_factory(&self, &const Vec<ast.Ast> t, &FnCtx c) {
+        uint f = c.fn_index;
+        var fret = self.module.functions.get(f as usize).unwrap().ret;
+        var def = self.module.functions.get(f as usize).unwrap().def;
+        var output = self.ck.elem(fret, 0);
+        var raw = self.tptr(self.ck.prim(ast.PrimKind.Byte), false);
+        var wake = self.tstruct(self.ck.r.program.waker_def, Vec.new());
+        Vec<TypeId> pa = Vec.new(); pa.push(output); var poll = self.tstruct(self.ck.r.program.poll_def, pa);
+        var fname = String.from(self.module.functions.get(f as usize).unwrap().name);
+        Span ds = self.ck.r.program.def(def).span;
+        var body = Function.new("{fname}.@async.poll"); body.def = def;
+        body.owner_args = ids_copy(&const self.module.functions.get(f as usize).unwrap().owner_args);
+        body.type_args = ids_copy(&const self.module.functions.get(f as usize).unwrap().type_args);
+        body.async_body = true;
+        uint poll_index = self.module.functions.len() as uint;
+        self.module.functions.get_mut(f as usize).unwrap().async_poll = poll_index;
+        self.instances.insert("{fname}.@async.poll", poll_index); self.worklist.push(poll_index);
+        self.module.functions.push(body);
+        var cancel = Function.new("{fname}.@async.cancel");
+        cancel.ret = self.ck.void_t(); cancel.arg_count = 1; cancel.lowered = true;
+        cancel.locals.push(Local.new(self.ck.void_t(), "return", false, ds)); cancel.locals.push(Local.new(raw, "frame", true, ds));
+        var block = BasicBlock.new(); block.term.kind = TerminatorKind.Return; cancel.blocks.push(block);
+        uint cancel_index = self.module.functions.len() as uint;
+        self.module.functions.get_mut(f as usize).unwrap().async_cancel = cancel_index;
+        self.instances.insert("{fname}.@async.cancel", cancel_index);
+        self.module.functions.push(cancel);
+        uint fresh_block = self.new_block(&*c); c.current = fresh_block;
+        var null = Constant.new(ConstantKind.Int, raw);
+        var no = Constant.new(ConstantKind.Bool, self.ck.bool_t());
+        var result = Rvalue.new(RvalueKind.Aggregate); result.type = fret;
+        bool send = self.def_async_send(t, def);
+        Vec<TypeId> pp = Vec.new(); pp.push(raw); pp.push(wake); var poll_fn = self.ck.r.types.fn_type(pp, poll, ast.CallMode.Writable, send);
+        Vec<TypeId> cp = Vec.new(); cp.push(raw); var cancel_fn = self.ck.r.types.fn_type(cp, self.ck.void_t(), ast.CallMode.Writable, send);
+        result.elems.push(Operand.constant_of(null)); result.elems.push(self.fn_address(poll_index, poll_fn));
+        result.elems.push(self.fn_address(cancel_index, cancel_fn)); result.elems.push(Operand.constant_of(no));
+        uint argc = self.module.functions.get(f as usize).unwrap().arg_count;
+        for (i in 1..argc + 1) { var lt = self.local_type(&*c, i); result.captures.push(self.operand_from_place(Place.of(i), lt)); }
+        self.assign(&*c, Place.of(0), result, ds);
+        var ret = Terminator.new(TerminatorKind.Return); ret.span = ds; self.set_term(&*c, ret);
+        self.needs_drop(fret); self.needs_drop(wake);
+    }
+
+    Operand lower_await(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e) {
+        var x = self.ex(t, e); Span span = x.span; ulong operand = child(e, x.a);
+        var output = self.type_of(&*c, e); var future = self.type_of(&*c, operand); var base = future;
+        var value = self.lower_operand(t, &*c, operand);
+        if (self.block_terminated(&*c)) { return value; }
+        uint slot = self.new_temp(&*c, future, span); var holder = Place.of(slot);
+        self.push_local(&*c, slot);
+        if (self.needs_drop(future)) { self.emit(&*c, Statement.new(StatementKind.Drop, holder.copy(), span)); }
+        self.assign(&*c, holder.copy(), Rvalue.use_of(value), span);
+        var receiver = holder.copy();
+        while (self.ck.tk(base) == K_REF) { base = self.ck.inner(base); receiver = receiver.deref(); }
+        Vec<TypeId> pa = Vec.new(); pa.push(output); var poll_type = self.tstruct(self.ck.r.program.poll_def, pa);
+        uint polled = self.new_temp(&*c, poll_type, span); self.push_local(&*c, polled);
+        uint loop_block = self.new_block(&*c); self.goto_block(&*c, loop_block);
+        if (self.needs_drop(poll_type)) { self.emit(&*c, Statement.new(StatementKind.Drop, Place.of(polled), span)); }
+        var wake_type = self.tstruct(self.ck.r.program.waker_def, Vec.new());
+        var wake_ref_type = self.tref(wake_type, true);
+        uint wake_ref = self.new_temp(&*c, wake_ref_type, span);
+        uint waker = self.module.functions.get(c.fn_index as usize).unwrap().async_waker;
+        var borrow = Rvalue.new(RvalueKind.Ref); borrow.place = Place.of(waker); borrow.is_const = true; borrow.type = wake_ref_type;
+        self.assign(&*c, Place.of(wake_ref), borrow, span);
+        uint wake = self.new_temp(&*c, wake_type, span); self.push_local(&*c, wake);
+        var clone = self.instance(self.ck.find_method(self.ck.r.program.waker_def, "clone"), Vec.new(), Vec.new());
+        Vec<Operand> ca = Vec.new(); ca.push(Operand.copy_of(Place.of(wake_ref)));
+        self.call(&*c, Callee.direct(clone), ca, Place.of(wake), false, span);
+        var ref_type = self.tref(base, false);
+        uint ref = self.new_temp(&*c, ref_type, span);
+        var borrow2 = Rvalue.new(RvalueKind.Ref); borrow2.place = receiver; borrow2.is_const = false; borrow2.type = ref_type;
+        self.assign(&*c, Place.of(ref), borrow2, span);
+        var poll = Callee.new(CalleeKind.Direct);
+        if (self.ck.tk(base) == K_DYN) { poll.kind = CalleeKind.Virtual; poll.vtable_slot = 0; }
+        else {
+            Vec<TypeId> args = Vec.new(); args.push(output);
+            var future_trait = self.ck.core_trait("Future");
+            poll.fn_index = self.resolve_trait_method(self.ck.find_method(future_trait, "poll"), base, Vec.new(), span, true, ids_copy(&args));
+            if (poll.fn_index == NONE) { return Operand.empty(); }
+            var target = self.module.functions.get(poll.fn_index as usize).unwrap().def;
+            var target_owner_args = ids_copy(&const self.module.functions.get(poll.fn_index as usize).unwrap().owner_args);
+            var s = Subst.new();
+            match self.def_owner(target) {
+                FnOwner.Impl => { var im = self.ck.r.program.def(target).owner_impl; self.bind_into(&s, im, &target_owner_args, 0); }
+                FnOwner.Trait => {
+                    var tr = self.ck.r.program.def(target).owner_trait;
+                    s.bind(self.ck.r.program.def(tr).self_type, base); self.bind_into(&s, tr, &args, 0);
+                }
+                _ => {}
+            }
+            var d = self.ck.r.program.def(target);
+            bool valid = d.params.len() == 2 && d.generics.is_empty() && !self.def_is_async(t, target);
+            if (valid) {
+                var dret = d.ret; var p0 = d.params.get(0).unwrap().type; var p1 = d.params.get(1).unwrap().type;
+                valid = self.ck.apply(&s, dret).index == poll_type.index && self.ck.apply(&s, p0).index == ref_type.index && self.ck.apply(&s, p1).index == wake_type.index;
+            }
+            if (!valid) { self.error(span, "implementation of Future.poll does not match its trait signature"); return Operand.empty(); }
+        }
+        Vec<Operand> pargs = Vec.new(); pargs.push(Operand.move_of(Place.of(ref))); pargs.push(Operand.move_of(Place.of(wake)));
+        self.call(&*c, poll, pargs, Place.of(polled), false, span);
+        uint discr = self.new_temp(&*c, self.ck.usize_t(), span);
+        var tag = Rvalue.new(RvalueKind.Discriminant); tag.place = Place.of(polled);
+        self.assign(&*c, Place.of(discr), tag, span);
+        uint ready = self.new_block(&*c); uint pending = self.new_block(&*c);
+        var sw = Terminator.new(TerminatorKind.Switch); sw.discr = Operand.copy_of(Place.of(discr));
+        sw.cases.push(Case { value: 1, block: ready }); sw.otherwise = pending; sw.span = span; self.set_term(&*c, sw);
+        c.current = pending;
+        var suspend = Terminator.new(TerminatorKind.Call); suspend.callee = Callee.builtin_of("@async_suspend");
+        suspend.dest = Place.none(); suspend.target = loop_block; suspend.span = span;
+        ir.map_put(&self.fun(&*c).async_suspends, pending, loop_block);
+        self.set_term(&*c, suspend);
+        c.current = ready;
+        uint result = self.new_temp(&*c, output, span); self.push_local(&*c, result);
+        var taken = self.operand_from_place(Place.of(polled).downcast(1).field(0), output);
+        self.assign(&*c, Place.of(result), Rvalue.use_of(taken), span);
+        if (self.ck.tk(base) == K_STRUCT && (same_def(self.ck.def_of(base), self.ck.r.program.task_def) || same_def(self.ck.def_of(base), self.ck.r.program.send_task_def)) && future.index == base.index) {
+            self.emit(&*c, Statement.new(StatementKind.Drop, holder, span));
+        }
+        return self.operand_from_place(Place.of(result), output);
+    }
+    /// Binds owner generics to args[offset..] into s.
+    void bind_into(&self, &Subst s, DefId owner, &const Vec<TypeId> args, usize offset) {
+        usize ng = self.ck.r.program.def(owner).generics.len();
+        for (i in 0..ng) { if (i + offset < args.len()) { s.bind(self.ck.r.program.def(owner).generics.get(i).unwrap().type, *args.get(i + offset).unwrap()); } }
+    }
+
+    Operand lower_closure(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e) {
+        var x = self.ex(t, e); Span span = x.span;
+        var fn_type = self.type_of(&*c, e);
+        var captures = self.closure_captures(e);
+        var raw_pointer = self.tptr(self.ck.prim(ast.PrimKind.Byte), false);
+        Vec<TypeId> fields = Vec.new(); fields.push(raw_pointer);
+        for (id in &const captures) {
+            var lt = self.checker_local(&*c, *id).type; var ty = self.subst_type(&*c, lt);
+            match self.capture_mode(e, *id) {
+                ast.CaptureMode.Move => {},
+                ast.CaptureMode.Shared => { ty = self.tref(ty, true); },
+                ast.CaptureMode.Writable => { ty = self.tref(ty, false); },
+            }
+            fields.push(ty);
+            self.needs_drop(ty);
+        }
+        var env_type = self.ck.r.types.tuple(ids_copy(&fields));
+        var env_pointer = self.tptr(env_type, false);
+        uint closure_id = 0;
+        match self.closure_ids.get(&e) { Some(i) => { closure_id = *i; }, None => { closure_id = self.closure_ids.len() as uint; self.closure_ids.insert(e, closure_id); } }
+        var fname = String.from(self.module.functions.get(c.fn_index as usize).unwrap().name);
+        var name = "{fname}.closure{closure_id}";
+        uint entry = NONE; uint drop = NONE;
+        match self.instances.get(&name) {
+            Some(i) => {
+                entry = *i;
+                if (!captures.is_empty()) { var dn = "{name}.drop"; drop = *self.instances.get(&dn).unwrap(); }
+            }
+            None => {}
+        }
+        if (entry == NONE) {
+            var f = Function.new(String.from(name));
+            f.def = self.module.functions.get(c.fn_index as usize).unwrap().def;
+            f.owner_args = ids_copy(&const self.module.functions.get(c.fn_index as usize).unwrap().owner_args);
+            f.type_args = ids_copy(&const self.module.functions.get(c.fn_index as usize).unwrap().type_args);
+            f.closure = e; f.closure_type = fn_type; f.environment_type = env_type;
+            entry = self.module.functions.len() as uint;
+            self.instances.insert(String.from(name), entry);
+            self.module.functions.push(f);
+            self.worklist.push(entry);
+            if (!captures.is_empty()) {
+                var d = Function.new("{name}.drop");
+                d.ret = self.ck.void_t(); d.arg_count = 1; d.lowered = true;
+                d.locals.push(Local.new(self.ck.void_t(), "return", false, span));
+                d.locals.push(Local.new(env_pointer, "environment", true, span));
+                drop = self.module.functions.len() as uint;
+                self.instances.insert("{name}.drop", drop);
+                self.module.functions.push(d);
+                var dc = FnCtx.new(drop);
+                uint fresh_block = self.new_block(&dc); dc.current = fresh_block;
+                usize i = fields.len();
+                while (i > 1) {
+                    if (self.needs_drop(*fields.get(i - 1).unwrap())) {
+                        self.emit(&dc, Statement.new(StatementKind.Drop, Place.of(1).deref().field((i - 1) as uint), span));
+                    }
+                    i -= 1;
+                }
+                Vec<Operand> fa = Vec.new(); fa.push(Operand.copy_of(Place.of(1)));
+                self.call(&dc, Callee.builtin_of("synx_rt_free"), fa, Place.none(), false, span);
+                var ret = Terminator.new(TerminatorKind.Return); ret.span = span; self.set_term(&dc, ret);
+            }
+        }
+        var env = Operand.constant_of(Constant.new(ConstantKind.Int, raw_pointer));
+        Vec<Operand> captured = Vec.new();
+        if (!captures.is_empty()) {
+            uint size = self.new_temp(&*c, self.ck.usize_t(), span);
+            var sizeof_env = Callee.builtin_of("size_of"); sizeof_env.type_args.push(env_type);
+            self.call(&*c, sizeof_env, Vec.new(), Place.of(size), false, span);
+            uint pointer = self.new_temp(&*c, env_pointer, span);
+            Vec<Operand> aa = Vec.new(); aa.push(Operand.copy_of(Place.of(size)));
+            self.call(&*c, Callee.builtin_of("synx_rt_alloc"), aa, Place.of(pointer), false, span);
+            self.assign(&*c, Place.of(pointer).deref().field(0), Rvalue.use_of(self.fn_address(drop, raw_pointer)), span);
+            for (i in 0..captures.len()) {
+                uint id = *captures.get(i).unwrap();
+                var source = self.checker_place(&*c, id);
+                if (source.is_none()) { self.error(span, "closure capture has no local"); return Operand.empty(); }
+                var ft = *fields.get(i + 1).unwrap();
+                Operand value = Operand.empty();
+                if (!self.is_move_capture(e, id)) {
+                    uint borrowed = self.new_temp(&*c, ft, span);
+                    var borrow = Rvalue.new(RvalueKind.Ref); borrow.place = source; borrow.type = ft; borrow.is_const = self.ck.const_of(ft);
+                    self.assign(&*c, Place.of(borrowed), borrow, span);
+                    value = self.operand_from_place(Place.of(borrowed), ft);
+                } else { value = self.operand_from_place(source, ft); }
+                captured.push(value.copy());
+                if (value.is_move()) { value.kind = OperandKind.Copy; }
+                self.assign(&*c, Place.of(pointer).deref().field((i + 1) as uint), Rvalue.use_of(value), span);
+            }
+            env = Operand.copy_of(Place.of(pointer));
+        }
+        var aggregate = Rvalue.new(RvalueKind.Aggregate); aggregate.agg = AggregateKind.Tuple; aggregate.type = fn_type;
+        aggregate.elems.push(self.fn_address(entry, raw_pointer)); aggregate.elems.push(env); aggregate.captures = captured;
+        uint result = self.new_temp(&*c, fn_type, span);
+        self.assign(&*c, Place.of(result), aggregate, span);
+        return Operand.move_of(Place.of(result));
+    }
+
+    // ---------- statements ----------
+
+    void lower_block_into(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong block, Place dest, bool has_dest) {
+        var b = t.get(key_file(block) as usize).unwrap().block(key_index(block)); Span span = b.span;
+        self.push_scope(&*c);
+        for (s in &const b.stmts) { self.lower_stmt(t, &*c, child(block, *s)); if (self.block_terminated(&*c)) { break; } }
+        if (!self.block_terminated(&*c)) {
+            if (b.tail != ast.NONE) {
+                ulong tail = child(block, b.tail); var tt = self.type_of(&*c, tail);
+                if (has_dest && !self.ck.is_void(tt) && !self.ck.is_never(tt)) { self.lower_into(t, &*c, tail, dest); }
+                else { var o = self.lower_operand(t, &*c, tail); }
+            }
+        }
+        if (!self.block_terminated(&*c)) { self.pop_scope(&*c, span); } else { self.drop_scope(&*c); }
+    }
+    void lower_stmt(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong stmt) {
+        var s = t.get(key_file(stmt) as usize).unwrap().stmt(key_index(stmt)); Span span = s.span;
+        match s.kind {
+            ast.StmtKind.VarDecl => {
+                uint checker_id = *self.ck.result.decl_locals.get(stmt).unwrap();
+                var lt = self.checker_local(&*c, checker_id).type; var ty = self.subst_type(&*c, lt);
+                uint local = self.new_temp(&*c, ty, s.name_span);
+                self.fun(&*c).locals.get_mut(local as usize).unwrap().name = defs.name(s.text);
+                self.map_local(&*c, checker_id, local);
+                if (s.b != ast.NONE) { self.lower_into(t, &*c, child(stmt, s.b), Place.of(local)); }
+                self.push_local(&*c, local);
+            }
+            ast.StmtKind.Expr => {
+                ulong e = child(stmt, s.a); var ty = self.type_of(&*c, e); var kind = self.ex(t, e).kind;
+                match kind {
+                    ast.ExprKind.If => { self.lower_if(t, &*c, e, Place.none(), false); return; }
+                    ast.ExprKind.Match => { self.lower_match(t, &*c, e, Place.none(), false); return; }
+                    ast.ExprKind.Block => { self.lower_block_into(t, &*c, child(e, self.ex(t, e).a), Place.none(), false); return; }
+                    _ => {}
+                }
+                var o = self.lower_operand(t, &*c, e);
+                if (o.is_move() && o.place.is_local() && self.needs_drop(ty) && !self.local_named(&*c, o.place.local)) {
+                    self.emit(&*c, Statement.new(StatementKind.Drop, o.place, span));
+                }
+            }
+            ast.StmtKind.Assign => {
+                ulong target_key = child(stmt, s.a); ulong value_key = child(stmt, s.b);
+                var target = Place.of(0);
+                if (!self.lower_place(t, &*c, target_key, &target)) { self.error(self.ex(t, target_key).span, "cannot assign to this expression"); return; }
+                var tt = self.type_of(&*c, target_key);
+                match s.assign_op {
+                    ast.AssignOp.Assign => {
+                        if (self.needs_drop(tt) && !self.assigns_through_raw_pointer(t, &*c, target_key)) {
+                            uint replacement = self.new_temp(&*c, tt, self.ex(t, value_key).span);
+                            self.push_local(&*c, replacement);
+                            self.lower_into(t, &*c, value_key, Place.of(replacement));
+                            self.emit(&*c, Statement.new(StatementKind.Drop, target.copy(), span));
+                            var value = self.operand_from_place(Place.of(replacement), tt);
+                            self.assign(&*c, target, Rvalue.use_of(value), span);
+                        } else { self.lower_into(t, &*c, value_key, target); }
+                    }
+                    _ => {
+                        var rhs = self.lower_operand(t, &*c, value_key);
+                        var r = Rvalue.new(RvalueKind.Binary);
+                        match s.assign_op {
+                            ast.AssignOp.Add => { r.bop = ast.BinaryOp.Add; }, ast.AssignOp.Sub => { r.bop = ast.BinaryOp.Sub; },
+                            ast.AssignOp.Mul => { r.bop = ast.BinaryOp.Mul; }, ast.AssignOp.Div => { r.bop = ast.BinaryOp.Div; },
+                            ast.AssignOp.Rem => { r.bop = ast.BinaryOp.Rem; }, ast.AssignOp.BitAnd => { r.bop = ast.BinaryOp.BitAnd; },
+                            ast.AssignOp.BitOr => { r.bop = ast.BinaryOp.BitOr; }, ast.AssignOp.BitXor => { r.bop = ast.BinaryOp.BitXor; },
+                            ast.AssignOp.Shl => { r.bop = ast.BinaryOp.Shl; }, ast.AssignOp.Shr => { r.bop = ast.BinaryOp.Shr; }, _ => {}
+                        }
+                        r.a = Operand.copy_of(target.copy()); r.b = rhs; r.type = tt;
+                        self.assign(&*c, target, r, span);
+                    }
+                }
+            }
+            ast.StmtKind.While => {
+                ulong cond_key = child(stmt, s.a); Span cond_span = self.ex(t, cond_key).span;
+                uint head = self.new_block(&*c); uint body = self.new_block(&*c); uint exit = self.new_block(&*c); uint condition_exit = self.new_block(&*c);
+                self.goto_block(&*c, head);
+                usize condition_depth = c.scopes.len();
+                self.push_scope(&*c);
+                var cond = self.lower_operand(t, &*c, cond_key);
+                var sw = Terminator.new(TerminatorKind.Switch); sw.discr = cond; sw.cases.push(Case { value: 1, block: body });
+                sw.otherwise = condition_exit; sw.span = cond_span; self.set_term(&*c, sw);
+                c.current = body;
+                c.loops.push(LoopCtx { break_block: exit, continue_block: head, scope_depth: condition_depth });
+                self.lower_block_into(t, &*c, child(stmt, s.b), Place.none(), false);
+                var unused = c.loops.pop();
+                self.emit_drops_to(&*c, condition_depth, cond_span);
+                if (!self.block_terminated(&*c)) { self.goto_block(&*c, head); }
+                c.current = condition_exit;
+                self.pop_scope(&*c, cond_span);
+                self.goto_block(&*c, exit);
+                c.current = exit;
+            }
+            ast.StmtKind.Loop => {
+                uint body = self.new_block(&*c); uint exit = self.new_block(&*c);
+                self.goto_block(&*c, body);
+                c.loops.push(LoopCtx { break_block: exit, continue_block: body, scope_depth: c.scopes.len() });
+                self.lower_block_into(t, &*c, child(stmt, s.a), Place.none(), false);
+                var unused = c.loops.pop();
+                if (!self.block_terminated(&*c)) { self.goto_block(&*c, body); }
+                c.current = exit;
+            }
+            ast.StmtKind.For => { self.lower_for(t, &*c, stmt); }
+        }
+    }
+    Rvalue compare_locals(&const self, ast.BinaryOp op, uint a, uint b, TypeId bool_type) {
+        var r = Rvalue.new(RvalueKind.Binary); r.bop = op; r.a = Operand.copy_of(Place.of(a)); r.b = Operand.copy_of(Place.of(b)); r.type = bool_type; return r;
+    }
+    void lower_for(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong stmt) {
+        var s = t.get(key_file(stmt) as usize).unwrap().stmt(key_index(stmt)); Span span = s.span;
+        ulong pattern = child(stmt, s.a); ulong iter = child(stmt, s.b); ulong body_block = child(stmt, s.c);
+        Span iter_span = self.ex(t, iter).span; Span pattern_span = t.get(key_file(stmt) as usize).unwrap().pattern(s.a).span;
+        var it = self.type_of(&*c, iter);
+        int refs = 0; var base = it;
+        while (self.ck.tk(base) == K_REF) { base = self.ck.inner(base); refs += 1; }
+        bool is_const_ref = refs > 0 && self.ck.const_of(it);
+        var bool_type = self.ck.bool_t();
+        self.push_scope(&*c);
+        if (self.ck.tk(base) == K_STRUCT && (same_def(self.ck.def_of(base), self.ck.r.program.range_def) || same_def(self.ck.def_of(base), self.ck.r.program.range_inclusive_def))) {
+            bool inclusive = same_def(self.ck.def_of(base), self.ck.r.program.range_inclusive_def);
+            var elem = self.ck.elem(base, 0);
+            var range = self.lower_operand(t, &*c, iter);
+            uint range_local = self.new_temp(&*c, base, iter_span);
+            var use = Rvalue.new(RvalueKind.Use);
+            if (refs > 0) {
+                var rp = range.place.copy(); for (i in 0..refs) { rp = rp.deref(); }
+                use.a = Operand.copy_of(rp);
+            } else { use.a = range; }
+            self.assign(&*c, Place.of(range_local), use, iter_span);
+            uint i = self.new_temp(&*c, elem, pattern_span);
+            uint end = self.new_temp(&*c, elem, iter_span);
+            self.assign(&*c, Place.of(i), Rvalue.use_of(Operand.copy_of(Place.of(range_local).field(0))), span);
+            self.assign(&*c, Place.of(end), Rvalue.use_of(Operand.copy_of(Place.of(range_local).field(1))), span);
+            uint head = self.new_block(&*c); uint body = self.new_block(&*c); uint step = self.new_block(&*c); uint exit = self.new_block(&*c);
+            self.goto_block(&*c, head);
+            uint cond = self.new_temp(&*c, bool_type, span);
+            var op = if (inclusive) { ast.BinaryOp.Le } else { ast.BinaryOp.Lt };
+            self.assign(&*c, Place.of(cond), self.compare_locals(op, i, end, bool_type), span);
+            var sw = Terminator.new(TerminatorKind.Switch); sw.discr = Operand.copy_of(Place.of(cond)); sw.cases.push(Case { value: 1, block: body });
+            sw.otherwise = exit; sw.span = span; self.set_term(&*c, sw);
+            c.current = body;
+            self.push_scope(&*c);
+            self.lower_pattern_bind(t, &*c, pattern, Place.of(i), elem, 0);
+            c.loops.push(LoopCtx { break_block: exit, continue_block: step, scope_depth: c.scopes.len() - 1 });
+            self.lower_block_into(t, &*c, body_block, Place.none(), false);
+            var unused = c.loops.pop();
+            if (!self.block_terminated(&*c)) { self.pop_scope(&*c, span); self.goto_block(&*c, step); } else { self.drop_scope(&*c); }
+            c.current = step;
+            if (inclusive) {
+                uint advance = self.new_block(&*c);
+                uint done = self.new_temp(&*c, bool_type, span);
+                self.assign(&*c, Place.of(done), self.compare_locals(ast.BinaryOp.Eq, i, end, bool_type), span);
+                var stop = Terminator.new(TerminatorKind.Switch); stop.discr = Operand.copy_of(Place.of(done)); stop.cases.push(Case { value: 1, block: exit });
+                stop.otherwise = advance; stop.span = span; self.set_term(&*c, stop); c.current = advance;
+            }
+            var inc = Rvalue.new(RvalueKind.Binary); inc.bop = ast.BinaryOp.Add; inc.a = Operand.copy_of(Place.of(i));
+            inc.b = Operand.constant_of(self.int_const(1, elem)); inc.type = elem;
+            self.assign(&*c, Place.of(i), inc, span);
+            self.goto_block(&*c, head);
+            c.current = exit;
+            self.pop_scope(&*c, span);
+            return;
+        }
+        TypeId elem_t = TypeId.none(); var container = Place.of(0); var container_t = base;
+        if (self.ck.tk(base) == K_ARRAY || self.ck.tk(base) == K_SLICE) { elem_t = self.ck.inner(base); }
+        else if (self.ck.tk(base) == K_STRUCT && same_def(self.ck.def_of(base), self.ck.r.program.vec_def)) { elem_t = self.ck.elem(base, 0); }
+        if (elem_t.index == NONE) { self.error(iter_span, "cannot iterate over this value"); self.drop_scope(&*c); return; }
+        if (refs > 0) {
+            var r = self.lower_operand(t, &*c, iter);
+            uint rl = self.new_temp(&*c, it, iter_span);
+            self.assign(&*c, Place.of(rl), Rvalue.use_of(r), iter_span);
+            container = Place.of(rl);
+            for (k in 0..refs) { container = container.deref(); }
+        } else {
+            if (!self.is_copy_type(elem_t) && self.ck.tk(base) == K_ARRAY) {
+                self.error(iter_span, "iterating an array by value moves its elements; iterate over &const array instead");
+            }
+            if (self.ck.tk(base) == K_STRUCT) { self.error(iter_span, "iterating a Vec by value is not supported yet; iterate over &const vec or &vec"); }
+            if (!self.lower_place(t, &*c, iter, &container)) {
+                var r = self.lower_operand(t, &*c, iter);
+                uint rl = self.new_temp(&*c, it, iter_span);
+                self.assign(&*c, Place.of(rl), Rvalue.use_of(r), iter_span);
+                container = Place.of(rl);
+                self.push_local(&*c, rl);
+            }
+        }
+        var usize_type = self.ck.usize_t();
+        uint len = self.new_temp(&*c, usize_type, iter_span);
+        var lenv = Rvalue.new(RvalueKind.Len); lenv.place = container.copy(); lenv.type = usize_type;
+        self.assign(&*c, Place.of(len), lenv, iter_span);
+        uint i = self.new_temp(&*c, usize_type, span);
+        self.assign(&*c, Place.of(i), Rvalue.use_of(Operand.constant_of(self.int_const(0, usize_type))), span);
+        uint head = self.new_block(&*c); uint body = self.new_block(&*c); uint step = self.new_block(&*c); uint exit = self.new_block(&*c);
+        self.goto_block(&*c, head);
+        uint cond = self.new_temp(&*c, bool_type, span);
+        self.assign(&*c, Place.of(cond), self.compare_locals(ast.BinaryOp.Lt, i, len, bool_type), span);
+        var sw = Terminator.new(TerminatorKind.Switch); sw.discr = Operand.copy_of(Place.of(cond)); sw.cases.push(Case { value: 1, block: body });
+        sw.otherwise = exit; sw.span = span; self.set_term(&*c, sw);
+        c.current = body;
+        self.push_scope(&*c);
+        var elem_place = if (self.ck.tk(container_t) == K_STRUCT) { container.field(0).index(i) } else { container.index(i) };
+        if (refs > 0) {
+            var rt = self.tref(elem_t, is_const_ref);
+            uint r = self.new_temp(&*c, rt, pattern_span);
+            var rv = Rvalue.new(RvalueKind.Ref); rv.place = elem_place; rv.is_const = is_const_ref; rv.type = rt;
+            self.assign(&*c, Place.of(r), rv, pattern_span);
+            self.lower_pattern_bind(t, &*c, pattern, Place.of(r), rt, 0);
+        } else { self.lower_pattern_bind(t, &*c, pattern, elem_place, elem_t, 0); }
+        c.loops.push(LoopCtx { break_block: exit, continue_block: step, scope_depth: c.scopes.len() - 1 });
+        self.lower_block_into(t, &*c, body_block, Place.none(), false);
+        var unused = c.loops.pop();
+        if (!self.block_terminated(&*c)) { self.pop_scope(&*c, span); self.goto_block(&*c, step); } else { self.drop_scope(&*c); }
+        c.current = step;
+        var inc = Rvalue.new(RvalueKind.Binary); inc.bop = ast.BinaryOp.Add; inc.a = Operand.copy_of(Place.of(i));
+        inc.b = Operand.constant_of(self.int_const(1, usize_type)); inc.type = usize_type;
+        self.assign(&*c, Place.of(i), inc, span);
+        self.goto_block(&*c, head);
+        c.current = exit;
+        self.pop_scope(&*c, span);
+    }
+    bool assigns_through_raw_pointer(&self, &const Vec<ast.Ast> t, &const FnCtx c, ulong target) {
+        ulong e = target;
+        while (true) {
+            var x = self.ex(t, e);
+            match x.kind {
+                ast.ExprKind.Field => { e = child(e, x.a); }
+                ast.ExprKind.Index => { e = child(e, x.a); }
+                ast.ExprKind.Unary => {
+                    match x.unary_op { ast.UnaryOp.Deref => {}, _ => return false }
+                    ulong operand = child(e, x.a);
+                    if (self.ck.tk(self.type_of(c, operand)) == K_PTR) { return true; }
+                    e = operand;
+                }
+                _ => return false,
+            }
+        }
+        return false;
+    }
+    void lower_return(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong value, Span span) {
+        if (value != check_data.NO_KEY) {
+            var vt = self.type_of(&*c, value);
+            if (!self.ck.is_void(vt) && !self.ck.is_never(vt)) { self.lower_into(t, &*c, value, Place.of(0)); }
+            else { var o = self.lower_operand(t, &*c, value); }
+        }
+        self.emit_drops_to(&*c, 0, span);
+        var term = Terminator.new(TerminatorKind.Goto); term.target = c.return_block; term.span = span; self.set_term(&*c, term);
+    }
+
+    // ---------- places ----------
+
+    bool lower_place(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, &Place out) {
+        var x = self.ex(t, e);
+        match x.kind {
+            ast.ExprKind.Name => {
+                match self.ref_of(e) {
+                    Some(r) => { match r.kind { RefKind.Local => {}, _ => return false } put_place(&*out, self.checker_place(&*c, r.local_id)); return !out.is_none(); }
+                    None => return false,
+                }
+            }
+            ast.ExprKind.Field => {
+                var r = NameRef.new();
+                match self.ref_of(e) { Some(found) => { r = found; }, None => return false }
+                match r.kind { RefKind.Field => {}, RefKind.TupleField => {}, _ => return false }
+                ulong base_key = child(e, x.a); var base = Place.of(0);
+                if (!self.lower_place(t, &*c, base_key, &base)) {
+                    var o = self.lower_operand(t, &*c, base_key);
+                    if (o.is_const()) { return false; }
+                    base = o.place;
+                    if (base.is_local()) { self.scope_temporary(&*c, base.local); }
+                }
+                for (i in 0..r.auto_derefs) { base = base.deref(); }
+                put_place(&*out, base.field(r.field_index));
+                return true;
+            }
+            ast.ExprKind.Index => {
+                int derefs = 0; match self.ref_of(e) { Some(r) => { derefs = r.auto_derefs; }, None => {} }
+                ulong base_key = child(e, x.a); ulong index_key = child(e, x.b);
+                var bt = self.type_of(&*c, base_key); var base_t = bt;
+                for (i in 0..derefs) { base_t = self.ck.inner(base_t); }
+                var idx_t = self.type_of(&*c, index_key);
+                if (self.ck.tk(idx_t) == K_STRUCT) { self.error(x.span, "slicing with a range is not supported in code generation yet"); return false; }
+                var base = Place.of(0);
+                if (!self.lower_place(t, &*c, base_key, &base)) {
+                    var o = self.lower_operand(t, &*c, base_key);
+                    if (o.is_const()) { return false; }
+                    base = o.place;
+                    if (base.is_local()) { self.scope_temporary(&*c, base.local); }
+                }
+                for (i in 0..derefs) { base = base.deref(); }
+                var idx = self.lower_operand(t, &*c, index_key);
+                Span index_span = self.ex(t, index_key).span;
+                uint idx_local = self.new_temp(&*c, self.ck.usize_t(), index_span);
+                self.assign(&*c, Place.of(idx_local), Rvalue.use_of(idx), index_span);
+                self.emit_bounds_check(&*c, idx_local, base.copy(), x.span);
+                put_place(&*out, if (self.ck.tk(base_t) == K_STRUCT) { base.field(0).index(idx_local) } else { base.index(idx_local) });
+                return true;
+            }
+            ast.ExprKind.Unary => {
+                match x.unary_op { ast.UnaryOp.Deref => {}, _ => return false }
+                ulong operand = child(e, x.a); var base = Place.of(0);
+                if (!self.lower_place(t, &*c, operand, &base)) {
+                    var o = self.lower_operand(t, &*c, operand);
+                    if (o.is_const()) { return false; }
+                    base = o.place;
+                    if (base.is_local()) { self.scope_temporary(&*c, base.local); }
+                }
+                put_place(&*out, base.deref());
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    void emit_bounds_check(&self, &FnCtx c, uint index_local, Place container, Span span) {
+        var usize_type = self.ck.usize_t(); var bool_type = self.ck.bool_t();
+        uint len = self.new_temp(&*c, usize_type, span);
+        var lenv = Rvalue.new(RvalueKind.Len); lenv.place = container; lenv.type = usize_type;
+        self.assign(&*c, Place.of(len), lenv, span);
+        uint ok = self.new_temp(&*c, bool_type, span);
+        self.assign(&*c, Place.of(ok), self.compare_locals(ast.BinaryOp.Lt, index_local, len, bool_type), span);
+        var term = Terminator.new(TerminatorKind.Assert); term.cond = Operand.copy_of(Place.of(ok));
+        term.message = String.from("index out of bounds"); term.span = span;
+        uint next = self.new_block(&*c); term.target = next; self.set_term(&*c, term); c.current = next;
+    }
+
+    // ---------- expressions ----------
+
+    Operand borrow_operand(&self, &FnCtx c, Operand o, bool is_const, TypeId from, Span span) {
+        var p = Place.of(0);
+        if (o.is_const()) {
+            uint tmp = self.new_temp(&*c, from, span);
+            self.assign(&*c, Place.of(tmp), Rvalue.use_of(o), span);
+            p = Place.of(tmp); self.push_local(&*c, tmp);
+        } else { p = o.place; self.scope_temporary(&*c, p.local); }
+        var rt = self.tref(from, is_const);
+        uint r = self.new_temp(&*c, rt, span);
+        var rv = Rvalue.new(RvalueKind.Ref); rv.place = p; rv.is_const = is_const; rv.type = rt;
+        self.assign(&*c, Place.of(r), rv, span);
+        return Operand.copy_of(Place.of(r));
+    }
+    Operand apply_coercion(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, Operand op, TypeId from) {
+        Coercion co = check_data.coercion(CoercionKind.None);
+        match self.ck.result.coercions.get(e) { Some(found) => { co = Coercion { kind: found.kind, borrow_first: found.borrow_first, target: found.target }; }, None => return op }
+        Span span = self.ex(t, e).span;
+        match co.kind {
+            CoercionKind.None => return op, CoercionKind.MutToConst => return op, CoercionKind.NeverToAny => return op,
+            CoercionKind.AutoBorrowConst => return self.borrow_operand(&*c, op, true, from, span),
+            CoercionKind.AutoBorrowMut => return self.borrow_operand(&*c, op, false, from, span),
+            CoercionKind.ToDyn => {
+                var r = if (co.borrow_first) { self.borrow_operand(&*c, op, true, from, span) } else { op };
+                var concrete = if (co.borrow_first) { from } else { self.ck.inner(from) };
+                var target = self.subst_type(&*c, co.target);
+                var rv = Rvalue.new(RvalueKind.ToDyn); rv.a = r; rv.type = target;
+                rv.vtable = self.vtable_for(concrete, self.ck.inner(target), span);
+                uint local = self.new_temp(&*c, target, span);
+                self.assign(&*c, Place.of(local), rv, span);
+                return Operand.copy_of(Place.of(local));
+            }
+            CoercionKind.FnMode => {
+                var target = self.subst_type(&*c, co.target);
+                uint value = self.new_temp(&*c, target, span);
+                self.assign(&*c, Place.of(value), Rvalue.use_of(op), span);
+                return Operand.move_of(Place.of(value));
+            }
+            _ => {
+                var r = if (co.borrow_first) { self.borrow_operand(&*c, op, true, from, span) } else { op };
+                var ref_t = if (co.borrow_first) { self.tref(from, true) } else { from };
+                var inner = self.ck.inner(ref_t);
+                var rv = Rvalue.new(RvalueKind.StrFromString); TypeId result = TypeId.none();
+                match co.kind {
+                    CoercionKind.StringToStr => { rv.kind = RvalueKind.StrFromString; result = self.tref(self.tstr(), true); }
+                    CoercionKind.ArrayToSlice => { rv.kind = RvalueKind.ArrayToSlice; var sl = self.ck.r.types.slice(self.ck.inner(inner)); result = self.tref(sl, self.ck.const_of(ref_t)); }
+                    _ => { rv.kind = RvalueKind.VecToSlice; var sl = self.ck.r.types.slice(self.ck.elem(inner, 0)); result = self.tref(sl, self.ck.const_of(ref_t)); }
+                }
+                rv.a = r; rv.type = result;
+                uint local = self.new_temp(&*c, result, span);
+                self.assign(&*c, Place.of(local), rv, span);
+                return Operand.copy_of(Place.of(local));
+            }
+        }
+    }
+    void lower_into(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, Place dest) {
+        bool coerced = self.has_coercion(e);
+        match self.ex(t, e).kind {
+            ast.ExprKind.If => { if (!coerced) { self.lower_if(t, &*c, e, dest, true); return; } }
+            ast.ExprKind.Match => { if (!coerced) { self.lower_match(t, &*c, e, dest, true); return; } }
+            ast.ExprKind.Block => { if (!coerced) { self.lower_block_into(t, &*c, child(e, self.ex(t, e).a), dest, true); return; } }
+            ast.ExprKind.Interp => { if (!coerced) { self.lower_interp(t, &*c, e, dest); return; } }
+            ast.ExprKind.Call => { if (!coerced) { var unused = self.lower_call(t, &*c, e, dest, true); return; } }
+            _ => {}
+        }
+        var o = self.lower_operand(t, &*c, e);
+        if (self.block_terminated(&*c)) { return; }
+        self.assign(&*c, dest, Rvalue.use_of(o), self.ex(t, e).span);
+    }
+    Operand lower_const(&self, &const Vec<ast.Ast> t, &FnCtx c, DefId constant) {
+        Span cspan = self.ck.r.program.def(constant).span;
+        if (!self.ck.result.const_locals.has(constant.index as ulong)) { self.error(cspan, "internal error: constant was not checked"); return Operand.empty(); }
+        var saved_map = mem.replace(&c.local_map, Vec.new());
+        var saved_captures = mem.replace(&c.captures, Vec.new());
+        var saved_constant = c.constant;
+        c.constant = constant;
+        usize n = self.ck.result.const_locals.get(constant.index as ulong).unwrap().len();
+        for (i in 0..n) { c.local_map.push(NONE); }
+        var ty = self.subst_type(&*c, self.ck.r.program.def(constant).ret);
+        uint result = self.new_temp(&*c, ty, cspan);
+        self.push_scope(&*c);
+        var d = self.ck.r.program.def(constant); uint file = d.ast_file; uint value = t.get(file as usize).unwrap().items.get(d.ast_index as usize).unwrap().b;
+        self.lower_into(t, &*c, node_key(file, value), Place.of(result));
+        self.pop_scope(&*c, cspan);
+        c.local_map = saved_map; c.captures = saved_captures; c.constant = saved_constant;
+        return self.operand_from_place(Place.of(result), ty);
+    }
+
+    Operand temp_of(&self, &FnCtx c, Rvalue r, TypeId t, Span span) {
+        uint tmp = self.new_temp(&*c, t, span);
+        self.assign(&*c, Place.of(tmp), r, span);
+        return self.operand_from_place(Place.of(tmp), t);
+    }
+    Operand unit_value(&self, TypeId t) { return Operand.constant_of(Constant.new(ConstantKind.Unit, t)); }
+    Operand fn_value(&self, &const FnCtx c, &const NameRef r, TypeId t, Span span) {
+        var d = self.ck.r.program.def(r.fn_def);
+        if (d.is_builtin || check.owner_index(d.owner) == 5) {
+            self.error(span, "using a builtin or extern function as a function value is not supported yet"); return Operand.empty();
+        }
+        Vec<TypeId> owner = Vec.new(); Vec<TypeId> args = Vec.new();
+        for (a in &const r.owner_args) { owner.push(self.subst_type(c, *a)); }
+        for (a in &const r.type_args) { args.push(self.subst_type(c, *a)); }
+        uint f = self.instance(r.fn_def, owner, args);
+        return self.fn_address(f, t);
+    }
+    Operand unit_variant(&self, &FnCtx c, &const NameRef r, TypeId t, Span span) {
+        var agg = Rvalue.new(RvalueKind.Aggregate); agg.agg = AggregateKind.Variant; agg.variant = r.variant; agg.type = t;
+        return self.temp_of(&*c, agg, t, span);
+    }
+    Operand lower_operand(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e) {
+        var x = self.ex(t, e); Span span = x.span;
+        var ty = self.type_of(&*c, e);
+        Operand o = Operand.empty();
+        match x.kind {
+            ast.ExprKind.IntLit => { o = Operand.constant_of(self.int_const(x.number, ty)); }
+            ast.ExprKind.FloatLit => { var k = Constant.new(ConstantKind.Float, ty); k.float_value = x.real; o = Operand.constant_of(k); }
+            ast.ExprKind.CharLit => { var k = Constant.new(ConstantKind.Char, ty); k.int_value = x.number; o = Operand.constant_of(k); }
+            ast.ExprKind.BoolLit => { var k = Constant.new(ConstantKind.Bool, ty); k.int_value = if (x.flag) { 1 } else { 0 }; o = Operand.constant_of(k); }
+            ast.ExprKind.StringLit => { var k = Constant.new(ConstantKind.Str, ty); k.str_value = bytes.copy(x.text, 0, x.text.len()); o = Operand.constant_of(k); }
+            ast.ExprKind.Interp => {
+                uint tmp = self.new_temp(&*c, ty, span);
+                self.lower_interp(t, &*c, e, Place.of(tmp));
+                o = Operand.move_of(Place.of(tmp));
+            }
+            ast.ExprKind.Name => {
+                var r = NameRef.new();
+                match self.ref_of(e) { Some(found) => { r = found; }, None => { self.error(span, "unresolved name"); return Operand.empty(); } }
+                match r.kind {
+                    RefKind.Local => {
+                        var p = Place.of(0);
+                        if (!self.lower_place(t, &*c, e, &p)) { self.error(span, "unmapped local"); return Operand.empty(); }
+                        o = self.operand_from_place(p, ty);
+                    }
+                    RefKind.Function => {
+                        var d = self.ck.r.program.def(r.fn_def);
+                        if (d.is_builtin || check.owner_index(d.owner) == 5) {
+                            self.error(span, "using a builtin or extern function as a function value is not supported yet"); return Operand.empty();
+                        }
+                        Vec<TypeId> args = Vec.new(); for (a in &const r.type_args) { args.push(self.subst_type(&*c, *a)); }
+                        uint f = self.instance(r.fn_def, Vec.new(), args);
+                        o = self.fn_address(f, ty);
+                    }
+                    RefKind.Variant => {
+                        if (self.ck.variant_kind(r.variant_enum, r.variant) == 0) { o = self.unit_variant(&*c, &r, ty, span); }
+                        else { self.error(span, "using a variant constructor as a function value is not supported yet"); return Operand.empty(); }
+                    }
+                    RefKind.Const => { o = self.lower_const(t, &*c, r.const_def); }
+                    _ => { self.error(span, "this name cannot be used as a value"); return Operand.empty(); }
+                }
+            }
+            ast.ExprKind.Field => {
+                var found = self.ref_of(e);
+                bool done = false;
+                match found {
+                    Some(r) => {
+                        match r.kind {
+                            RefKind.Field => {
+                                var p = Place.of(0);
+                                if (!self.lower_place(t, &*c, e, &p)) { self.error(span, "cannot read this field"); return Operand.empty(); }
+                                o = self.operand_from_place(p, ty); done = true;
+                            }
+                            RefKind.TupleField => {
+                                var p = Place.of(0);
+                                if (!self.lower_place(t, &*c, e, &p)) { self.error(span, "cannot read this field"); return Operand.empty(); }
+                                o = self.operand_from_place(p, ty); done = true;
+                            }
+                            RefKind.Variant => {
+                                if (self.ck.variant_kind(r.variant_enum, r.variant) == 0) { o = self.unit_variant(&*c, &r, ty, span); done = true; }
+                            }
+                            RefKind.AssocFn => { o = self.fn_value(&*c, &r, ty, span); if (o.is_const() && o.constant.type.index == NONE) { return o; } done = true; }
+                            RefKind.Function => { o = self.fn_value(&*c, &r, ty, span); if (o.is_const() && o.constant.type.index == NONE) { return o; } done = true; }
+                            RefKind.Const => { o = self.lower_const(t, &*c, r.const_def); done = true; }
+                            _ => {}
+                        }
+                    }
+                    None => {}
+                }
+                if (!done) { self.error(span, "this member access cannot be used as a value yet"); return Operand.empty(); }
+            }
+            ast.ExprKind.Call => { o = self.lower_call(t, &*c, e, Place.none(), false); }
+            ast.ExprKind.Index => {
+                var p = Place.of(0);
+                if (!self.lower_place(t, &*c, e, &p)) { return Operand.empty(); }
+                o = self.operand_from_place(p, ty);
+            }
+            ast.ExprKind.Unary => {
+                match x.unary_op {
+                    ast.UnaryOp.Deref => {
+                        var p = Place.of(0);
+                        if (!self.lower_place(t, &*c, e, &p)) { return Operand.empty(); }
+                        o = self.operand_from_place(p, ty);
+                    }
+                    _ => {
+                        ulong operand = child(e, x.a); var on = self.ex(t, operand);
+                        bool minimum = false;
+                        match x.unary_op { ast.UnaryOp.Neg => {
+                            match on.kind { ast.ExprKind.IntLit => { minimum = self.ck.is_prim(ty, ast.PrimKind.Long) && on.number == ((1 as ulong) << 63); }, _ => {} }
+                        }, _ => {} }
+                        var operand_type = self.type_of(&*c, operand); uint ok = self.ck.tk(operand_type);
+                        bool trait_op = false;
+                        match x.unary_op { ast.UnaryOp.Neg => { trait_op = true; }, ast.UnaryOp.Not => { trait_op = true; }, _ => {} }
+                        if (minimum) { o = Operand.constant_of(self.int_const((1 as ulong) << 63, ty)); }
+                        else if (trait_op && (ok == K_STRUCT || ok == K_ENUM)) {
+                            bool neg = false; match x.unary_op { ast.UnaryOp.Neg => { neg = true; }, _ => {} }
+                            o = self.lower_unary_trait(t, &*c, operand, neg, operand_type, ty, span);
+                        }
+                        else {
+                            var r = Rvalue.new(RvalueKind.Unary); r.uop = x.unary_op; r.a = self.lower_operand(t, &*c, operand); r.type = ty;
+                            o = self.temp_of(&*c, r, ty, span);
+                        }
+                    }
+                }
+            }
+            ast.ExprKind.Binary => { o = self.lower_binary(t, &*c, e, Place.none(), false); }
+            ast.ExprKind.Cast => {
+                var r = Rvalue.new(RvalueKind.Cast); r.a = self.lower_operand(t, &*c, child(e, x.a)); r.type = ty;
+                o = self.temp_of(&*c, r, ty, span);
+            }
+            ast.ExprKind.Try => { o = self.lower_try(t, &*c, e); }
+            ast.ExprKind.OptChain => { self.error(span, "'?.' is not supported in code generation yet"); return Operand.empty(); }
+            ast.ExprKind.Coalesce => {
+                ulong value_key = child(e, x.a); ulong fallback = child(e, x.b); Span vspan = self.ex(t, value_key).span;
+                var vt = self.type_of(&*c, value_key);
+                var v = self.lower_operand(t, &*c, value_key);
+                uint vl = self.new_temp(&*c, vt, vspan);
+                self.assign(&*c, Place.of(vl), Rvalue.use_of(v), vspan);
+                uint result = self.new_temp(&*c, ty, span);
+                var usize_type = self.ck.usize_t();
+                uint disc = self.new_temp(&*c, usize_type, span);
+                var d = Rvalue.new(RvalueKind.Discriminant); d.place = Place.of(vl); d.type = usize_type;
+                self.assign(&*c, Place.of(disc), d, span);
+                uint some_b = self.new_block(&*c); uint none_b = self.new_block(&*c); uint join = self.new_block(&*c);
+                uint some = self.ck.find_variant(self.ck.r.program.option_def, "Some");
+                var sw = Terminator.new(TerminatorKind.Switch); sw.discr = Operand.copy_of(Place.of(disc));
+                sw.cases.push(Case { value: some as ulong, block: some_b }); sw.otherwise = none_b; sw.span = span; self.set_term(&*c, sw);
+                c.current = some_b;
+                var take = self.operand_from_place(Place.of(vl).downcast(some).field(0), ty);
+                self.assign(&*c, Place.of(result), Rvalue.use_of(take), span);
+                self.goto_block(&*c, join);
+                c.current = none_b;
+                self.lower_into(t, &*c, fallback, Place.of(result));
+                self.goto_block(&*c, join);
+                c.current = join;
+                o = self.operand_from_place(Place.of(result), ty);
+            }
+            ast.ExprKind.Range => {
+                var agg = Rvalue.new(RvalueKind.Aggregate); agg.agg = AggregateKind.Struct; agg.type = ty;
+                agg.elems.push(self.lower_operand(t, &*c, child(e, x.a)));
+                agg.elems.push(self.lower_operand(t, &*c, child(e, x.b)));
+                o = self.temp_of(&*c, agg, ty, span);
+            }
+            ast.ExprKind.Ref => {
+                ulong operand = child(e, x.a); var p = Place.of(0);
+                if (!self.lower_place(t, &*c, operand, &p)) {
+                    var ot = self.type_of(&*c, operand); Span os = self.ex(t, operand).span;
+                    var value = self.lower_operand(t, &*c, operand);
+                    uint tmp = self.new_temp(&*c, ot, os);
+                    self.assign(&*c, Place.of(tmp), Rvalue.use_of(value), os);
+                    self.push_local(&*c, tmp);
+                    p = Place.of(tmp);
+                }
+                var rv = Rvalue.new(RvalueKind.Ref); rv.place = p; rv.is_const = x.flag; rv.type = ty;
+                o = self.temp_of(&*c, rv, ty, span);
+            }
+            ast.ExprKind.StructLit => {
+                var agg = Rvalue.new(RvalueKind.Aggregate); agg.type = ty;
+                Vec<defs.FieldDef> fields = Vec.new();
+                bool variant = false; var r = NameRef.new();
+                match self.ref_of(e) { Some(found) => { r = found; match r.kind { RefKind.Variant => { variant = true; }, _ => {} } }, None => {} }
+                if (variant) {
+                    agg.agg = AggregateKind.Variant; agg.variant = r.variant;
+                    for (fd in &const self.ck.r.program.def(r.variant_enum).variants.get(r.variant as usize).unwrap().fields) { fields.push(defs.FieldDef { name: String.from(fd.name), span: fd.span, type: fd.type, is_pub: fd.is_pub }); }
+                } else {
+                    agg.agg = AggregateKind.Struct;
+                    for (fd in &const self.ck.r.program.def(self.ck.def_of(ty)).fields) { fields.push(defs.FieldDef { name: String.from(fd.name), span: fd.span, type: fd.type, is_pub: fd.is_pub }); }
+                }
+                Vec<Operand> values = Vec.new(); for (i in 0..fields.len()) { values.push(Operand.empty()); }
+                for (position in 0..x.fields.len()) {
+                    var init = x.fields.get(position).unwrap(); var name = defs.name(init.name);
+                    usize idx = fields.len(); for (k in 0..fields.len()) { if (idx == fields.len() && fields.get(k).unwrap().name == name) { idx = k; } }
+                    if (idx == fields.len()) { continue; }
+                    if (init.value != ast.NONE) { *values.get_mut(idx).unwrap() = self.lower_operand(t, &*c, child(e, init.value)); }
+                    else {
+                        ulong key = check_data.field_key(key_file(e), key_index(e), position);
+                        if (!self.ck.result.shorthand_locals.has(key)) { self.error(init.span, "shorthand field has no local"); continue; }
+                        uint id = *self.ck.result.shorthand_locals.get(key).unwrap();
+                        var p = self.checker_place(&*c, id);
+                        if (p.is_none()) { self.error(init.span, "shorthand field has no local"); continue; }
+                        var lt = self.checker_local(&*c, id).type; var st = self.subst_type(&*c, lt);
+                        *values.get_mut(idx).unwrap() = self.operand_from_place(p, st);
+                    }
+                }
+                agg.elems = values;
+                o = self.temp_of(&*c, agg, ty, span);
+            }
+            ast.ExprKind.Tuple => {
+                if (x.items.is_empty()) { o = Operand.constant_of(Constant.new(ConstantKind.Unit, ty)); }
+                else {
+                    var agg = Rvalue.new(RvalueKind.Aggregate); agg.agg = AggregateKind.Tuple; agg.type = ty;
+                    for (item in &const x.items) { agg.elems.push(self.lower_operand(t, &*c, child(e, *item))); }
+                    o = self.temp_of(&*c, agg, ty, span);
+                }
+            }
+            ast.ExprKind.Array => {
+                var agg = Rvalue.new(RvalueKind.Aggregate); agg.agg = AggregateKind.Array; agg.type = ty;
+                for (item in &const x.items) { agg.elems.push(self.lower_operand(t, &*c, child(e, *item))); }
+                o = self.temp_of(&*c, agg, ty, span);
+            }
+            ast.ExprKind.ArrayRepeat => {
+                var agg = Rvalue.new(RvalueKind.Aggregate); agg.agg = AggregateKind.Array; agg.type = ty;
+                var v = self.lower_operand(t, &*c, child(e, x.a));
+                if (!v.is_const() && !self.is_copy_type(self.ck.inner(ty))) { self.error(span, "array repeat needs a Copy element type"); return Operand.empty(); }
+                ulong n = self.ck.length_of(ty); ulong i = 0;
+                while (i < n) { agg.elems.push(v.copy()); i += 1; }
+                o = self.temp_of(&*c, agg, ty, span);
+            }
+            ast.ExprKind.Block => { return self.lower_value_block(t, &*c, e, child(e, x.a), ty); }
+            ast.ExprKind.If => {
+                if (self.ck.is_void(ty) || self.ck.is_never(ty)) { self.lower_if(t, &*c, e, Place.none(), false); return self.unit_value(self.ck.void_t()); }
+                uint tmp = self.new_temp(&*c, ty, span);
+                self.lower_if(t, &*c, e, Place.of(tmp), true);
+                o = self.operand_from_place(Place.of(tmp), ty);
+            }
+            ast.ExprKind.Match => {
+                if (self.ck.is_void(ty) || self.ck.is_never(ty)) { self.lower_match(t, &*c, e, Place.none(), false); return self.unit_value(self.ck.void_t()); }
+                uint tmp = self.new_temp(&*c, ty, span);
+                self.lower_match(t, &*c, e, Place.of(tmp), true);
+                o = self.operand_from_place(Place.of(tmp), ty);
+            }
+            ast.ExprKind.Closure => { o = self.lower_closure(t, &*c, e); }
+            ast.ExprKind.Unsafe => { return self.lower_value_block(t, &*c, e, child(e, x.a), ty); }
+            ast.ExprKind.Await => { o = self.lower_await(t, &*c, e); }
+            ast.ExprKind.Return => {
+                ulong value = if (x.a == ast.NONE) { check_data.NO_KEY } else { child(e, x.a) };
+                self.lower_return(t, &*c, value, span);
+                return self.unit_value(self.tnever());
+            }
+            ast.ExprKind.Break => {
+                if (c.loops.is_empty()) { self.error(span, "break outside loop"); return Operand.empty(); }
+                var top = c.loops.get(c.loops.len() - 1).unwrap(); usize depth = top.scope_depth; uint target = top.break_block;
+                self.emit_drops_to(&*c, depth, span);
+                var term = Terminator.new(TerminatorKind.Goto); term.target = target; term.span = span; self.set_term(&*c, term);
+                return self.unit_value(self.tnever());
+            }
+            ast.ExprKind.Continue => {
+                if (c.loops.is_empty()) { self.error(span, "continue outside loop"); return Operand.empty(); }
+                var top = c.loops.get(c.loops.len() - 1).unwrap(); usize depth = top.scope_depth; uint target = top.continue_block;
+                self.emit_drops_to(&*c, depth, span);
+                var term = Terminator.new(TerminatorKind.Goto); term.target = target; term.span = span; self.set_term(&*c, term);
+                return self.unit_value(self.tnever());
+            }
+        }
+        return self.apply_coercion(t, &*c, e, o, ty);
+    }
+    /// Block and unsafe expressions in operand position.
+    Operand lower_value_block(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, ulong block, TypeId ty) {
+        if (self.ck.is_void(ty) || self.ck.is_never(ty)) {
+            self.lower_block_into(t, &*c, block, Place.none(), false);
+            return self.unit_value(self.ck.void_t());
+        }
+        uint tmp = self.new_temp(&*c, ty, self.ex(t, e).span);
+        self.lower_block_into(t, &*c, block, Place.of(tmp), true);
+        var o = self.operand_from_place(Place.of(tmp), ty);
+        return self.apply_coercion(t, &*c, e, o, ty);
+    }
+    Operand strip_operand(&self, Operand o, TypeId ty) {
+        var out = o; var ot = ty;
+        while (self.ck.tk(ot) == K_REF && !out.is_const()) { out.place = out.place.deref(); out.kind = OperandKind.Copy; ot = self.ck.inner(ot); }
+        return out;
+    }
+    /// Writes rv into dest when present, otherwise into a new temporary.
+    Operand finish_binary(&self, &FnCtx c, Rvalue rv, TypeId ty, Span span, Place dest, bool has_dest) {
+        if (has_dest) { self.assign(&*c, dest.copy(), rv, span); return Operand.copy_of(dest); }
+        uint tmp = self.new_temp(&*c, ty, span);
+        self.assign(&*c, Place.of(tmp), rv, span);
+        return Operand.copy_of(Place.of(tmp));
+    }
+    Operand as_str_operand(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong x) {
+        var xt = self.type_of(&*c, x); Span xs = self.ex(t, x).span;
+        var o = self.lower_operand(t, &*c, x);
+        var base = xt; while (self.ck.tk(base) == K_REF) { base = self.ck.inner(base); }
+        if (self.ck.tk(base) == K_STR) {
+            if (self.ck.tk(xt) != K_REF) { self.error(xs, "str value without reference"); return o; }
+            while (self.ck.tk(self.ck.inner(xt)) == K_REF) { o.place = o.place.deref(); o.kind = OperandKind.Copy; xt = self.ck.inner(xt); }
+            return o;
+        }
+        if (o.is_const()) { self.error(xs, "unexpected constant"); return o; }
+        var p = o.place.copy();
+        self.scope_temporary(&*c, p.local);
+        while (self.ck.tk(xt) == K_REF) { p = p.deref(); xt = self.ck.inner(xt); }
+        var rt = self.tref(xt, true);
+        uint r = self.new_temp(&*c, rt, xs);
+        var rv = Rvalue.new(RvalueKind.Ref); rv.place = p; rv.is_const = true; rv.type = rt;
+        self.assign(&*c, Place.of(r), rv, xs);
+        var st = self.tref(self.tstr(), true);
+        uint s = self.new_temp(&*c, st, xs);
+        var conv = Rvalue.new(RvalueKind.StrFromString); conv.a = Operand.copy_of(Place.of(r)); conv.type = st;
+        self.assign(&*c, Place.of(s), conv, xs);
+        return Operand.copy_of(Place.of(s));
+    }
+    /// -x or !x on a user type: calls Neg.neg or Not.not with the operand by
+    /// value. Separate from lower_operand to keep its recursive frame small.
+    Operand lower_unary_trait(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong operand, bool neg, TypeId operand_type, TypeId ty, Span span) {
+        var td = self.ck.core_trait(if (neg) { "Neg" } else { "Not" });
+        var tm = if (td.index != NONE) { self.ck.find_method(td, if (neg) { "neg" } else { "not" }) } else { DefId.none() };
+        if (tm.index == NONE) { self.error(span, "operator trait not available"); return Operand.empty(); }
+        uint target = self.resolve_trait_method(tm, operand_type, Vec.new(), span, false, Vec.new());
+        if (target == NONE) { return Operand.empty(); }
+        Vec<Operand> args = Vec.new(); args.push(self.lower_operand(t, &*c, operand));
+        uint res = self.new_temp(&*c, ty, span);
+        self.call(&*c, Callee.direct(target), args, Place.of(res), false, span);
+        return self.operand_from_place(Place.of(res), ty);
+    }
+    Operand borrowed_argument(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong x) {
+        var xt = self.type_of(&*c, x); Span xs = self.ex(t, x).span;
+        var o = self.lower_operand(t, &*c, x);
+        if (self.ck.tk(xt) == K_REF) { return o; }
+        var p = if (o.is_const()) { Place.none() } else { o.place.copy() };
+        if (o.is_const()) {
+            uint tmp = self.new_temp(&*c, xt, xs);
+            self.assign(&*c, Place.of(tmp), Rvalue.use_of(o), xs);
+            p = Place.of(tmp);
+        }
+        var rt = self.tref(xt, true);
+        uint r = self.new_temp(&*c, rt, xs);
+        var rv = Rvalue.new(RvalueKind.Ref); rv.place = p; rv.is_const = true; rv.type = rt;
+        self.assign(&*c, Place.of(r), rv, xs);
+        return Operand.copy_of(Place.of(r));
+    }
+    Operand lower_binary(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, Place dest, bool has_dest) {
+        var x = self.ex(t, e); Span span = x.span; ulong lhs = child(e, x.a); ulong rhs = child(e, x.b); var op = x.binary_op;
+        var ty = self.type_of(&*c, e);
+        uint opi = binary_index(op);
+        if (opi == 11 || opi == 12) {
+            uint result = if (has_dest && dest.is_local()) { dest.local } else { self.new_temp(&*c, ty, span) };
+            var l = self.lower_operand(t, &*c, lhs);
+            self.assign(&*c, Place.of(result), Rvalue.use_of(l), self.ex(t, lhs).span);
+            uint rhs_b = self.new_block(&*c); uint join = self.new_block(&*c);
+            var sw = Terminator.new(TerminatorKind.Switch); sw.discr = Operand.copy_of(Place.of(result));
+            sw.cases.push(Case { value: if (opi == 11) { 1 } else { 0 }, block: rhs_b }); sw.otherwise = join; sw.span = span;
+            self.set_term(&*c, sw);
+            c.current = rhs_b;
+            self.lower_into(t, &*c, rhs, Place.of(result));
+            self.goto_block(&*c, join);
+            c.current = join;
+            if (has_dest && !dest.is_local()) { self.assign(&*c, dest, Rvalue.use_of(Operand.copy_of(Place.of(result))), span); }
+            return Operand.copy_of(Place.of(result));
+        }
+        var lt = self.type_of(&*c, lhs); var lbase = lt;
+        while (self.ck.tk(lbase) == K_REF) { lbase = self.ck.inner(lbase); }
+        bool is_cmp = opi >= 5 && opi <= 10;
+        bool builtin = self.ck.is_numeric(lbase) || self.ck.is_bool(lbase) || self.ck.is_prim(lbase, ast.PrimKind.Char) || self.ck.tk(lbase) == K_PTR;
+        bool is_str = self.ck.tk(lbase) == K_STR || (self.ck.tk(lbase) == K_STRUCT && same_def(self.ck.def_of(lbase), self.ck.r.program.string_def));
+        if (builtin) {
+            var l = self.lower_operand(t, &*c, lhs);
+            var r = self.lower_operand(t, &*c, rhs);
+            if (is_cmp) { l = self.strip_operand(l, lt); var rt = self.type_of(&*c, rhs); r = self.strip_operand(r, rt); }
+            var rv = Rvalue.new(RvalueKind.Binary); rv.bop = op; rv.a = l; rv.b = r; rv.type = ty;
+            return self.finish_binary(&*c, rv, ty, span, dest, has_dest);
+        }
+        if (is_str && is_cmp) {
+            var l = self.as_str_operand(t, &*c, lhs);
+            var r = self.as_str_operand(t, &*c, rhs);
+            var int_type = self.ck.int_t();
+            uint cmp = self.new_temp(&*c, int_type, span);
+            Vec<Operand> args = Vec.new(); args.push(l); args.push(r);
+            self.call(&*c, Callee.builtin_of("str_cmp"), args, Place.of(cmp), false, span);
+            var rv = Rvalue.new(RvalueKind.Binary); rv.bop = op; rv.a = Operand.copy_of(Place.of(cmp));
+            rv.b = Operand.constant_of(self.int_const(0, int_type)); rv.type = ty;
+            return self.finish_binary(&*c, rv, ty, span, dest, has_dest);
+        }
+        var method = String.from("lt"); var tr = String.from("Ord");
+        match op {
+            ast.BinaryOp.Add => { method = String.from("add"); tr = String.from("Add"); }
+            ast.BinaryOp.Sub => { method = String.from("sub"); tr = String.from("Sub"); }
+            ast.BinaryOp.Mul => { method = String.from("mul"); tr = String.from("Mul"); }
+            ast.BinaryOp.Div => { method = String.from("div"); tr = String.from("Div"); }
+            ast.BinaryOp.Rem => { method = String.from("rem"); tr = String.from("Rem"); }
+            ast.BinaryOp.Eq => { method = String.from("eq"); tr = String.from("Eq"); }
+            ast.BinaryOp.Ne => { method = String.from("eq"); tr = String.from("Eq"); }
+            _ => {}
+        }
+        var td = self.ck.core_trait(tr.as_str());
+        var tm = if (td.index != NONE) { self.ck.find_method(td, method.as_str()) } else { DefId.none() };
+        if (tm.index == NONE) { self.error(span, "operator trait not available"); return Operand.empty(); }
+        uint target = self.resolve_trait_method(tm, lbase, Vec.new(), span, false, Vec.new());
+        if (target == NONE) { return Operand.empty(); }
+        Vec<Operand> args = Vec.new();
+        if (is_cmp) {
+            args.push(self.borrowed_argument(t, &*c, lhs)); args.push(self.borrowed_argument(t, &*c, rhs));
+            // Operands are evaluated left to right. a > b calls b.lt(a); a <= b is !(b.lt(a)).
+            if (opi == 8 || opi == 9) { args.swap(0, 1); }
+        }
+        else { args.push(self.lower_operand(t, &*c, lhs)); args.push(self.lower_operand(t, &*c, rhs)); }
+        uint res = self.new_temp(&*c, ty, span);
+        self.call(&*c, Callee.direct(target), args, Place.of(res), false, span);
+        var out = self.operand_from_place(Place.of(res), ty);
+        bool negate = opi == 6 || opi == 9 || opi == 10;
+        if (negate) {
+            var bool_type = self.ck.bool_t();
+            var n = Rvalue.new(RvalueKind.Unary); n.uop = ast.UnaryOp.Not; n.a = out; n.type = bool_type;
+            uint nt = self.new_temp(&*c, bool_type, span);
+            self.assign(&*c, Place.of(nt), n, span);
+            out = Operand.copy_of(Place.of(nt));
+        }
+        if (has_dest) { self.assign(&*c, dest.copy(), Rvalue.use_of(out), span); return Operand.copy_of(dest); }
+        return out;
+    }
+    void lower_if(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, Place dest, bool has_dest) {
+        var x = self.ex(t, e); ulong cond_key = child(e, x.a); Span cond_span = self.ex(t, cond_key).span;
+        var cond = self.lower_operand(t, &*c, cond_key);
+        uint then_b = self.new_block(&*c); uint else_b = self.new_block(&*c); uint join = self.new_block(&*c);
+        var sw = Terminator.new(TerminatorKind.Switch); sw.discr = cond; sw.cases.push(Case { value: 1, block: then_b });
+        sw.otherwise = else_b; sw.span = cond_span; self.set_term(&*c, sw);
+        c.current = then_b;
+        self.lower_block_into(t, &*c, child(e, x.b), dest.copy(), has_dest);
+        if (!self.block_terminated(&*c)) { self.goto_block(&*c, join); }
+        c.current = else_b;
+        if (x.c != ast.NONE) {
+            if (has_dest) { self.lower_into(t, &*c, child(e, x.c), dest); }
+            else { var o = self.lower_operand(t, &*c, child(e, x.c)); }
+        }
+        if (!self.block_terminated(&*c)) { self.goto_block(&*c, join); }
+        c.current = join;
+    }
+
+    // ---------- patterns ----------
+
+    /// Strips count references; ref_mode becomes 1 behind &const, 2 behind &.
+    Place auto_deref(&self, Place place, &TypeId ty, &uint ref_mode, int count) {
+        var p = place; int i = 0;
+        while (i < count && self.ck.tk(*ty) == K_REF) {
+            *ref_mode = if (*ref_mode == 1 || self.ck.const_of(*ty)) { 1 } else { 2 };
+            *ty = self.ck.inner(*ty); p = p.deref(); i += 1;
+        }
+        return p;
+    }
+    uint switch_on(&self, &FnCtx c, Operand discr, ulong want, uint fail, Span span) {
+        uint ok = self.new_block(&*c);
+        var sw = Terminator.new(TerminatorKind.Switch); sw.discr = discr; sw.cases.push(Case { value: want, block: ok });
+        sw.otherwise = fail; sw.span = span; self.set_term(&*c, sw);
+        c.current = ok; return ok;
+    }
+    uint variant_test(&self, &FnCtx c, &const Place place, uint variant, uint fail, Span span) {
+        var usize_type = self.ck.usize_t();
+        uint disc = self.new_temp(&*c, usize_type, span);
+        var d = Rvalue.new(RvalueKind.Discriminant); d.place = place.copy(); d.type = usize_type;
+        self.assign(&*c, Place.of(disc), d, span);
+        return self.switch_on(&*c, Operand.copy_of(Place.of(disc)), variant as ulong, fail, span);
+    }
+    uint compare_test(&self, &FnCtx c, &const Place place, ast.BinaryOp op, Operand value, uint fail, Span span) {
+        var bool_type = self.ck.bool_t();
+        uint b = self.new_temp(&*c, bool_type, span);
+        var cmp = Rvalue.new(RvalueKind.Binary); cmp.bop = op; cmp.a = Operand.copy_of(place.copy()); cmp.b = value; cmp.type = bool_type;
+        self.assign(&*c, Place.of(b), cmp, span);
+        return self.switch_on(&*c, Operand.copy_of(Place.of(b)), 1, fail, span);
+    }
+    String last_segment(&const self, &const ast.Path path) { return defs.name(path.segments.get(path.segments.len() - 1).unwrap().name); }
+    uint lower_pattern_test(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong p, Place place_in, TypeId type_in, uint fail) {
+        var x = t.get(key_file(p) as usize).unwrap().pattern(key_index(p)); Span span = x.span;
+        var place = place_in; var ty = type_in; uint ref_mode = 0;
+        match self.ck.result.pattern_derefs.get(p) { Some(n) => { place = self.auto_deref(place, &ty, &ref_mode, *n); }, None => {} }
+        match x.kind {
+            ast.PatternKind.Wildcard => return c.current,
+            ast.PatternKind.Binding => {
+                if (self.ck.result.pattern_locals.has(p)) { return c.current; }
+                uint v = NONE;
+                if (self.ck.tk(ty) == K_ENUM) { v = self.ck.find_variant(self.ck.def_of(ty), defs.name(x.text)); }
+                if (v == NONE) { self.error(span, "pattern variant not found"); return c.current; }
+                return self.variant_test(&*c, &place, v, fail, span);
+            }
+            ast.PatternKind.Literal => {
+                ulong value = child(p, x.a);
+                if (self.ck.tk(ty) == K_STR) {
+                    var lit = self.lower_operand(t, &*c, value);
+                    var rt = self.tref(self.tstr(), true);
+                    uint r = self.new_temp(&*c, rt, span);
+                    var rv = Rvalue.new(RvalueKind.Ref); rv.place = place.copy(); rv.is_const = true; rv.type = rt;
+                    self.assign(&*c, Place.of(r), rv, span);
+                    var int_type = self.ck.int_t();
+                    uint cmp = self.new_temp(&*c, int_type, span);
+                    Vec<Operand> args = Vec.new(); args.push(Operand.copy_of(Place.of(r))); args.push(lit);
+                    self.call(&*c, Callee.builtin_of("str_cmp"), args, Place.of(cmp), false, span);
+                    var bool_type = self.ck.bool_t();
+                    uint b = self.new_temp(&*c, bool_type, span);
+                    var eq = Rvalue.new(RvalueKind.Binary); eq.bop = ast.BinaryOp.Eq; eq.a = Operand.copy_of(Place.of(cmp));
+                    eq.b = Operand.constant_of(self.int_const(0, int_type)); eq.type = bool_type;
+                    self.assign(&*c, Place.of(b), eq, span);
+                    return self.switch_on(&*c, Operand.copy_of(Place.of(b)), 1, fail, span);
+                }
+                var lit = self.lower_operand(t, &*c, value);
+                if (lit.is_const()) {
+                    match lit.constant.kind { ConstantKind.Bool => { ulong want = lit.constant.int_value; return self.switch_on(&*c, Operand.copy_of(place), want, fail, span); }, _ => {} }
+                }
+                return self.compare_test(&*c, &place, ast.BinaryOp.Eq, lit, fail, span);
+            }
+            ast.PatternKind.Range => {
+                var lo = self.lower_operand(t, &*c, child(p, x.a));
+                self.compare_test(&*c, &place, ast.BinaryOp.Ge, lo, fail, span);
+                var hi = self.lower_operand(t, &*c, child(p, x.b));
+                var op = if (x.flag) { ast.BinaryOp.Le } else { ast.BinaryOp.Lt };
+                return self.compare_test(&*c, &place, op, hi, fail, span);
+            }
+            ast.PatternKind.Path => {
+                uint v = if (self.ck.tk(ty) == K_ENUM) { self.ck.find_variant(self.ck.def_of(ty), self.last_segment(&const x.path)) } else { NONE };
+                if (v == NONE) { self.error(span, "pattern variant not found"); return c.current; }
+                return self.variant_test(&*c, &place, v, fail, span);
+            }
+            ast.PatternKind.TupleStruct => {
+                uint v = if (self.ck.tk(ty) == K_ENUM) { self.ck.find_variant(self.ck.def_of(ty), self.last_segment(&const x.path)) } else { NONE };
+                if (v == NONE) { self.error(span, "pattern variant not found"); return c.current; }
+                self.variant_test(&*c, &place, v, fail, span);
+                var en = self.ck.def_of(ty); var s = self.ck.owner_subst(en, ty);
+                var tuple = ids_copy(&const self.ck.r.program.def(en).variants.get(v as usize).unwrap().tuple_types);
+                for (i in 0..x.items.len()) {
+                    if (i >= tuple.len()) { continue; }
+                    var ft = self.ck.apply(&s, *tuple.get(i).unwrap());
+                    self.lower_pattern_test(t, &*c, child(p, *x.items.get(i).unwrap()), place.downcast(v).field(i as uint), ft, fail);
+                }
+                return c.current;
+            }
+            ast.PatternKind.Struct => {
+                var base = place.copy(); var s = Subst.new(); Vec<TypeId> field_types = Vec.new(); Vec<String> field_names = Vec.new();
+                if (self.ck.tk(ty) == K_ENUM) {
+                    var en = self.ck.def_of(ty); uint v = self.ck.find_variant(en, self.last_segment(&const x.path));
+                    if (v == NONE) { self.error(span, "pattern variant not found"); return c.current; }
+                    self.variant_test(&*c, &place, v, fail, span);
+                    base = place.downcast(v);
+                    for (fd in &const self.ck.r.program.def(en).variants.get(v as usize).unwrap().fields) { field_types.push(fd.type); field_names.push(String.from(fd.name)); }
+                    s = self.ck.owner_subst(en, ty);
+                } else if (self.ck.tk(ty) == K_STRUCT) {
+                    var sd = self.ck.def_of(ty);
+                    for (fd in &const self.ck.r.program.def(sd).fields) { field_types.push(fd.type); field_names.push(String.from(fd.name)); }
+                    s = self.ck.owner_subst(sd, ty);
+                } else { return c.current; }
+                for (fp in &const x.fields) {
+                    if (fp.pattern == ast.NONE) { continue; }
+                    var name = defs.name(fp.name); usize idx = field_names.len();
+                    for (k in 0..field_names.len()) { if (idx == field_names.len() && *field_names.get(k).unwrap() == name) { idx = k; } }
+                    if (idx == field_names.len()) { continue; }
+                    var ft = self.ck.apply(&s, *field_types.get(idx).unwrap());
+                    self.lower_pattern_test(t, &*c, child(p, fp.pattern), base.field(idx as uint), ft, fail);
+                }
+                return c.current;
+            }
+            ast.PatternKind.Tuple => {
+                usize n = self.ck.n_elems(ty);
+                for (i in 0..x.items.len()) {
+                    if (i >= n) { continue; }
+                    var et = self.ck.elem(ty, i);
+                    self.lower_pattern_test(t, &*c, child(p, *x.items.get(i).unwrap()), place.field(i as uint), et, fail);
+                }
+                return c.current;
+            }
+            ast.PatternKind.Or => {
+                uint success = self.new_block(&*c);
+                usize n = x.items.len();
+                for (i in 0..n) {
+                    uint next_alt = if (i + 1 < n) { self.new_block(&*c) } else { fail };
+                    self.lower_pattern_test(t, &*c, child(p, *x.items.get(i).unwrap()), place.copy(), ty, next_alt);
+                    self.goto_block(&*c, success);
+                    c.current = next_alt;
+                    if (i + 1 == n) { c.current = success; }
+                }
+                c.current = success;
+                return success;
+            }
+        }
+    }
+    void bind_local(&self, &FnCtx c, uint checker_id, Place place, TypeId ty, uint ref_mode, &const str name, Span span) {
+        var lt_raw = self.checker_local(&*c, checker_id).type; var lt = self.subst_type(&*c, lt_raw);
+        uint local = self.new_temp(&*c, lt, span);
+        self.fun(&*c).locals.get_mut(local as usize).unwrap().name = String.from(name);
+        self.map_local(&*c, checker_id, local);
+        var r = Rvalue.new(RvalueKind.Use);
+        if (ref_mode != 0) { r.kind = RvalueKind.Ref; r.place = place; r.is_const = ref_mode == 1; r.type = lt; }
+        else { r.a = self.operand_from_place(place, ty); }
+        self.assign(&*c, Place.of(local), r, span);
+        self.push_local(&*c, local);
+    }
+    void lower_pattern_bind(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong p, Place place_in, TypeId type_in, uint mode) {
+        var x = t.get(key_file(p) as usize).unwrap().pattern(key_index(p)); Span span = x.span;
+        var place = place_in; var ty = type_in; uint ref_mode = mode;
+        match self.ck.result.pattern_derefs.get(p) { Some(n) => { place = self.auto_deref(place, &ty, &ref_mode, *n); }, None => {} }
+        match x.kind {
+            ast.PatternKind.Binding => {
+                if (!self.ck.result.pattern_locals.has(p)) { return; }
+                uint checker_id = *self.ck.result.pattern_locals.get(p).unwrap();
+                var name = defs.name(x.text);
+                self.bind_local(&*c, checker_id, place, ty, ref_mode, name.as_str(), span);
+            }
+            ast.PatternKind.TupleStruct => {
+                if (self.ck.tk(ty) != K_ENUM) { return; }
+                var en = self.ck.def_of(ty); uint v = self.ck.find_variant(en, self.last_segment(&const x.path));
+                if (v == NONE) { return; }
+                var s = self.ck.owner_subst(en, ty);
+                var tuple = ids_copy(&const self.ck.r.program.def(en).variants.get(v as usize).unwrap().tuple_types);
+                for (i in 0..x.items.len()) {
+                    if (i >= tuple.len()) { continue; }
+                    var ft = self.ck.apply(&s, *tuple.get(i).unwrap());
+                    self.lower_pattern_bind(t, &*c, child(p, *x.items.get(i).unwrap()), place.downcast(v).field(i as uint), ft, ref_mode);
+                }
+            }
+            ast.PatternKind.Struct => {
+                var base = place.copy(); var s = Subst.new(); Vec<TypeId> field_types = Vec.new(); Vec<String> field_names = Vec.new();
+                if (self.ck.tk(ty) == K_ENUM) {
+                    var en = self.ck.def_of(ty); uint v = self.ck.find_variant(en, self.last_segment(&const x.path));
+                    if (v == NONE) { return; }
+                    base = place.downcast(v);
+                    for (fd in &const self.ck.r.program.def(en).variants.get(v as usize).unwrap().fields) { field_types.push(fd.type); field_names.push(String.from(fd.name)); }
+                    s = self.ck.owner_subst(en, ty);
+                } else if (self.ck.tk(ty) == K_STRUCT) {
+                    var sd = self.ck.def_of(ty);
+                    for (fd in &const self.ck.r.program.def(sd).fields) { field_types.push(fd.type); field_names.push(String.from(fd.name)); }
+                    s = self.ck.owner_subst(sd, ty);
+                } else { return; }
+                for (fp in &const x.fields) {
+                    var name = defs.name(fp.name); usize idx = field_names.len();
+                    for (k in 0..field_names.len()) { if (idx == field_names.len() && *field_names.get(k).unwrap() == name) { idx = k; } }
+                    if (idx == field_names.len()) { continue; }
+                    var ft = self.ck.apply(&s, *field_types.get(idx).unwrap());
+                    var fplace = base.field(idx as uint);
+                    if (fp.pattern != ast.NONE) { self.lower_pattern_bind(t, &*c, child(p, fp.pattern), fplace, ft, ref_mode); }
+                    else {
+                        usize count = self.checker_local_count(&*c); uint checker_id = NONE;
+                        for (k in 0..count) {
+                            var l = self.checker_local(&*c, k as uint);
+                            if (l.name == name && l.span.start == fp.span.start) { checker_id = k as uint; }
+                        }
+                        if (checker_id == NONE) { self.error(fp.span, "unmapped shorthand binding"); continue; }
+                        self.bind_local(&*c, checker_id, fplace, ft, ref_mode, name.as_str(), fp.span);
+                    }
+                }
+            }
+            ast.PatternKind.Tuple => {
+                usize n = self.ck.n_elems(ty);
+                for (i in 0..x.items.len()) {
+                    if (i >= n) { continue; }
+                    var et = self.ck.elem(ty, i);
+                    self.lower_pattern_bind(t, &*c, child(p, *x.items.get(i).unwrap()), place.field(i as uint), et, ref_mode);
+                }
+            }
+            _ => {}
+        }
+    }
+    void lower_match(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, Place dest, bool has_dest) {
+        var x = self.ex(t, e); Span span = x.span; ulong scrutinee = child(e, x.a); Span ss = self.ex(t, scrutinee).span;
+        var st = self.type_of(&*c, scrutinee);
+        var scrut = Place.of(0);
+        if (!self.lower_place(t, &*c, scrutinee, &scrut)) {
+            var o = self.lower_operand(t, &*c, scrutinee);
+            uint tmp = self.new_temp(&*c, st, ss);
+            self.assign(&*c, Place.of(tmp), Rvalue.use_of(o), ss);
+            scrut = Place.of(tmp);
+            self.push_local(&*c, tmp);
+        }
+        uint join = self.new_block(&*c);
+        uint next_arm = self.new_block(&*c);
+        self.goto_block(&*c, next_arm);
+        for (arm in &const x.arms) {
+            c.current = next_arm;
+            uint fail = self.new_block(&*c);
+            next_arm = fail;
+            self.push_scope(&*c);
+            ulong pattern = child(e, arm.pattern);
+            self.lower_pattern_test(t, &*c, pattern, scrut.copy(), st, fail);
+            self.lower_pattern_bind(t, &*c, pattern, scrut.copy(), st, 0);
+            if (arm.guard != ast.NONE) {
+                ulong guard = child(e, arm.guard);
+                var g = self.lower_operand(t, &*c, guard);
+                uint ok = self.new_block(&*c);
+                var sw = Terminator.new(TerminatorKind.Switch); sw.discr = g; sw.cases.push(Case { value: 1, block: ok });
+                sw.otherwise = fail; sw.span = self.ex(t, guard).span; self.set_term(&*c, sw);
+                c.current = ok;
+            }
+            ulong body = child(e, arm.body); var bt = self.type_of(&*c, body);
+            if (has_dest && !self.ck.is_void(bt) && !self.ck.is_never(bt)) { self.lower_into(t, &*c, body, dest.copy()); }
+            else { var o = self.lower_operand(t, &*c, body); }
+            if (!self.block_terminated(&*c)) { self.pop_scope(&*c, arm.span); self.goto_block(&*c, join); } else { self.drop_scope(&*c); }
+        }
+        c.current = next_arm;
+        var u = Terminator.new(TerminatorKind.Unreachable); u.span = span; self.set_term(&*c, u);
+        c.current = join;
+    }
+    Operand lower_try(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e) {
+        var x = self.ex(t, e); Span span = x.span; ulong operand = child(e, x.a); Span os = self.ex(t, operand).span;
+        var ot = self.type_of(&*c, operand); var ty = self.type_of(&*c, e);
+        var v = self.lower_operand(t, &*c, operand);
+        uint vl = self.new_temp(&*c, ot, os);
+        self.assign(&*c, Place.of(vl), Rvalue.use_of(v), os);
+        var en = self.ck.def_of(ot);
+        bool is_result = same_def(en, self.ck.r.program.result_def);
+        uint good = self.ck.find_variant(en, if (is_result) { "Ok" } else { "Some" });
+        uint bad = self.ck.find_variant(en, if (is_result) { "Err" } else { "None" });
+        var usize_type = self.ck.usize_t();
+        uint disc = self.new_temp(&*c, usize_type, span);
+        var d = Rvalue.new(RvalueKind.Discriminant); d.place = Place.of(vl); d.type = usize_type;
+        self.assign(&*c, Place.of(disc), d, span);
+        uint good_b = self.new_block(&*c); uint bad_b = self.new_block(&*c);
+        var sw = Terminator.new(TerminatorKind.Switch); sw.discr = Operand.copy_of(Place.of(disc));
+        sw.cases.push(Case { value: good as ulong, block: good_b }); sw.otherwise = bad_b; sw.span = span; self.set_term(&*c, sw);
+        c.current = bad_b;
+        var ret_t = self.module.functions.get(c.fn_index as usize).unwrap().ret;
+        var agg = Rvalue.new(RvalueKind.Aggregate); agg.agg = AggregateKind.Variant; agg.type = ret_t;
+        agg.variant = self.ck.find_variant(self.ck.def_of(ret_t), if (is_result) { "Err" } else { "None" });
+        if (is_result) { agg.elems.push(self.operand_from_place(Place.of(vl).downcast(bad).field(0), self.ck.elem(ot, 1))); }
+        self.assign(&*c, Place.of(0), agg, span);
+        self.emit_drops_to(&*c, 0, span);
+        var g = Terminator.new(TerminatorKind.Goto); g.target = c.return_block; g.span = span; self.set_term(&*c, g);
+        c.current = good_b;
+        uint out = self.new_temp(&*c, ty, span);
+        var take = self.operand_from_place(Place.of(vl).downcast(good).field(0), ty);
+        self.assign(&*c, Place.of(out), Rvalue.use_of(take), span);
+        return self.operand_from_place(Place.of(out), ty);
+    }
+
+    // ---------- interpolation ----------
+
+    void append_display(&self, &FnCtx c, Place string_place, Operand value, TypeId ty, Span span) {
+        var base = ty; var v = value;
+        while (self.ck.tk(base) == K_REF) {
+            if (!v.is_const()) { v.place = v.place.deref(); v.kind = OperandKind.Copy; }
+            base = self.ck.inner(base);
+        }
+        var string_local_type = self.local_type(&*c, string_place.local);
+        var sref_type = self.tref(string_local_type, false);
+        uint sref = self.new_temp(&*c, sref_type, span);
+        var rv = Rvalue.new(RvalueKind.Ref); rv.place = string_place; rv.is_const = false; rv.type = sref_type;
+        self.assign(&*c, Place.of(sref), rv, span);
+        var dst = Operand.copy_of(Place.of(sref));
+        var str_ref = self.tref(self.tstr(), true);
+        if (self.ck.tk(base) == K_STR) {
+            if (self.ck.tk(ty) == K_REF && !v.is_const()) {
+                uint r = self.new_temp(&*c, str_ref, span);
+                var rr = Rvalue.new(RvalueKind.Ref); rr.place = v.place.copy(); rr.is_const = true; rr.type = str_ref;
+                self.assign(&*c, Place.of(r), rr, span);
+                v = Operand.copy_of(Place.of(r));
+            }
+            Vec<Operand> args = Vec.new(); args.push(dst); args.push(v);
+            self.call(&*c, Callee.builtin_of("string_push_str"), args, Place.none(), false, span);
+            return;
+        }
+        if (self.ck.tk(base) == K_STRUCT && same_def(self.ck.def_of(base), self.ck.r.program.string_def)) {
+            var bt = self.tref(base, true);
+            uint r = self.new_temp(&*c, bt, span);
+            var rr = Rvalue.new(RvalueKind.Ref); rr.place = v.place.copy(); rr.is_const = true; rr.type = bt;
+            self.assign(&*c, Place.of(r), rr, span);
+            uint s = self.new_temp(&*c, str_ref, span);
+            var conv = Rvalue.new(RvalueKind.StrFromString); conv.a = Operand.copy_of(Place.of(r)); conv.type = str_ref;
+            self.assign(&*c, Place.of(s), conv, span);
+            Vec<Operand> args = Vec.new(); args.push(dst); args.push(Operand.copy_of(Place.of(s)));
+            self.call(&*c, Callee.builtin_of("string_push_str"), args, Place.none(), false, span);
+            return;
+        }
+        if (self.ck.tk(base) == K_PRIM) {
+            String builtin = String.from("fmt_int");
+            match self.ck.r.types.get(base).prim {
+                ast.PrimKind.Bool => { builtin = String.from("fmt_bool"); }, ast.PrimKind.Char => { builtin = String.from("fmt_char"); },
+                ast.PrimKind.Float => { builtin = String.from("fmt_double"); }, ast.PrimKind.Double => { builtin = String.from("fmt_double"); },
+                ast.PrimKind.Byte => { builtin = String.from("fmt_uint"); }, ast.PrimKind.Uint => { builtin = String.from("fmt_uint"); },
+                ast.PrimKind.Ulong => { builtin = String.from("fmt_uint"); }, ast.PrimKind.Usize => { builtin = String.from("fmt_uint"); },
+                _ => {}
+            }
+            var wide = base;
+            if (self.ck.is_float(base)) { wide = self.ck.double_t(); }
+            else if (builtin == String.from("fmt_uint")) { wide = self.ck.prim(ast.PrimKind.Ulong); }
+            else if (builtin == String.from("fmt_int")) { wide = self.ck.prim(ast.PrimKind.Long); }
+            if (wide.index != base.index) {
+                uint w = self.new_temp(&*c, wide, span);
+                var cast = Rvalue.new(RvalueKind.Cast); cast.a = v; cast.type = wide;
+                self.assign(&*c, Place.of(w), cast, span);
+                v = Operand.copy_of(Place.of(w));
+            }
+            Vec<Operand> args = Vec.new(); args.push(dst); args.push(v);
+            self.call(&*c, Callee.builtin_of(builtin.as_str()), args, Place.none(), false, span);
+            return;
+        }
+        var display = self.ck.core_trait("Display");
+        var tm = if (display.index != NONE) { self.ck.find_method(display, "to_string") } else { DefId.none() };
+        uint target = if (tm.index != NONE) { self.resolve_trait_method(tm, base, Vec.new(), span, false, Vec.new()) } else { NONE };
+        if (target == NONE) { var bn = self.show(base); self.error(span, "no Display implementation for '{bn}'"); return; }
+        var bt = self.tref(base, true);
+        uint r = self.new_temp(&*c, bt, span);
+        if (v.is_const()) { self.error(span, "cannot format a constant of this type"); return; }
+        var rr = Rvalue.new(RvalueKind.Ref); rr.place = v.place.copy(); rr.is_const = true; rr.type = bt;
+        self.assign(&*c, Place.of(r), rr, span);
+        var string_t = self.tstruct(self.ck.r.program.string_def, Vec.new());
+        uint s = self.new_temp(&*c, string_t, span);
+        Vec<Operand> ta = Vec.new(); ta.push(Operand.copy_of(Place.of(r)));
+        self.call(&*c, Callee.direct(target), ta, Place.of(s), false, span);
+        var srt = self.tref(string_t, true);
+        uint sr = self.new_temp(&*c, srt, span);
+        var r2 = Rvalue.new(RvalueKind.Ref); r2.place = Place.of(s); r2.is_const = true; r2.type = srt;
+        self.assign(&*c, Place.of(sr), r2, span);
+        uint ss = self.new_temp(&*c, str_ref, span);
+        var conv = Rvalue.new(RvalueKind.StrFromString); conv.a = Operand.copy_of(Place.of(sr)); conv.type = str_ref;
+        self.assign(&*c, Place.of(ss), conv, span);
+        Vec<Operand> args = Vec.new(); args.push(dst); args.push(Operand.copy_of(Place.of(ss)));
+        self.call(&*c, Callee.builtin_of("string_push_str"), args, Place.none(), false, span);
+        self.emit(&*c, Statement.new(StatementKind.Drop, Place.of(s), span));
+    }
+    void lower_interp(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, Place dest) {
+        var x = self.ex(t, e); Span span = x.span;
+        self.call(&*c, Callee.builtin_of("string_new"), Vec.new(), dest.copy(), false, span);
+        for (part in &const x.parts) {
+            if (part.expr == ast.NONE) {
+                if (part.text.is_empty()) { continue; }
+                var kt = self.tref(self.tstr(), true);
+                var k = Constant.new(ConstantKind.Str, kt); k.str_value = bytes.copy(part.text, 0, part.text.len());
+                self.append_display(&*c, dest.copy(), Operand.constant_of(k), kt, span);
+            } else {
+                ulong pe = child(e, part.expr); Span ps = self.ex(t, pe).span;
+                var ty = self.type_of(&*c, pe);
+                var v = self.lower_operand(t, &*c, pe);
+                if (v.is_const() && self.ck.tk(ty) != K_REF) {
+                    uint tmp = self.new_temp(&*c, ty, ps);
+                    self.assign(&*c, Place.of(tmp), Rvalue.use_of(v), ps);
+                    v = Operand.copy_of(Place.of(tmp));
+                }
+                var held = v.copy();
+                self.append_display(&*c, dest.copy(), v, ty, ps);
+                // A once-closure capture is an unnamed local that the part only borrows.
+                bool is_temp = held.is_move() && held.place.is_local() && !self.local_named(&*c, held.place.local) &&
+                    !self.module.functions.get(c.fn_index as usize).unwrap().locals.get(held.place.local as usize).unwrap().escape_boundary;
+                if (is_temp && self.needs_drop(ty)) { self.emit(&*c, Statement.new(StatementKind.Drop, held.place, ps)); }
+            }
+        }
+    }
+
+    // ---------- calls ----------
+
+    /// Finds the impl of trait_method's trait for self_type, binding impl
+    /// parameters from Self and, when has_trait_args, the trait arguments.
+    uint resolve_trait_method(&self, DefId trait_method, TypeId self_type, Vec<TypeId> fn_args, Span span, bool has_trait_args, Vec<TypeId> trait_args) {
+        var tr = self.ck.r.program.def(trait_method).owner_trait;
+        var method_name = String.from(self.ck.r.program.def(trait_method).name);
+        for (i in 0..self.ck.r.program.impls.len()) {
+            var im = DefId { kind: DefKind.Impl, index: i as uint };
+            if (!same_def(self.ck.r.program.def(im).trait_ref.trait_def, tr)) { continue; }
+            Vec<TypeId> pats = Vec.new(); Vec<TypeId> cons = Vec.new();
+            pats.push(self.ck.r.program.def(im).self_type); cons.push(self_type);
+            if (has_trait_args) {
+                if (trait_args.len() != self.ck.r.program.def(im).trait_ref.args.len()) { continue; }
+                for (k in 0..trait_args.len()) { pats.push(*self.ck.r.program.def(im).trait_ref.args.get(k).unwrap()); cons.push(*trait_args.get(k).unwrap()); }
+            }
+            bool matched = true;
+            Vec<TypeId> bound_params = Vec.new(); Vec<TypeId> bound_values = Vec.new();
+            while (!pats.is_empty() && matched) {
+                var pat = pats.pop().unwrap(); var con = cons.pop().unwrap();
+                if (pat.index == con.index) { continue; }
+                var pt = self.ck.r.types.get(pat); var ct = self.ck.r.types.get(con);
+                uint pk = self.ck.tk(pat);
+                if (pk == K_PARAM && same_def(pt.owner, im)) {
+                    usize at = bound_params.len();
+                    for (b in 0..bound_params.len()) { if (bound_params.get(b).unwrap().index == pat.index) { at = b; } }
+                    if (at == bound_params.len()) { bound_params.push(pat); bound_values.push(con); }
+                    else if (bound_values.get(at).unwrap().index != con.index) { matched = false; }
+                    continue;
+                }
+                bool prim_differs = pk == K_PRIM && types.prim_index(pt.prim) != types.prim_index(ct.prim);
+                if (pk != self.ck.tk(con) || pt.is_const != ct.is_const || pt.length != ct.length || !same_def(pt.def, ct.def) ||
+                    prim_differs || pk == K_PARAM || pt.elems.len() != ct.elems.len()) { matched = false; break; }
+                if (pt.inner.index != NONE) { pats.push(pt.inner); cons.push(ct.inner); }
+                if (pt.ret.index != NONE) { pats.push(pt.ret); cons.push(ct.ret); }
+                for (k in 0..pt.elems.len()) { pats.push(*pt.elems.get(k).unwrap()); cons.push(*ct.elems.get(k).unwrap()); }
+            }
+            Vec<TypeId> owner_args = Vec.new(); var s = Subst.new();
+            usize ng = self.ck.r.program.def(im).generics.len();
+            for (g in 0..ng) {
+                var gt = self.ck.r.program.def(im).generics.get(g).unwrap().type;
+                usize at = bound_params.len();
+                for (b in 0..bound_params.len()) { if (bound_params.get(b).unwrap().index == gt.index) { at = b; } }
+                if (at == bound_params.len()) { matched = false; break; }
+                var value = *bound_values.get(at).unwrap();
+                if (self.ck.is_unsized(value)) { matched = false; break; }
+                owner_args.push(value); s.bind(gt, value);
+            }
+            if (!matched) { continue; }
+            var m = self.ck.find_method(im, method_name.as_str());
+            if (m.index != NONE) { return self.instance(m, owner_args, fn_args); }
+            if (self.def_body_exists(trait_method)) {
+                Vec<TypeId> owner = Vec.new(); owner.push(self_type);
+                var raw = ids_copy(&const self.ck.r.program.def(im).trait_ref.args);
+                for (a in &const raw) { owner.push(self.ck.apply(&s, *a)); }
+                return self.instance(trait_method, owner, fn_args);
+            }
+        }
+        var tn = String.from(self.ck.r.program.def(tr).name); var st = self.show(self_type);
+        self.error(span, "no implementation of '{tn}.{method_name}' for '{st}'");
+        return NONE;
+    }
+    /// True when a definition has a body (trait default methods).
+    bool def_body_exists(&const self, DefId def) {
+        var d = self.ck.r.program.def(def); if (d.ast_file == NONE) { return false; }
+        return *self.has_body.get(def.index as usize).unwrap();
+    }
+    uint vtable_for(&self, TypeId concrete, TypeId dyn_type, Span span) {
+        for (i in 0..self.module.vtables.len()) {
+            var v = self.module.vtables.get(i).unwrap();
+            if (v.concrete.index == concrete.index && v.dyn_type.index == dyn_type.index) { return i as uint; }
+        }
+        var name = "vtable.{self.module.vtables.len()}";
+        var tr = self.ck.def_of(dyn_type);
+        var methods = ids_def_copy(&const self.ck.r.program.def(tr).methods);
+        var dyn_args = self.ck.elems(dyn_type);
+        Vec<uint> table = Vec.new();
+        for (method in &const methods) {
+            uint target = self.resolve_trait_method(*method, concrete, Vec.new(), span, true, ids_copy(&dyn_args));
+            if (target == NONE) { return NONE; }
+            var expected = Subst.new();
+            expected.bind(self.ck.r.program.def(tr).self_type, concrete);
+            for (k in 0..dyn_args.len()) { expected.bind(self.ck.r.program.def(tr).generics.get(k).unwrap().type, *dyn_args.get(k).unwrap()); }
+            var target_def = self.module.functions.get(target as usize).unwrap().def;
+            var actual = Subst.new();
+            match self.def_owner(target_def) {
+                FnOwner.Impl => {
+                    var im = self.ck.r.program.def(target_def).owner_impl;
+                    var oa = ids_copy(&const self.module.functions.get(target as usize).unwrap().owner_args);
+                    self.bind_into(&actual, im, &oa, 0);
+                }
+                _ => { actual = expected.copy(); }
+            }
+            var td = self.ck.r.program.def(target_def); var md = self.ck.r.program.def(*method);
+            bool same = td.params.len() == md.params.len() && td.generics.is_empty();
+            if (same) { var tr = td.ret; var mr = md.ret; same = self.ck.apply(&actual, tr).index == self.ck.apply(&expected, mr).index; }
+            usize np = self.ck.r.program.def(*method).params.len();
+            for (k in 0..np) {
+                if (!same) { break; }
+                var tp = self.ck.r.program.def(target_def).params.get(k).unwrap().type; var mp = self.ck.r.program.def(*method).params.get(k).unwrap().type;
+                same = self.ck.apply(&actual, tp).index == self.ck.apply(&expected, mp).index;
+            }
+            if (!same) { var mn = self.ck.def_name(*method); self.error(span, "implementation of '{mn}' does not match its trait signature"); return NONE; }
+            table.push(target);
+        }
+        self.needs_drop(concrete);
+        uint index = self.module.vtables.len() as uint;
+        self.module.vtables.push(Vtable { name: name, concrete: concrete, dyn_type: dyn_type, methods: table });
+        return index;
+    }
+    uint resolve_call_target(&self, &const FnCtx c, &const NameRef r, TypeId receiver_base) {
+        Vec<TypeId> owner = Vec.new(); Vec<TypeId> args = Vec.new();
+        for (a in &const r.owner_args) { owner.push(self.subst_type(c, *a)); }
+        for (a in &const r.type_args) { args.push(self.subst_type(c, *a)); }
+        if (check.owner_index(self.def_owner(r.fn_def)) == 3) {
+            return self.resolve_trait_method(r.fn_def, receiver_base, args, zero(), true, owner);
+        }
+        return self.instance(r.fn_def, owner, args);
+    }
+    Operand lower_method_call(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, ulong callee, &const NameRef r, Place dest, bool has_dest) {
+        var x = self.ex(t, e); Span span = x.span; var cx = self.ex(t, callee); ulong base_key = child(callee, cx.a); Span bspan = self.ex(t, base_key).span;
+        var ty = self.type_of(&*c, e);
+        var recv_t = self.type_of(&*c, base_key); var base = recv_t;
+        int k = 0; while (k < r.auto_derefs && self.ck.tk(base) == K_REF) { base = self.ck.inner(base); k += 1; }
+        if (self.ck.r.program.def(r.fn_def).is_builtin) {
+            var recv = self.lower_operand(t, &*c, base_key);
+            if (!recv.is_const()) {
+                var p = recv.place.copy(); var rt = recv_t;
+                while (self.ck.tk(rt) == K_REF) { p = p.deref(); rt = self.ck.inner(rt); }
+                var str_ref = self.tref(self.tstr(), true);
+                uint rl = self.new_temp(&*c, str_ref, bspan);
+                var rr = Rvalue.new(RvalueKind.Ref); rr.place = p; rr.is_const = true; rr.type = str_ref;
+                self.assign(&*c, Place.of(rl), rr, bspan);
+                recv = Operand.copy_of(Place.of(rl));
+            }
+            Vec<Operand> args = Vec.new(); args.push(recv);
+            for (a in &const x.items) { args.push(self.lower_operand(t, &*c, child(e, *a))); }
+            var fname = self.ck.def_name(r.fn_def);
+            var out = if (has_dest) { dest } else { Place.of(self.new_temp(&*c, ty, span)) };
+            self.call(&*c, Callee.builtin_of("str_{fname}"), args, out.copy(), false, span);
+            return self.operand_from_place(out, ty);
+        }
+        bool virtual_call = self.ck.tk(base) == K_DYN;
+        uint target = if (virtual_call) { NONE } else { self.resolve_call_target(&*c, r, base) };
+        if (!virtual_call && target == NONE) { return Operand.empty(); }
+        Vec<Operand> arg_values = Vec.new();
+        for (a in &const x.items) { arg_values.push(self.lower_operand(t, &*c, child(e, *a))); }
+        uint kind = check.self_kind_index(self.ck.r.program.def(r.fn_def).params.get(0).unwrap().self_kind);
+        Vec<Operand> args = Vec.new();
+        bool auto_borrow = false;
+        match self.ck.result.coercions.get(base_key) {
+            Some(co) => { match co.kind { CoercionKind.AutoBorrowConst => { auto_borrow = true; }, CoercionKind.AutoBorrowMut => { auto_borrow = true; }, _ => {} } }
+            None => {}
+        }
+        bool done = false;
+        if (kind == 1) {
+            var p = Place.of(0);
+            if (self.lower_place(t, &*c, base_key, &p)) {
+                for (i in 0..r.auto_derefs) { p = p.deref(); }
+                args.push(self.operand_from_place(p, base));
+            } else {
+                var recv = self.lower_operand(t, &*c, base_key);
+                // A reference produced by a call, such as f().unwrap(), is read
+                // through like a reference held in a place.
+                if (r.auto_derefs > 0 && !recv.is_const()) {
+                    var q = recv.place.copy();
+                    for (i in 0..r.auto_derefs) { q = q.deref(); }
+                    recv = self.operand_from_place(q, base);
+                }
+                args.push(recv);
+            }
+            done = true;
+        } else {
+            bool want_const = kind == 3;
+            var p = Place.of(0);
+            bool have_place = self.lower_place(t, &*c, base_key, &p);
+            if (!have_place) {
+                var o = self.lower_operand(t, &*c, base_key);
+                if (auto_borrow) { args.push(o); done = true; }
+                else if (o.is_const()) {
+                    uint tmp = self.new_temp(&*c, recv_t, bspan);
+                    self.assign(&*c, Place.of(tmp), Rvalue.use_of(o), bspan);
+                    p = Place.of(tmp); self.push_local(&*c, tmp);
+                } else { p = o.place; }
+            }
+            if (!done) {
+                var pt = recv_t;
+                if (!auto_borrow && self.ck.tk(pt) == K_REF && r.auto_derefs <= 1) {
+                    if (r.auto_derefs == 1 && want_const == self.ck.const_of(pt)) { args.push(Operand.copy_of(p.copy())); done = true; }
+                }
+                if (!done) {
+                    int i = 0;
+                    while (i < r.auto_derefs && self.ck.tk(pt) == K_REF) { p = p.deref(); pt = self.ck.inner(pt); i += 1; }
+                    var rt = self.tref(base, want_const);
+                    uint rl = self.new_temp(&*c, rt, bspan);
+                    var rr = Rvalue.new(RvalueKind.Ref); rr.place = p; rr.is_const = want_const; rr.type = rt;
+                    self.assign(&*c, Place.of(rl), rr, bspan);
+                    args.push(Operand.copy_of(Place.of(rl)));
+                }
+            }
+        }
+        for (a in &const arg_values) { args.push(a.copy()); }
+        bool diverges = self.ck.is_never(ty);
+        var out = Place.none();
+        if (has_dest) { out = dest; } else if (!self.ck.is_void(ty) && !diverges) { out = Place.of(self.new_temp(&*c, ty, span)); }
+        var cl = Callee.new(if (virtual_call) { CalleeKind.Virtual } else { CalleeKind.Direct }); cl.fn_index = target;
+        if (virtual_call) {
+            var methods = ids_def_copy(&const self.ck.r.program.def(self.ck.def_of(base)).methods);
+            usize slot = methods.len();
+            for (m in 0..methods.len()) { if (slot == methods.len() && same_def(*methods.get(m).unwrap(), r.fn_def)) { slot = m; } }
+            if (slot == methods.len()) { self.error(span, "internal error: virtual method has no vtable slot"); return Operand.empty(); }
+            cl.vtable_slot = slot as uint;
+        }
+        self.call(&*c, cl, args, out.copy(), diverges, span);
+        if (self.ck.is_void(ty) || diverges) { return self.unit_value(ty); }
+        return self.operand_from_place(out, ty);
+    }
+    Operand lower_call(&self, &const Vec<ast.Ast> t, &FnCtx c, ulong e, Place dest, bool has_dest) {
+        var x = self.ex(t, e); Span span = x.span; ulong callee = child(e, x.a); var cx = self.ex(t, callee);
+        var ty = self.type_of(&*c, e);
+        match self.ref_of(e) {
+            Some(r) => {
+                match r.kind {
+                    RefKind.Method => {
+                        match cx.kind { ast.ExprKind.OptChain => { self.error(span, "'?.' calls are not supported in code generation yet"); return Operand.empty(); }, _ => {} }
+                        return self.lower_method_call(t, &*c, e, callee, &r, dest, has_dest);
+                    }
+                    _ => {}
+                }
+            }
+            None => {}
+        }
+        var found = self.ref_of(callee);
+        var out = if (has_dest) { dest.copy() } else { Place.none() };
+        bool has_ref = false; var r = NameRef.new();
+        match found { Some(v) => { has_ref = true; r = v; }, None => {} }
+        bool is_variant = false; match r.kind { RefKind.Variant => { is_variant = has_ref; }, _ => {} }
+        if (is_variant) {
+            var agg = Rvalue.new(RvalueKind.Aggregate); agg.agg = AggregateKind.Variant; agg.variant = r.variant; agg.type = ty;
+            for (a in &const x.items) { agg.elems.push(self.lower_operand(t, &*c, child(e, *a))); }
+            if (!has_dest) { out = Place.of(self.new_temp(&*c, ty, span)); }
+            self.assign(&*c, out.copy(), agg, span);
+            return self.operand_from_place(out, ty);
+        }
+        Vec<Operand> args = Vec.new();
+        var cl = Callee.new(CalleeKind.Direct);
+        bool diverges = false;
+        var callee_temp = Place.none(); var callee_place = Place.none();
+        usize callee_scope_depth = c.scopes.len();
+        bool named = false; match r.kind { RefKind.Function => { named = has_ref; }, RefKind.AssocFn => { named = has_ref; }, _ => {} }
+        if (named) {
+            var d = self.ck.r.program.def(r.fn_def);
+            bool builtin = d.is_builtin; bool is_extern = check.owner_index(d.owner) == 5;
+            var dret = d.ret; var dname = String.from(d.name);
+            if (builtin) {
+                cl = Callee.builtin_of(dname.as_str());
+                for (a in &const r.type_args) { cl.type_args.push(self.subst_type(&*c, *a)); }
+                if (dname == String.from("drop_in_place") && !cl.type_args.is_empty()) { self.needs_drop(*cl.type_args.get(0).unwrap()); }
+                diverges = dret.index != NONE && self.ck.is_never(dret);
+            } else if (is_extern) {
+                cl = Callee.builtin_of(dname.as_str());
+                diverges = dret.index != NONE && self.ck.is_never(dret);
+            } else {
+                uint target = self.resolve_call_target(&*c, &r, TypeId.none());
+                if (target == NONE) { return Operand.empty(); }
+                cl = Callee.direct(target);
+                var tret = self.def_ret(self.module.functions.get(target as usize).unwrap().def);
+                diverges = tret.index != NONE && self.ck.is_never(tret);
+            }
+        } else {
+            cl.kind = CalleeKind.Indirect;
+            var p = Place.of(0);
+            usize scoped_before = c.scopes.get(c.scopes.len() - 1).unwrap().len();
+            bool placed = self.lower_place(t, &*c, callee, &p);
+            usize top = c.scopes.len() - 1;
+            if (placed && c.scopes.get(top).unwrap().len() > scoped_before) {
+                var scope = c.scopes.get_mut(top).unwrap(); usize at = scope.len();
+                for (i in scoped_before..scope.len()) { if (at == scope.len() && *scope.get(i).unwrap() == p.local) { at = i; } }
+                if (at != scope.len()) { remove_at(&*scope, at); }
+            }
+            if (!placed) {
+                var value = self.lower_operand(t, &*c, callee);
+                var ct = self.type_of(&*c, callee);
+                p = Place.of(self.new_temp(&*c, ct, cx.span));
+                self.assign(&*c, p.copy(), Rvalue.use_of(value), cx.span);
+                callee_temp = p.copy();
+            } else if (!self.local_named(&*c, p.local)) {
+                if (!self.scoped(&*c, p.local)) { callee_temp = Place.of(p.local); }
+            }
+            if (!callee_temp.is_none()) { self.push_local(&*c, callee_temp.local); }
+            callee_place = p;
+            var callable = self.type_of(&*c, callee);
+            while (self.ck.tk(callable) == K_REF) { callee_place = callee_place.deref(); callable = self.ck.inner(callable); }
+            diverges = self.ck.is_never(self.ck.ret_of(callable));
+        }
+        for (a in &const x.items) { args.push(self.lower_operand(t, &*c, child(e, *a))); }
+        match cl.kind {
+            CalleeKind.Indirect => {
+                var callable = self.type_of(&*c, callee);
+                while (self.ck.tk(callable) == K_REF) { callable = self.ck.inner(callable); }
+                uint mode = check.mode_index(self.ck.mode_of(callable));
+                if (mode == 2) { cl.fn_operand = Operand.move_of(callee_place.copy()); }
+                else {
+                    var ref_type = self.tref(callable, mode == 1);
+                    uint borrowed = self.new_temp(&*c, ref_type, cx.span);
+                    var borrow = Rvalue.new(RvalueKind.Ref); borrow.place = callee_place.copy(); borrow.type = ref_type; borrow.is_const = self.ck.const_of(ref_type);
+                    self.assign(&*c, Place.of(borrowed), borrow, cx.span);
+                    cl.fn_operand = Operand.copy_of(Place.of(borrowed));
+                }
+            }
+            _ => {}
+        }
+        if (!has_dest && !self.ck.is_void(ty) && !diverges) { out = Place.of(self.new_temp(&*c, ty, span)); }
+        self.call(&*c, cl, args, out.copy(), diverges, span);
+        var callable_type = self.type_of(&*c, callee);
+        while (self.ck.tk(callable_type) == K_REF) { callable_type = self.ck.inner(callable_type); }
+        if (!callee_temp.is_none() && !diverges && check.mode_index(self.ck.mode_of(callable_type)) != 2) {
+            self.emit(&*c, Statement.new(StatementKind.Drop, callee_temp.copy(), span));
+        }
+        if (!callee_temp.is_none()) {
+            var scope = c.scopes.get_mut(callee_scope_depth - 1).unwrap(); usize at = scope.len();
+            for (i in 0..scope.len()) { if (at == scope.len() && *scope.get(i).unwrap() == callee_temp.local) { at = i; } }
+            if (at != scope.len()) { remove_at(&*scope, at); }
+        }
+        if (self.ck.is_void(ty) || diverges) { return self.unit_value(ty); }
+        return self.operand_from_place(out, ty);
+    }
+}
+
+Vec<DefId> ids_def_copy(&const Vec<DefId> values) { Vec<DefId> out = Vec.new(); for (v in values) { out.push(*v); } return out; }
+/// Removes the element at index, keeping order (std::vector::erase).
+void remove_at(&Vec<uint> values, usize index) {
+    Vec<uint> kept = Vec.new();
+    for (i in 0..values.len()) { if (i != index) { kept.push(*values.get(i).unwrap()); } }
+    values.clear(); for (k in &const kept) { values.push(*k); }
+}
+/// Stores through a writable place reference.
+void put_place(&Place out, Place value) { *out = value; }

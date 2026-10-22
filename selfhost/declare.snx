@@ -1,0 +1,212 @@
+/// Declaration pass. Source: Resolver::declare_items in compiler/src/resolve.cpp.
+/// Parity: tests/selfhost_modules_test.cpp.
+/// Register builtins once, declare prelude, then user modules before signatures.
+/// Duplicate records remain in arenas; only the first global binding is kept.
+import ast;
+import ids.{TypeId, DefId, DefKind, ModuleId, NONE};
+import defs.{Program, Definition, Symbol, FnOwner, GenericParamDef, ParamDef, VariantDef};
+import defs;
+import types.{TypeContext, TypeKind};
+import diagnostics.{DiagnosticSink, Severity};
+import bytes;
+import source.Span;
+
+pub struct Resolver {
+    pub Program program;
+    pub TypeContext types;
+    pub DiagnosticSink sink;
+    pub bool is_prelude;
+    pub Vec<DefId> pending_structs;
+    pub Vec<DefId> pending_enums;
+    pub Vec<DefId> pending_traits;
+    pub Vec<DefId> pending_impls;
+    pub Vec<DefId> pending_functions;
+    pub Vec<DefId> pending_consts;
+    pub Vec<DefId> builtin_str_methods;
+    pub Resolver new() { return Resolver { program: Program.new(), types: TypeContext.new(), sink: DiagnosticSink.new(), is_prelude: false,
+        pending_structs: Vec.new(), pending_enums: Vec.new(), pending_traits: Vec.new(), pending_impls: Vec.new(),
+        pending_functions: Vec.new(), pending_consts: Vec.new(), builtin_str_methods: Vec.new() }; }
+    DefId builtin(&self, &const str name, Vec<TypeId> params, TypeId ret, TypeId self_type) {
+        var d = Definition.new(); d.name = String.from(name); d.is_builtin = true; d.checked = true;
+        d.ret = ret; d.ret_declared = true; d.self_type = self_type;
+        if (self_type.index != NONE) {
+            var ty = self.types.ref_type(self_type, true);
+            d.params.push(ParamDef { name: String.from("self"), span: defs.zero_span(), type: ty, self_kind: ast.SelfKind.ConstRef });
+        }
+        for (i in 0..params.len()) { d.params.push(ParamDef { name: "arg{i}", span: defs.zero_span(), type: *params.get(i).unwrap(), self_kind: ast.SelfKind.None }); }
+        var id = DefId { kind: DefKind.Function, index: self.program.functions.len() as uint };
+        self.program.functions.push(d);
+        if (self_type.index == NONE) { var s = Symbol.new(3); s.fn_def = id.index; self.program.globals.put(name, s); }
+        return id;
+    }
+    pub void register_builtins(&self) {
+        TypeId str_type = self.types.str(); TypeId cstr = self.types.ref_type(str_type, true);
+        TypeId byte_type = self.types.prim(ast.PrimKind.Byte); TypeId ptr = self.types.ptr(byte_type, true);
+        TypeId usize_type = self.types.prim(ast.PrimKind.Usize); TypeId void_type = self.types.prim(ast.PrimKind.Void); TypeId never = self.types.never();
+        Vec<TypeId> one = Vec.new(); one.push(cstr); self.builtin("print", one, void_type, TypeId.none());
+        Vec<TypeId> two = Vec.new(); two.push(cstr); self.builtin("panic", two, never, TypeId.none());
+        Vec<TypeId> raw = Vec.new(); raw.push(ptr); raw.push(usize_type); self.builtin("str_from_raw", raw, cstr, TypeId.none());
+        var size = self.builtin("size_of", Vec.new(), usize_type, TypeId.none());
+        var tp = self.types.param(size, 0, "T"); self.program.def_mut(size).generics.push(GenericParamDef { name: String.from("T"), span: defs.zero_span(), type: tp, bounds: Vec.new() });
+        var drop = self.builtin("drop_in_place", Vec.new(), void_type, TypeId.none());
+        var dp = self.types.param(drop, 0, "T"); var pointer = self.types.ptr(dp, false);
+        self.program.def_mut(drop).generics.push(GenericParamDef { name: String.from("T"), span: defs.zero_span(), type: dp, bounds: Vec.new() });
+        self.program.def_mut(drop).params.push(ParamDef { name: String.from("value"), span: defs.zero_span(), type: pointer, self_kind: ast.SelfKind.None });
+        var len = self.builtin("len", Vec.new(), usize_type, str_type); self.builtin_str_methods.push(len);
+        var as_ptr = self.builtin("as_ptr", Vec.new(), ptr, str_type); self.builtin_str_methods.push(as_ptr);
+        var parse = self.builtin("parse_int", Vec.new(), TypeId.none(), str_type); self.builtin_str_methods.push(parse);
+    }
+    bool declare_global(&self, &const str name, Symbol symbol) {
+        var s = symbol;
+        match s.kind {
+            0 => { s.is_pub = self.program.structs.get(s.struct_def as usize).unwrap().is_pub; }
+            1 => { s.is_pub = self.program.enums.get(s.enum_def as usize).unwrap().is_pub; }
+            2 => { s.is_pub = self.program.traits.get(s.trait_def as usize).unwrap().is_pub; }
+            3 => { s.is_pub = self.program.functions.get(s.fn_def as usize).unwrap().is_pub; }
+            4 => { s.is_pub = self.program.consts.get(s.const_def as usize).unwrap().is_pub; }
+            _ => {}
+        }
+        bool global = self.is_prelude || self.program.active_module.index == NONE;
+        var previous = if (global) { self.program.globals.get(name) } else { self.program.module(self.program.active_module).symbols.get(name) };
+        match previous {
+            Some(old) => {
+                self.sink.error(s.span, "'{name}' is already defined", "SNX0302");
+                Vec<byte> message = Vec.new(); bytes.text(&message, "previous definition is here"); self.sink.add(Severity.Note, old.span, message, String.new());
+                return false;
+            }
+            None => {}
+        }
+        if (global) { self.program.globals.put(name, s); }
+        else { ModuleId module = self.program.active_module; self.program.module_mut(module).symbols.put(name, s); }
+        return true;
+    }
+    DefId new_function(&self, &const ast.Function func, uint node, FnOwner owner) {
+        var d = Definition.new(); d.name = defs.name(func.name); d.module = self.program.active_module;
+        d.span = func.name_span; d.ast_file = func.span.file; d.ast_index = node; d.is_pub = func.is_pub; d.is_prelude = self.is_prelude;
+        d.owner = owner; d.ret_declared = func.ret != ast.NONE;
+        var id = DefId { kind: DefKind.Function, index: self.program.functions.len() as uint };
+        self.program.functions.push(d); self.pending_functions.push(id); return id;
+    }
+    pub Vec<GenericParamDef> declare_generics(&self, &const Vec<ast.GenericParam> gs, DefId owner) {
+        Vec<GenericParamDef> out = Vec.new();
+        for (i in 0..gs.len()) {
+            var g = gs.get(i).unwrap(); var name = defs.name(g.name); var ty = self.types.param(owner, i as uint, name);
+            for (j in 0..i) { if (out.get(j).unwrap().name == name) { self.sink.error(g.span, "duplicate type parameter '{name}'", ""); } }
+            out.push(GenericParamDef { name: name, span: g.span, type: ty, bounds: Vec.new() });
+        }
+        return out;
+    }
+    pub void declare_module(&self, &const ast.Ast tree, ModuleId scope, bool is_prelude) {
+        ModuleId saved = self.program.active_module; self.program.active_module = scope; self.is_prelude = is_prelude;
+        for (node in 0..tree.items.len()) {
+            var item = tree.items.get(node).unwrap();
+            match item.kind {
+                ast.ItemKind.Import => {},
+                ast.ItemKind.Const => {
+                    var d = Definition.new(); d.module = scope; d.name = defs.name(item.text); d.span = item.span;
+                    d.ast_file = item.span.file; d.ast_index = node as uint; d.is_pub = item.is_pub;
+                    var id = DefId { kind: DefKind.Const, index: self.program.consts.len() as uint }; var name = String.from(d.name);
+                    self.program.consts.push(d); var s = Symbol.new(4); s.const_def = id.index; s.span = item.span;
+                    if (self.declare_global(name, s)) { self.pending_consts.push(id); }
+                }
+                ast.ItemKind.Function => {
+                    var id = self.new_function(tree.function(item.function), item.function, FnOwner.Module);
+                    var s = Symbol.new(3); s.fn_def = id.index; s.span = tree.function(item.function).name_span;
+                    var name = String.from(self.program.def(id).name); self.declare_global(name, s);
+                }
+                ast.ItemKind.Struct => { self.nominal(tree, item, node as uint, DefKind.Struct); }
+                ast.ItemKind.Enum => { self.nominal(tree, item, node as uint, DefKind.Enum); }
+                ast.ItemKind.Trait => { self.nominal(tree, item, node as uint, DefKind.Trait); }
+                ast.ItemKind.Impl => { self.nominal(tree, item, node as uint, DefKind.Impl); }
+                ast.ItemKind.Extern => {
+                    for (f in &const item.methods) {
+                        var id = self.new_function(tree.function(*f), *f, FnOwner.Extern);
+                        var s = Symbol.new(3); s.fn_def = id.index; s.span = tree.function(*f).name_span;
+                        var name = String.from(self.program.def(id).name); self.declare_global(name, s);
+                    }
+                }
+            }
+        }
+        self.program.active_module = saved;
+    }
+    void nominal(&self, &const ast.Ast tree, &const ast.Item item, uint node, DefKind kind) {
+        uint index = 0; match kind { DefKind.Struct => { index = self.program.structs.len() as uint; }, DefKind.Enum => { index = self.program.enums.len() as uint; },
+            DefKind.Trait => { index = self.program.traits.len() as uint; }, DefKind.Impl => { index = self.program.impls.len() as uint; }, _ => panic("invalid declaration kind") }
+        var id = DefId { kind: kind, index: index };
+        var d = Definition.new(); d.module = self.program.active_module; d.name = defs.name(item.text); d.span = item.span;
+        d.ast_file = item.span.file; d.ast_index = node; d.is_pub = item.is_pub;
+        // Impl visibility does not propagate to its definition record.
+        match kind { DefKind.Impl => { d.is_pub = false; }, _ => {} }
+        d.generics = self.declare_generics(item.generics, id);
+        Vec<TypeId> args = Vec.new(); for (g in &const d.generics) { args.push(g.type); }
+        var qualified = self.program.qualified_name(d.module, d.name);
+        match kind {
+            DefKind.Struct => { d.self_type = self.types.nominal(TypeKind.Struct, id, qualified, args); }
+            DefKind.Enum => { d.self_type = self.types.nominal(TypeKind.Enum, id, qualified, args); }
+            DefKind.Trait => { d.self_type = self.types.param(id, 65535, "Self"); }
+            _ => {}
+        }
+        match kind { DefKind.Enum => {
+            for (i in 0..item.variants.len()) {
+                var v = item.variants.get(i).unwrap(); var name = defs.name(v.name);
+                for (prev in &const d.variants) { if (prev.name == name) { self.sink.error(v.span, "duplicate variant '{name}'", ""); } }
+                d.variants.push(VariantDef { name: name, span: v.span, index: i as uint, kind: v.kind, tuple_types: Vec.new(), fields: Vec.new(), owner: id });
+            }
+        }, _ => {} }
+        for (m in &const item.methods) {
+            FnOwner owner = FnOwner.Impl;
+            match kind { DefKind.Struct => { owner = FnOwner.Struct; }, DefKind.Enum => { owner = FnOwner.Enum; }, DefKind.Trait => { owner = FnOwner.Trait; }, _ => {} }
+            var func = self.new_function(tree.function(*m), *m, owner);
+            {
+                var f = self.program.def_mut(func);
+                match kind { DefKind.Struct => { f.owner_struct = id; f.self_type = d.self_type; }, DefKind.Enum => { f.owner_enum = id; f.self_type = d.self_type; },
+                    DefKind.Trait => { f.owner_trait = id; f.self_type = d.self_type; }, DefKind.Impl => { f.owner_impl = id; }, _ => {} }
+            }
+            bool check_methods = false; match kind { DefKind.Struct => { check_methods = true; }, DefKind.Trait => { check_methods = true; }, _ => {} }
+            if (check_methods) {
+                var f = self.program.def(func);
+                for (other in &const d.methods) { if (self.program.def(*other).name == f.name) { self.sink.error(f.span, "duplicate method '{f.name}'", ""); } }
+            }
+            d.methods.push(func);
+        }
+        var name = String.from(d.name);
+        if (self.is_prelude) {
+            match kind {
+                DefKind.Struct => {
+                    if (name == String.from("String")) { d.is_builtin_string = true; self.program.string_def = id; }
+                    if (name == String.from("Vec")) { d.is_builtin_vec = true; self.program.vec_def = id; }
+                    if (name == String.from("Range")) { self.program.range_def = id; }
+                    if (name == String.from("RangeInclusive")) { self.program.range_inclusive_def = id; }
+                    if (name == String.from("Task")) { self.program.task_def = id; }
+                    if (name == String.from("SendTask")) { self.program.send_task_def = id; }
+                    if (name == String.from("Waker")) { self.program.waker_def = id; }
+                }
+                DefKind.Enum => {
+                    if (name == String.from("Option")) { self.program.option_def = id; }
+                    if (name == String.from("Result")) { self.program.result_def = id; }
+                    if (name == String.from("Poll")) { self.program.poll_def = id; }
+                }
+                DefKind.Trait => { self.program.core_traits.put(name, id.index); }
+                _ => {}
+            }
+        }
+        match kind {
+            DefKind.Struct => { self.program.structs.push(d); self.pending_structs.push(id); }
+            DefKind.Enum => { self.program.enums.push(d); self.pending_enums.push(id); }
+            DefKind.Trait => { self.program.traits.push(d); self.pending_traits.push(id); }
+            DefKind.Impl => { self.program.impls.push(d); self.pending_impls.push(id); return; }
+            _ => {}
+        }
+        var s = Symbol.new(0); s.span = item.span;
+        match kind { DefKind.Struct => { s.kind = 0; s.struct_def = id.index; }, DefKind.Enum => { s.kind = 1; s.enum_def = id.index; }, DefKind.Trait => { s.kind = 2; s.trait_def = id.index; }, _ => {} }
+        self.declare_global(name, s);
+        match kind { DefKind.Enum => {
+            if (self.is_prelude && (name == String.from("Option") || name == String.from("Result"))) {
+                for (v in &const self.program.def(id).variants) {
+                    var vs = Symbol.new(5); vs.variant = v.index; vs.enum_def = id.index; vs.span = v.span;
+                    var vn = String.from(v.name); self.declare_global(vn, vs);
+                }
+            }
+        }, _ => {} }
+    }
+}

@@ -1,0 +1,117 @@
+/// Regular ar archive member directory for ELF, COFF, and BSD/Darwin libraries.
+/// Names own their bytes. Payloads are checked offsets into the caller's buffer.
+/// No member is extracted to disk. Symbol-index payloads remain unparsed.
+/// Fixtures: tests/linker/run.py through selfhost/link/probe.snx.
+import link.reader.{ReadError, ErrorKind};
+import link.reader;
+
+pub struct Member {
+    pub Vec<byte> name;
+    pub usize header;
+    pub usize offset;
+    pub usize size;
+    pub bool metadata;
+}
+struct RawMember { Vec<byte> name; usize header; usize offset; usize size; }
+struct Span { usize offset; usize size; }
+bool equal(&const Vec<byte> name, &const str token) { return name.len() == token.len() && reader.matches(name, 0, token); }
+bool metadata(&const Vec<byte> name) {
+    return equal(name, "/") || equal(name, "//") || equal(name, "/SYM64/") ||
+        equal(name, "__.SYMDEF") || equal(name, "__.SYMDEF SORTED") ||
+        equal(name, "__.SYMDEF_64") || equal(name, "__.SYMDEF_64 SORTED");
+}
+Result<Vec<byte>, ReadError> long_name(&const Vec<byte> data, Span table, usize index) {
+    if (index >= table.size) { return Err(reader.error(ErrorKind.Invalid, table.offset)); }
+    usize start = table.offset + index;
+    usize end = table.offset + table.size;
+    // Require an entry boundary. GNU entries end in / LF; COFF entries end in NUL.
+    if (index > 0) {
+        byte previous = *data.get(start - 1).unwrap();
+        if (previous != 0 && previous != 10) { return Err(reader.error(ErrorKind.Invalid, start)); }
+    }
+    usize cursor = start;
+    while (cursor < end) {
+        byte ch = *data.get(cursor).unwrap();
+        if (ch == 0) { return reader.copy(data, start, cursor - start); }
+        if (ch == 10) {
+            if (cursor == start || *data.get(cursor - 1).unwrap() != 47) { return Err(reader.error(ErrorKind.Invalid, cursor)); }
+            return reader.copy(data, start, cursor - start - 1);
+        }
+        cursor += 1;
+    }
+    return Err(reader.error(ErrorKind.Truncated, start));
+}
+Result<Vec<byte>, ReadError> bsd_name(&const Vec<byte> data, usize offset, usize length) {
+    usize end = offset + length;
+    while (end > offset && *data.get(end - 1).unwrap() == 0) { end -= 1; }
+    for (i in offset..end) {
+        if (*data.get(i).unwrap() == 0) { return Err(reader.error(ErrorKind.Invalid, i)); }
+    }
+    return reader.copy(data, offset, end - offset);
+}
+
+/// Parses the complete directory before returning any members.
+/// Accepts short, GNU/COFF table, and BSD #1/length names. Order is preserved.
+/// Thin archives and unknown slash extensions return Unsupported.
+/// Truncated headers/payloads, invalid decimal fields/names/padding, and duplicate
+/// name tables return ReadError with an archive-relative byte offset.
+pub Result<Vec<Member>, ReadError> parse(&const Vec<byte> data) {
+    if (reader.matches(data, 0, "!<thin>\n")) { return Err(reader.error(ErrorKind.Unsupported, 0)); }
+    var signature_end = reader.range(data, 0, 8)?;
+    if (!reader.matches(data, 0, "!<arch>\n")) { return Err(reader.error(ErrorKind.Invalid, 0)); }
+    Vec<RawMember> raw = Vec.new();
+    Span? table = None;
+    usize cursor = 8;
+    while (cursor < data.len()) {
+        usize payload = reader.range(data, cursor, 60)?;
+        if (!reader.matches(data, cursor + 58, "`\n")) { return Err(reader.error(ErrorKind.Invalid, cursor + 58)); }
+        usize size = reader.decimal(data, cursor + 48, 10)?;
+        usize end = reader.range(data, payload, size)?;
+        usize name_end = cursor + 16;
+        while (name_end > cursor && *data.get(name_end - 1).unwrap() == 32) { name_end -= 1; }
+        if (name_end == cursor) { return Err(reader.error(ErrorKind.Invalid, cursor)); }
+        var name = reader.copy(data, cursor, name_end - cursor)?;
+        if (equal(name, "//")) {
+            if (table.is_some()) { return Err(reader.error(ErrorKind.Invalid, cursor)); }
+            table = Some(Span { offset: payload, size: size });
+        }
+        raw.push(RawMember { name: name, header: cursor, offset: payload, size: size });
+        cursor = end;
+        if (size % 2 != 0) {
+            var pad_end = reader.range(data, cursor, 1)?;
+            if (*data.get(cursor).unwrap() != 10) { return Err(reader.error(ErrorKind.Invalid, cursor)); }
+            cursor += 1;
+        }
+    }
+    Vec<Member> out = Vec.new();
+    for (item in &const raw) {
+        usize offset = item.offset;
+        usize size = item.size;
+        Vec<byte> name = Vec.new();
+        if (reader.matches(item.name, 0, "#1/")) {
+            usize length = match reader.decimal(item.name, 3, item.name.len() - 3) {
+                Ok(value) => value, Err(_) => return Err(reader.error(ErrorKind.Invalid, item.header))
+            };
+            if (length > size) { return Err(reader.error(ErrorKind.Invalid, item.header)); }
+            name = bsd_name(data, offset, length)?;
+            offset += length; size -= length;
+        } else if (*item.name.get(0).unwrap() == 47 && !metadata(item.name)) {
+            usize index = match reader.decimal(item.name, 1, item.name.len() - 1) {
+                Ok(value) => value, Err(_) => return Err(reader.error(ErrorKind.Unsupported, item.header))
+            };
+            match table {
+                Some(span) => { name = long_name(data, span, index)?; },
+                None => return Err(reader.error(ErrorKind.Invalid, item.header)),
+            }
+        } else {
+            usize length = item.name.len();
+            if (!metadata(item.name) && *item.name.get(length - 1).unwrap() == 47) { length -= 1; }
+            name = reader.copy(item.name, 0, length)?;
+        }
+        if (name.is_empty()) { return Err(reader.error(ErrorKind.Invalid, item.header)); }
+        for (ch in &const name) { if (*ch == 0) { return Err(reader.error(ErrorKind.Invalid, item.header)); } }
+        bool is_metadata = metadata(name);
+        out.push(Member { name: name, header: item.header, offset: offset, size: size, metadata: is_metadata });
+    }
+    return Ok(out);
+}

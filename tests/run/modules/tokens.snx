@@ -1,0 +1,4 @@
+pub enum Token { Number(int), Record { int n; }, End }
+pub int read(Token token) {
+    return match token { Token.Number(n) => n, Token.Record { n } => n + 1, Token.End => 0 };
+}

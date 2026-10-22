@@ -1,0 +1,98 @@
+/// Scalar mathematics and three-dimensional vectors.
+pub const PI = 3.141592653589793;
+pub const TAU = 6.283185307179586;
+pub double abs(double value) { if (value == 0.0) { return 0.0; } return if (value < 0.0) { -value } else { value }; }
+pub bool is_nan(double value) { return value != value; }
+pub bool is_finite(double value) { return value == value && value - value == 0.0; }
+pub double min(double a, double b) { if (a != a) { return a; } return if (a < b) { a } else { b }; }
+pub double max(double a, double b) { if (a != a) { return a; } return if (a > b) { a } else { b }; }
+pub double clamp(double value, double low, double high) {
+    if (!(low <= high)) { panic("clamp requires ordered bounds"); }
+    if (value < low) { return low; }
+    if (value > high) { return high; }
+    return value;
+}
+pub double trunc(double value) {
+    if (!is_finite(value) || abs(value) >= 4503599627370496.0) { return value; }
+    return (value as long) as double;
+}
+pub double floor(double value) { double whole = trunc(value); return if (whole > value) { whole - 1.0 } else { whole }; }
+pub double ceil(double value) { double whole = trunc(value); return if (whole < value) { whole + 1.0 } else { whole }; }
+/// Round halfway cases away from zero.
+pub double round(double value) {
+    double whole = trunc(value); double fraction = value - whole;
+    if (fraction >= 0.5) { return whole + 1.0; }
+    if (fraction <= -0.5) { return whole - 1.0; }
+    return whole;
+}
+pub double lerp(double start, double end, double amount) {
+    if (amount == 0.0) { return start; }
+    if (amount == 1.0) { return end; }
+    return (1.0 - amount) * start + amount * end;
+}
+pub double radians(double degrees) { return degrees * (PI / 180.0); }
+pub double degrees(double radians) { return radians * (180.0 / PI); }
+pub double powi(double value, int exponent) {
+    long power = exponent as long;
+    double base = value;
+    if (power < 0) { base = 1.0 / base; power = -power; }
+    double result = 1.0;
+    while (power > 0) {
+        if ((power & 1) != 0) { result *= base; }
+        power = power / 2;
+        if (power != 0) { base *= base; }
+    }
+    return result;
+}
+pub bool approx_eq(double a, double b, double relative, double absolute) {
+    if (relative < 0.0 || absolute < 0.0 || relative != relative || absolute != absolute) { return false; }
+    if (a == b) { return true; }
+    if (!is_finite(a) || !is_finite(b)) { return false; }
+    return abs(a - b) <= max(absolute, relative * max(abs(a), abs(b)));
+}
+pub ulong gcd(ulong a, ulong b) { while (b != 0) { ulong remainder = a % b; a = b; b = remainder; } return a; }
+pub ulong? lcm(ulong a, ulong b) {
+    if (a == 0 || b == 0) { return Some(0); }
+    ulong factor = a / gcd(a, b);
+    if (factor > 18446744073709551615 / b) { return None; }
+    return Some(factor * b);
+}
+pub double sqrt(double value) {
+    if (value < 0.0) { panic("sqrt requires a nonnegative value"); }
+    if (value == 0.0 || value != value || value + value == value) { return value; }
+    double guess = if (value > 1.0) { value } else { 1.0 };
+    for (i in 0..1024) {
+        double next = (guess + value / guess) * 0.5;
+        if (next == guess) { return next; }
+        guess = next;
+    }
+    return guess;
+}
+pub struct Vec3 {
+    pub double x;
+    pub double y;
+    pub double z;
+    pub double dot(&const self, &const Vec3 other) {
+        return self.x * other.x + self.y * other.y + self.z * other.z;
+    }
+    pub double length(&const self) {
+        double scale = max(abs(self.x), max(abs(self.y), abs(self.z)));
+        if (scale == 0.0 || !is_finite(scale)) { return scale; }
+        double x = self.x / scale; double y = self.y / scale; double z = self.z / scale;
+        return scale * sqrt(x * x + y * y + z * z);
+    }
+    pub Vec3 add(&const self, &const Vec3 other) { return Vec3 { x: self.x + other.x, y: self.y + other.y, z: self.z + other.z }; }
+    pub Vec3 sub(&const self, &const Vec3 other) { return Vec3 { x: self.x - other.x, y: self.y - other.y, z: self.z - other.z }; }
+    pub Vec3 scale(&const self, double factor) { return Vec3 { x: self.x * factor, y: self.y * factor, z: self.z * factor }; }
+    pub Vec3 cross(&const self, &const Vec3 other) {
+        return Vec3 { x: self.y * other.z - self.z * other.y, y: self.z * other.x - self.x * other.z, z: self.x * other.y - self.y * other.x };
+    }
+    pub double distance(&const self, &const Vec3 other) { return self.sub(other).length(); }
+    pub Vec3? normalized(&const self) {
+        double scale = max(abs(self.x), max(abs(self.y), abs(self.z)));
+        if (scale == 0.0 || !is_finite(scale)) { return None; }
+        double x = self.x / scale; double y = self.y / scale; double z = self.z / scale;
+        double magnitude = sqrt(x * x + y * y + z * z);
+        return Some(Vec3 { x: x / magnitude, y: y / magnitude, z: z / magnitude });
+    }
+}

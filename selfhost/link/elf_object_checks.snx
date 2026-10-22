@@ -1,0 +1,192 @@
+/// ELF object-reader parity fixtures and malformed-record checks.
+/// Axon supplies the valid object bytes. Every truncated prefix must fail.
+import objfile.{ObjectFile, ObjectFormat, ObjSymbol, ObjReloc};
+import objfile;
+import x64;
+import bytes;
+import link.elf_object;
+import link.import_checks;
+import link.model.{Object, Failure, Code};
+import std.binary;
+
+void require(bool value, &const str message) { if (!value) { panic(message); } }
+T expect<T>(Result<T, Failure> result) {
+    return match result { Ok(value) => value, Err(error) => panic("ELF reader rejected valid fixture at {error.record}") };
+}
+ulong word(&const Vec<byte> data, usize at, usize width) { return binary.read_uint(data, at, width, true).unwrap(); }
+void patch(&Vec<byte> data, usize at, ulong value, usize width) {
+    require(at <= data.len() && width <= data.len() - at, "ELF fixture patch bounds");
+    for (i in 0..width) { *data.get_mut(at + i).unwrap() = ((value >> (i as ulong * 8)) & 255) as byte; }
+}
+usize rejected(&const Vec<byte> data) {
+    match elf_object.read(data, "fixture.o", true) {
+        Err(_) => return 1, Ok(_) => panic("ELF reader accepted malformed fixture")
+    }
+}
+usize bad(&const Vec<byte> data, usize at, ulong value, usize width) {
+    var changed = bytes.copy(data, 0, data.len()); patch(&changed, at, value, width);
+    match elf_object.read(changed, "fixture.o", true) {
+        Err(_) => return 1, Ok(_) => panic("ELF reader accepted malformed field {at}, value {value}")
+    }
+}
+usize unsupported(&const Vec<byte> data, usize at, ulong value, usize width) {
+    var changed = bytes.copy(data, 0, data.len()); patch(&changed, at, value, width);
+    match elf_object.read(changed, "fixture.o", true) {
+        Ok(_) => panic("ELF reader accepted unsupported field {at}"),
+        Err(error) => { require(match error.code { Unsupported => true, _ => false }, "ELF unsupported error code"); return 1; }
+    }
+}
+ObjectFile fixture() {
+    var file = ObjectFile.new();
+    for (i in 0..32) { file.text.push(i as byte); }
+    for (i in 0..24) { file.rodata.push((i + 32) as byte); }
+    file.symbols.push(ObjSymbol { name: String.from("entry_long_symbol"), offset: 0, is_text: true, global: true, defined: true });
+    file.symbols.push(ObjSymbol { name: String.from("data_long_symbol"), offset: 8, is_text: false, global: false, defined: true });
+    file.symbols.push(ObjSymbol { name: String.from("external_long_symbol"), offset: 0, is_text: true, global: true, defined: false });
+    file.relocs.push(ObjReloc { offset: 4, symbol: String.from("data_long_symbol"), kind: x64.RelocKind.Pc32, addend: -12, is_text: true });
+    file.relocs.push(ObjReloc { offset: 16, symbol: String.from("external_long_symbol"), kind: x64.RelocKind.Abs64, addend: -8, is_text: true });
+    file.relocs.push(ObjReloc { offset: 0, symbol: String.from("entry_long_symbol"), kind: x64.RelocKind.Abs64, addend: 3, is_text: false });
+    file.relocs.push(ObjReloc { offset: 16, symbol: String.from("external_long_symbol"), kind: x64.RelocKind.Call32, addend: -4, is_text: false });
+    return file;
+}
+bool equal(&const Vec<byte> left, &const Vec<byte> right) {
+    if (left.len() != right.len()) { return false; }
+    for (i in 0..left.len()) { if (*left.get(i).unwrap() != *right.get(i).unwrap()) { return false; } }
+    return true;
+}
+void definition(&const Object object, &const str wanted, usize section, ulong offset) {
+    for (symbol in &const object.symbols) {
+        if (!bytes.equals(symbol.name, wanted)) { continue; }
+        require(match symbol.definition { Section(s, o) => s == section && o == offset, _ => false }, "ELF symbol definition"); return;
+    }
+    panic("ELF fixture symbol missing");
+}
+usize valid(&const Vec<byte> data, &const ObjectFile file) {
+    var snapshot = bytes.copy(data, 0, data.len());
+    var object = expect(elf_object.read(data, "fixture.o", true));
+    require(equal(snapshot, data), "ELF reader changed input");
+    require(object.archive_member && object.name == String.from("fixture.o"), "ELF object identity");
+    require(object.sections.len() == 2 && object.symbols.len() == 5, "ELF section/symbol count");
+    require(equal(object.sections.get(0).unwrap().data, file.text), "ELF text payload");
+    require(equal(object.sections.get(1).unwrap().data, file.rodata), "ELF read-only payload");
+    require(object.sections.get(0).unwrap().alignment == 16 && object.sections.get(1).unwrap().alignment == 16, "ELF alignments");
+    require(match object.sections.get(0).unwrap().kind { Text => true, _ => false }, "ELF text kind");
+    require(match object.sections.get(1).unwrap().kind { ReadOnly => true, _ => false }, "ELF rodata kind");
+    definition(object, "$section:1", 0, 0); definition(object, "$section:2", 1, 0);
+    definition(object, "entry_long_symbol", 0, 0); definition(object, "data_long_symbol", 1, 8);
+    require(object.relocations.len() == 4, "ELF relocation count");
+    for (i in 0..4) {
+        var source = file.relocs.get(i).unwrap(); var actual = object.relocations.get(i).unwrap();
+        require(actual.section == if (source.is_text) { 0 } else { 1 }, "ELF relocation section");
+        require(actual.offset == source.offset as ulong && actual.addend == source.addend, "ELF normalized relocation fields");
+        require(bytes.equals(object.symbols.get(actual.symbol).unwrap().name, source.symbol), "ELF relocation symbol mapping");
+        require(match actual.kind { Abs64 => i == 1 || i == 2, Pc32 => i == 0 || i == 3, _ => false }, "ELF normalized relocation kind");
+    }
+    for (symbol in &const object.symbols) {
+        if (bytes.equals(symbol.name, "external_long_symbol")) {
+            require(match symbol.definition { Undefined => true, _ => false }, "ELF undefined symbol");
+            require(match symbol.binding { Global => true, _ => false }, "ELF global binding");
+        }
+    }
+    return 1;
+}
+usize malformed(&const Vec<byte> data) {
+    usize count = 0; ulong max = 18446744073709551615;
+    usize table = word(data, 40, 8) as usize;
+    usize text = table + 64; usize ro = table + 128; usize rela = table + 192;
+    usize sym = table + 256; usize strings = table + 320; usize shstrings = table + 384;
+    usize symbols = word(data, sym + 24, 8) as usize;
+    usize symbol_count = (word(data, sym + 32, 8) / 24) as usize;
+    usize relocations = word(data, rela + 24, 8) as usize;
+    usize str_at = word(data, strings + 24, 8) as usize;
+    usize str_size = word(data, strings + 32, 8) as usize;
+    count += bad(data, 0, 0, 4); count += bad(data, 4, 1, 1); count += bad(data, 5, 2, 1);
+    count += bad(data, 6, 0, 1); count += bad(data, 16, 2, 2); count += bad(data, 18, 3, 2);
+    count += bad(data, 20, 0, 4); count += bad(data, 40, max, 8); count += bad(data, 48, 1, 4);
+    count += bad(data, 52, 63, 2); count += bad(data, 58, 63, 2); count += bad(data, 60, 0, 2);
+    count += bad(data, 60, 65535, 2); count += bad(data, 62, 8, 2); count += bad(data, 62, 65535, 2);
+    count += bad(data, table + 4, 1, 4); count += bad(data, text, 0xffffffff, 4);
+    count += bad(data, text + 24, max, 8); count += bad(data, text + 32, max, 8);
+    count += bad(data, text + 48, 3, 8); count += bad(data, text + 48, 8192, 8);
+    count += unsupported(data, text + 8, 0x406, 8);
+    count += unsupported(data, text + 8, 0x206, 8);
+    count += unsupported(data, text + 8, 0x806, 8);
+    count += unsupported(data, text + 8, 7, 8);
+    count += unsupported(data, shstrings + 4, 17, 4);
+    count += bad(data, shstrings + 4, 1, 4);
+    count += bad(data, sym + 40, 8, 4); count += bad(data, sym + 40, 1, 4);
+    count += bad(data, sym + 44, symbol_count as ulong + 1, 4);
+    count += bad(data, sym + 44, 3, 4); count += bad(data, sym + 56, 23, 8);
+    count += bad(data, sym + 32, 25, 8); count += bad(data, sym + 32, 0, 8);
+    count += bad(data, symbols + 8, 1, 8); count += bad(data, symbols + 3 * 24, 0xffffffff, 4);
+    count += bad(data, symbols + 3 * 24 + 8, 25, 8);
+    count += bad(data, symbols + 3 * 24 + 16, 17, 8);
+    count += unsupported(data, symbols + 5 * 24 + 4, 0x20, 1);
+    count += unsupported(data, symbols + 5 * 24 + 4, 0x16, 1);
+    count += unsupported(data, symbols + 5 * 24 + 6, 65522, 2);
+    count += unsupported(data, symbols + 3 * 24 + 5, 0x80, 1);
+    count += bad(data, str_at, 1, 1); count += bad(data, str_at + str_size - 1, 1, 1);
+    count += bad(data, rela + 40, 1, 4); count += bad(data, rela + 44, 8, 4);
+    count += bad(data, rela + 56, 16, 8); count += bad(data, rela + 32, 25, 8);
+    count += unsupported(data, rela + 4, 9, 4);
+    count += bad(data, relocations, 31, 8);
+    ulong info = word(data, relocations + 8, 8);
+    count += bad(data, relocations + 8, (symbol_count as ulong << 32) | 2, 8);
+    count += unsupported(data, relocations + 8, 2, 8);
+    count += unsupported(data, relocations + 8, (info & 0xffffffff00000000) | 9, 8);
+    return count;
+}
+usize accepted(&const Vec<byte> data) {
+    usize count = 0; usize table = word(data, 40, 8) as usize;
+    usize ro = table + 128; usize rela = table + 192; usize sym = table + 256;
+    usize symbols = word(data, sym + 24, 8) as usize;
+    usize relocations = word(data, rela + 24, 8) as usize;
+    ulong symbol_bits = word(data, relocations + 8, 8) & 0xffffffff00000000;
+    for (kind in 1..12) {
+        if (kind != 1 && kind != 2 && kind != 4 && kind != 10 && kind != 11) { continue; }
+        var changed = bytes.copy(data, 0, data.len()); patch(&changed, relocations + 8, symbol_bits | kind as ulong, 8);
+        var object = expect(elf_object.read(changed, "fixture.o", false));
+        require(object.relocations.get(0).unwrap().addend == -12, "ELF RELA addend preservation");
+        require(match object.relocations.get(0).unwrap().kind {
+            Abs64 => kind == 1, Pc32 => kind == 2 || kind == 4, Abs32 => kind == 10, Signed32 => kind == 11, _ => false
+        }, "ELF supported relocation types"); count += 1;
+    }
+    var none = bytes.copy(data, 0, data.len()); patch(&none, relocations + 8, 0, 8);
+    require(expect(elf_object.read(none, "fixture.o", false)).relocations.len() == 3, "ELF NONE relocation"); count += 1;
+    var section_ref = bytes.copy(data, 0, data.len()); patch(&section_ref, relocations + 8, 0x100000002, 8);
+    var section_object = expect(elf_object.read(section_ref, "fixture.o", false));
+    require(bytes.equals(section_object.symbols.get(section_object.relocations.get(0).unwrap().symbol).unwrap().name, "$section:1"), "ELF section-symbol relocation"); count += 1;
+    var minimum = bytes.copy(data, 0, data.len()); patch(&minimum, relocations + 16, 0x8000000000000000, 8);
+    var min_object = expect(elf_object.read(minimum, "fixture.o", false));
+    require(min_object.relocations.get(0).unwrap().addend == -9223372036854775808, "ELF signed addend minimum"); count += 1;
+    var binary_name = bytes.copy(data, 0, data.len());
+    usize str_at = word(data, table + 320 + 24, 8) as usize;
+    usize name_at = word(data, symbols + 3 * 24, 4) as usize;
+    patch(&binary_name, str_at + name_at, 255, 1);
+    var binary_object = expect(elf_object.read(binary_name, "fixture.o", false));
+    require(*binary_object.symbols.get(2).unwrap().name.get(0).unwrap() == 255, "ELF raw-byte symbol name"); count += 1;
+    var file = bytes.copy(data, 0, data.len());
+    patch(&file, symbols + 2 * 24 + 4, 4, 1); patch(&file, symbols + 2 * 24 + 6, 65521, 2);
+    require(expect(elf_object.read(file, "fixture.o", false)).symbols.len() == 4, "ELF file-symbol exclusion"); count += 1;
+    var writable = bytes.copy(data, 0, data.len()); patch(&writable, ro + 8, 3, 8);
+    var data_object = expect(elf_object.read(writable, "fixture.o", false));
+    require(match data_object.sections.get(1).unwrap().kind { Data => true, _ => false }, "ELF writable section"); count += 1;
+    var bss = bytes.copy(data, 0, data.len()); patch(&bss, ro + 4, 8, 4); patch(&bss, ro + 8, 3, 8);
+    patch(&bss, table + 7 * 64 + 32, 0, 8);
+    var bss_object = expect(elf_object.read(bss, "fixture.o", false));
+    require(match bss_object.sections.get(1).unwrap().kind { Bss => true, _ => false }, "ELF BSS kind");
+    require(bss_object.sections.get(1).unwrap().size == 24 && bss_object.sections.get(1).unwrap().data.is_empty(), "ELF BSS extent"); count += 1;
+    var debug = bytes.copy(data, 0, data.len()); patch(&debug, ro + 8, 0, 8);
+    patch(&debug, relocations + 8, 0x400000002, 8);
+    usize debug_relocs = word(data, table + 7 * 64 + 24, 8) as usize;
+    patch(&debug, debug_relocs + 8, 0xffffffffffffffff, 8);
+    var debug_object = expect(elf_object.read(debug, "fixture.o", false));
+    require(debug_object.sections.len() == 1 && debug_object.relocations.len() == 2, "ELF nonallocated debug exclusion"); count += 1;
+    return count;
+}
+pub usize run() {
+    var file = fixture(); var data = objfile.write_object(file, ObjectFormat.Elf);
+    usize count = valid(data, file);
+    for (size in 0..data.len()) { count += rejected(bytes.copy(data, 0, size)); }
+    count += malformed(data); count += accepted(data); count += import_checks.run(); return count;
+}

@@ -1,0 +1,120 @@
+/// Binary parser parity driver.
+/// Format: tests/selfhost_parser_test.cpp reference().
+import ast;
+import ast_dump;
+import parser.Parser;
+import source.{SourceFile, Span};
+import diagnostics.{DiagnosticSink, Severity};
+import lexer;
+import bytes;
+import std.fs;
+import std.env;
+import std.text;
+import std.binary;
+
+T require<T, E>(Result<T, E> result) {
+    match result {
+        Ok(value) => return value,
+        Err(_) => panic("parity I/O failed"),
+    }
+}
+void put(&Vec<byte> output, ulong value, usize width) {
+    if (!binary.write_uint(&*output, value, width, true)) {
+        panic("parity integer overflow");
+    }
+}
+void blob(&Vec<byte> output, &const Vec<byte> value) {
+    put(&*output, value.len() as ulong, 8);
+    bytes.append(&*output, value);
+}
+void string(&Vec<byte> output, &const str value) {
+    put(&*output, value.len() as ulong, 8);
+    bytes.text(&*output, value);
+}
+void span(&Vec<byte> output, Span value) {
+    put(&*output, value.start as ulong, 4);
+    put(&*output, value.end as ulong, 4);
+    put(&*output, value.file as ulong, 4);
+}
+void diagnostics(&Vec<byte> output, &const DiagnosticSink sink) {
+    put(&*output, sink.errors as ulong, 8);
+    put(&*output, sink.items.len() as ulong, 8);
+    for (item in &const sink.items) {
+        uint severity = 0;
+        match item.severity {
+            Severity.Error => {}
+            Severity.Warning => { severity = 1; }
+            Severity.Note => { severity = 2; }
+        }
+        put(&*output, severity as ulong, 4);
+        span(&*output, item.span);
+        blob(&*output, item.message);
+        string(&*output, item.code.as_str());
+    }
+}
+void inspect(&Vec<byte> output, byte mode, &const str path, uint id) {
+    var file = require(SourceFile.load(path, id));
+    var sink = DiagnosticSink.new();
+    var tokens = lexer.tokenize(file, &sink);
+    var parser = Parser.new(file, tokens, sink);
+    Vec<byte> dump = Vec.new();
+
+    match mode {
+        77 => {
+            parser.parse_module();
+            dump = ast_dump.module(parser.ast);
+        }
+        69 => {
+            uint root = parser.parse_expression();
+            if (root != ast.NONE) { dump = ast_dump.expr(parser.ast, root); }
+        }
+        84 => {
+            uint root = parser.parse_type_only();
+            if (root != ast.NONE) { dump = ast_dump.type_node(parser.ast, root); }
+        }
+        80 => {
+            uint root = parser.parse_pattern_only();
+            if (root != ast.NONE) { dump = ast_dump.pattern(parser.ast, root); }
+        }
+        83 => {
+            uint root = parser.parse_statement_only();
+            if (root != ast.NONE) { dump = ast_dump.stmt(parser.ast, root); }
+        }
+        _ => panic("invalid parser entry mode"),
+    }
+
+    output.push(mode);
+    blob(&*output, dump);
+    put(&*output, parser.position() as ulong, 8);
+    diagnostics(&*output, parser.sink);
+    Vec<SourceFile> registered = Vec.new();
+    var rendered = parser.sink.render(file, registered);
+    blob(&*output, rendered);
+}
+main() {
+    var args = env.args();
+    if (args.len() != 3) {
+        panic("usage: parser_probe <manifest> <report>");
+    }
+    var manifest = require(
+        fs.read_text(args.get(1).unwrap().as_str())
+    );
+    var lines = text.lines(manifest);
+    Vec<byte> output = Vec.new();
+    uint id = 7;
+    for (line in &const lines) {
+        if (line.is_empty()) { continue; }
+        var separator = text.find(line.as_str(), "\t")
+            .expect("manifest entry requires a tab");
+        if (separator != 1 || line.len() <= 2) {
+            panic("manifest entry requires one mode byte and a path");
+        }
+        byte mode = unsafe { *line.as_str().as_ptr() };
+        var path = text.slice(line.as_str(), separator + 1, line.len())
+            .expect("manifest path is not valid UTF-8");
+        inspect(&output, mode, path.as_str(), id);
+        if (id == 4294967295) { panic("parser probe file ID overflow"); }
+        id += 1;
+    }
+    require(fs.write(args.get(2).unwrap().as_str(), output));
+}

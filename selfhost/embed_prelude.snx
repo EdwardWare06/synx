@@ -1,0 +1,21 @@
+/// Regenerates prelude_source.snx from compiler/prelude.snx.
+/// Run with the active compiler after changing the shared prelude.
+import bytes;
+import std.fs;
+import std.env;
+T require<T, E>(Result<T, E> result) { match result { Ok(value) => return value, Err(_) => panic("prelude embedding I/O failed") } }
+main() {
+    var args = env.args(); if (args.len() != 3) { panic("usage: embed_prelude <prelude.snx> <prelude_source.snx>"); }
+    var input = require(fs.read(args.get(1).unwrap().as_str())); Vec<byte> out = Vec.new();
+    bytes.text(&out, "/// Generated from compiler/prelude.snx. Regenerate with embed_prelude.snx.\n/// Driver tests compare these bytes with the shared prelude source.\nimport bytes;\npub Vec<byte> source() \{ Vec<byte> data = Vec.new(); bytes.text(&data, \"");
+    for (b in &const input) {
+        match *b {
+            92 => bytes.text(&out, "\\\\"), 34 => bytes.text(&out, "\\\""),
+            123 => bytes.text(&out, "\\\{"), 125 => bytes.text(&out, "\\\}"),
+            13 => bytes.text(&out, "\\r"), 10 => bytes.text(&out, "\\n"), 9 => bytes.text(&out, "\\t"),
+            _ => out.push(*b),
+        }
+    }
+    bytes.text(&out, "\"); return data; \}\n");
+    require(fs.write(args.get(2).unwrap().as_str(), out));
+}

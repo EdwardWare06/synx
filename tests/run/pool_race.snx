@@ -1,0 +1,44 @@
+import std.task.pool.Executor;
+import std.sync.{Arc,AtomicUsize,AtomicBool,Mutex};
+import std.thread;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("race error") } }
+struct State { AtomicUsize active; AtomicUsize polls; AtomicBool done; Mutex<Waker?> wake; }
+struct Racing { Arc<State> state; }
+impl Future<usize> for Racing {
+    Poll<usize> poll(&self,Waker wake) {
+        var state = self.state.get();
+        if (state.active.fetch_add(1) != 0) { panic("task was polled concurrently"); }
+        usize n = state.polls.fetch_add(1);
+        Waker? previous = None;
+        { var guard = state.wake.lock(); previous = guard.get_mut().replace(wake.clone()); }
+        thread.yield_now();
+        wake.wake();
+        state.active.fetch_sub(1);
+        if (n >= 199) { return Poll.Ready(n + 1); }
+        return Poll.Pending;
+    }
+}
+async send usize race(Arc<State> state) { return await Racing { state: state }; }
+main() {
+    var executor = ok(Executor.new(4));
+    var state = Arc.new(State { active: AtomicUsize.new(0), polls: AtomicUsize.new(0), done: AtomicBool.new(false), wake: Mutex.new(None) });
+    var shared = state.clone();
+    var producer = ok(thread.spawn(send once || {
+        var value = shared.get();
+        while (!value.done.load()) {
+            Waker? wake = None;
+            { var guard = value.wake.lock(); match guard.get().as_ref() { Some(waker) => { wake = Some(waker.clone()); }, None => {} } }
+            match wake { Some(waker) => waker.wake(), None => {} }
+            thread.yield_now();
+        }
+    }));
+    var job = ok(executor.spawn(race(state.clone())));
+    print("{ok(job.join())}");
+    state.get().done.store(true);
+    producer.join();
+    executor.shutdown();
+    Waker? last = None;
+    { var guard = state.get().wake.lock(); last = guard.get_mut().take(); }
+    match last { Some(waker) => { for (i in 0..100) { waker.wake(); } }, None => panic("lost wake") }
+    print("wake races complete");
+}

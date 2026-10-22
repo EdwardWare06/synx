@@ -1,0 +1,6 @@
+import std.math.sqrt;
+pub String describe(int value) {
+    if (value < 0) { return String.from("Use a nonnegative integer."); }
+    double root = sqrt(value as double);
+    return "sqrt({value}) = {root}";
+}

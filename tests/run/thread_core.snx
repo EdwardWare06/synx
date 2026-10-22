@@ -1,0 +1,48 @@
+import std.thread;
+import std.sync.{Arc, AtomicUsize, Mutex};
+T started<T: Send + Owned>(Result<thread.JoinHandle<T>, thread.ThreadError> result) {
+    match result { Ok(handle) => return handle.join(), Err(_) => panic("spawn failed") }
+}
+thread.JoinHandle<T> handle<T: Send + Owned>(Result<thread.JoinHandle<T>, thread.ThreadError> result) {
+    match result { Ok(value) => return value, Err(_) => panic("spawn failed") }
+}
+int named() { return 17; }
+int deep(int n) { int[64] pad = [n; 64]; if (n == 0) { return pad[0]; } return deep(n - 1) + pad[1]; }
+main() {
+    var count = Arc.new(AtomicUsize.new(0));
+    var total = Arc.new(Mutex.new(0));
+    var cas = Arc.new(AtomicUsize.new(0));
+    var workers = Vec<thread.JoinHandle<int>>.new();
+    for (index in 0..4) {
+        var a = count.clone();
+        var b = total.clone();
+        var c = cas.clone();
+        workers.push(handle(thread.spawn(send once || {
+            for (i in 0..1000) {
+                a.get().fetch_add(1);
+                usize previous = c.get().load();
+                loop {
+                    match c.get().compare_exchange(previous, previous + 1) {
+                        Ok(_) => break, Err(actual) => { previous = actual; }
+                    }
+                }
+                var guard = b.get().lock();
+                *guard.get_mut() += 1;
+            }
+            return index;
+        })));
+    }
+    int sum = 0;
+    while (!workers.is_empty()) { sum += workers.pop().unwrap().join(); }
+    print("{count.get().load()} {sum} {cas.get().load()}");
+    { var guard = total.get().lock(); print("{*guard.get()}"); }
+    print("{started(thread.spawn(named))}");
+    var text = String.from("owned");
+    var values = Vec.new(); values.push(7);
+    var box = Box.new(5);
+    var result = started(thread.spawn(once || { return "{text} {values[0]} {*box.as_ref()}"; }));
+    print(result);
+    print("{started(thread.spawn(send once || deep(2000)))}");
+    var first = handle(thread.spawn(send once || 19));
+    print("{started(thread.spawn(send once || first.join()))}");
+}

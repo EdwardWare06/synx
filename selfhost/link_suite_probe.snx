@@ -1,0 +1,24 @@
+/// One compiled fixture runner per arithmetic/allocation mode. Environment
+/// dispatch preserves argv for the independent archive and image harnesses.
+import link.probe;
+import link.native_probe;
+import link.pe_dynamic_probe;
+import link.elf_dynamic_probe;
+import link.object_checks;
+import link.elf_object_checks;
+import link.macho_probe;
+import std.env;
+import std.io;
+main() {
+    var kind = match env.get("SYNX_LINK_TEST") {
+        Ok(Some(value)) => value, Ok(None) => panic("SYNX_LINK_TEST is required"), Err(_) => panic("cannot read SYNX_LINK_TEST")
+    };
+    if (kind == String.from("archive")) { probe.run(); }
+    else if (kind == String.from("native")) { native_probe.run(); }
+    else if (kind == String.from("pe")) { pe_dynamic_probe.run(); }
+    else if (kind == String.from("elf")) { elf_dynamic_probe.run(); }
+    else if (kind == String.from("objects")) { var count = object_checks.run(); print("object readers: {count} cases passed"); }
+    else if (kind == String.from("elfobjects")) { var count = elf_object_checks.run(); print("ELF object reader: {count} cases passed"); }
+    else if (kind == String.from("macho")) { macho_probe.run(); }
+    else { panic("unknown SYNX_LINK_TEST value"); }
+}

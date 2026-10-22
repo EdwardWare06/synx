@@ -1,0 +1,1 @@
+main() { short value=1; short count=-1; short result=value << count; if (result != -32768) { panic("wrong short shift"); } }

@@ -1,0 +1,18 @@
+import std.math.Vec3;
+import std.env;
+struct Item { int id; }
+impl Drop for Item { void drop(&self) { print("drop {self.id}"); } }
+main() {
+    var s = String.from("  alpha::beta::  ");
+    print("strings {s.contains("beta")} {s.starts_with("  a")} {s.contains("")} {s.contains("missing")}");
+    var trimmed = s.trim(); print(trimmed);
+    var parts = trimmed.split("::");
+    for (part in &const parts) { print("part [{part}]"); }
+    var unicode = String.from("  caf?  ").trim(); print(unicode);
+    var empty = String.new(); print("empty [{empty.trim()}]");
+    var empty_parts = empty.split(","); print("empty parts {empty_parts.len()}");
+    Vec<Item> items = Vec.new(); items.push(Item { id: 1 }); items.push(Item { id: 2 });
+    items.clear(); print("cleared {items.len()}");
+    var arguments = env.args(); print("args {arguments.len() > 0}");
+    var vector = Vec3 { x: 2.0, y: 3.0, z: 6.0 }; print("length {vector.length()}");
+}

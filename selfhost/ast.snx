@@ -1,0 +1,239 @@
+/// Syntax tree storage. Source: compiler/include/synx/ast.hpp.
+/// Parity: tests/selfhost_parser_test.cpp.
+///
+/// Nodes live in arenas inside Ast and refer to each other by uint index.
+/// NONE marks an absent child. Each node family is one struct with a kind
+/// field and the union of its fields; the table above each struct says which
+/// fields a kind uses. Unused fields keep their defaults.
+import source.Span;
+
+pub const uint NONE = 4294967295;
+
+pub enum CallMode { Writable, Shared, Once }
+pub enum CaptureMode { Move, Shared, Writable }
+pub enum PrimKind { Bool, Byte, Short, Int, Long, Uint, Ulong, Usize, Float, Double, Char, Void }
+pub enum TypeKind { Primitive, Path, Ref, Ptr, Array, Slice, Optional, Tuple, Fn, Dyn, SelfType }
+pub enum UnaryOp { Neg, Not, BitNot, Deref }
+pub enum BinaryOp { Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Gt, Le, Ge, And, Or, BitAnd, BitOr, BitXor, Shl, Shr }
+pub enum AssignOp { Assign, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr }
+pub enum ExprKind {
+    IntLit, FloatLit, CharLit, StringLit, BoolLit, Interp,
+    Name, Field, Call, Index,
+    Unary, Binary, Cast, Try, OptChain, Coalesce, Range, Ref,
+    StructLit, Tuple, Array, ArrayRepeat,
+    Block, If, Match, Closure, Unsafe, Await,
+    Return, Break, Continue
+}
+pub enum PatternKind { Wildcard, Literal, Binding, Path, TupleStruct, Struct, Tuple, Or, Range }
+pub enum StmtKind { VarDecl, Expr, Assign, While, Loop, For }
+pub enum SelfKind { None, Value, Ref, ConstRef }
+pub enum ItemKind { Import, Const, Function, Struct, Enum, Trait, Impl, Extern }
+pub enum VariantKind { Unit, Tuple, Struct }
+
+pub struct PathSegment { pub Span span; pub Vec<byte> name; }
+pub struct Path { pub Span span; pub Vec<PathSegment> segments; }
+pub struct Bound { pub Span span; pub Path path; pub Vec<uint> args; }
+pub struct GenericParam { pub Span span; pub Vec<byte> name; pub Vec<Bound> bounds; }
+
+pub Path empty_path() { return Path { span: Span { start: 0, end: 0, file: 0 }, segments: Vec.new() }; }
+pub Bound empty_bound() { return Bound { span: Span { start: 0, end: 0, file: 0 }, path: empty_path(), args: Vec.new() }; }
+
+/// Type fields by kind:
+///   Primitive: prim.  Path: path, items = type arguments.
+///   Ref, Ptr: flag = is_const, a = inner.  Array: a = element, b = size expression.
+///   Slice, Optional: a = element or inner.  Tuple: items = elements.
+///   Fn: mode, flag = is_send, items = parameters, a = return type or NONE.
+///   Dyn: bound.  SelfType: none.
+pub struct Type {
+    pub TypeKind kind;
+    pub Span span;
+    pub PrimKind prim;
+    pub bool flag;
+    pub CallMode mode;
+    pub Path path;
+    pub Vec<uint> items;
+    pub uint a;
+    pub uint b;
+    pub Bound bound;
+    pub Type new(TypeKind kind, Span span) {
+        return Type { kind: kind, span: span, prim: PrimKind.Void, flag: false, mode: CallMode.Writable,
+                      path: empty_path(), items: Vec.new(), a: NONE, b: NONE, bound: empty_bound() };
+    }
+}
+
+pub struct FieldInit { pub Span span; pub Vec<byte> name; pub uint value; }
+pub struct MatchArm { pub Span span; pub uint pattern; pub uint guard; pub uint body; }
+/// A string part is text, or an expression when expr is not NONE.
+pub struct InterpPart { pub Vec<byte> text; pub uint expr; }
+pub struct Capture { pub Span span; pub Vec<byte> name; pub CaptureMode mode; }
+pub struct ClosureParam { pub Span span; pub uint type; pub Vec<byte> name; }
+
+/// Expression fields by kind (a, b, c are expression, type, or block indexes):
+///   IntLit: number, flag = is_long.  FloatLit: real, flag = is_float.
+///   CharLit: number.  StringLit: text.  BoolLit: flag.  Interp: parts.
+///   Name: text, type_args.  Field: a = base, text, name_span, type_args.
+///   Call: a = callee, items = arguments.  Index: a = base, b = index.
+///   Unary: unary_op, a.  Binary: binary_op, a = lhs, b = rhs.
+///   Cast: a = operand, b = type.  Try: a.  OptChain: a = base, text.
+///   Coalesce: a = value, b = fallback.  Range: a = start, b = end, flag = inclusive.
+///   Ref: flag = is_const, a.  StructLit: path, fields.  Tuple, Array: items.
+///   ArrayRepeat: a = value, b = count.  Block, Unsafe: a = block.
+///   If: a = condition, b = then block, c = else expression.  Match: a, arms.
+///   Closure: mode, is_send, explicit_captures, captures, params, a = return type, b = body.
+///   Await: a.  Return: a.  Break, Continue: none.
+pub struct Expr {
+    pub ExprKind kind;
+    pub Span span;
+    pub ulong number;
+    pub double real;
+    pub bool flag;
+    pub Vec<byte> text;
+    pub uint a;
+    pub uint b;
+    pub uint c;
+    pub Span name_span;
+    pub UnaryOp unary_op;
+    pub BinaryOp binary_op;
+    pub Vec<uint> items;
+    pub Vec<uint> type_args;
+    pub Path path;
+    pub Vec<FieldInit> fields;
+    pub Vec<MatchArm> arms;
+    pub Vec<InterpPart> parts;
+    pub CallMode mode;
+    pub bool is_send;
+    pub bool explicit_captures;
+    pub Vec<Capture> captures;
+    pub Vec<ClosureParam> params;
+    pub Expr new(ExprKind kind, Span span) {
+        return Expr { kind: kind, span: span, number: 0, real: 0.0, flag: false, text: Vec.new(), a: NONE, b: NONE, c: NONE,
+                      name_span: Span { start: 0, end: 0, file: 0 }, unary_op: UnaryOp.Neg, binary_op: BinaryOp.Add,
+                      items: Vec.new(), type_args: Vec.new(), path: empty_path(), fields: Vec.new(), arms: Vec.new(),
+                      parts: Vec.new(), mode: CallMode.Writable, is_send: false, explicit_captures: false,
+                      captures: Vec.new(), params: Vec.new() };
+    }
+}
+
+pub struct FieldPattern { pub Span span; pub Vec<byte> name; pub uint pattern; }
+
+/// Pattern fields by kind:
+///   Literal: a = expression.  Binding: text.  Path: path.
+///   TupleStruct: path, items.  Struct: path, fields.  Tuple: items.  Or: items.
+///   Range: a = low, b = high, flag = inclusive.  Wildcard: none.
+pub struct Pattern {
+    pub PatternKind kind;
+    pub Span span;
+    pub Vec<byte> text;
+    pub Path path;
+    pub Vec<uint> items;
+    pub Vec<FieldPattern> fields;
+    pub uint a;
+    pub uint b;
+    pub bool flag;
+    pub Pattern new(PatternKind kind, Span span) {
+        return Pattern { kind: kind, span: span, text: Vec.new(), path: empty_path(), items: Vec.new(),
+                         fields: Vec.new(), a: NONE, b: NONE, flag: false };
+    }
+}
+
+/// Statement fields by kind:
+///   VarDecl: a = type, b = initializer, flag = is_const, text = name, name_span.
+///   Expr: a = expression, flag = has_semi.  Assign: assign_op, a = target, b = value.
+///   While: a = condition, b = body block.  Loop: a = body block.
+///   For: a = pattern, b = iterator, c = body block.
+pub struct Stmt {
+    pub StmtKind kind;
+    pub Span span;
+    pub uint a;
+    pub uint b;
+    pub uint c;
+    pub bool flag;
+    pub Vec<byte> text;
+    pub Span name_span;
+    pub AssignOp assign_op;
+    pub Stmt new(StmtKind kind, Span span) {
+        return Stmt { kind: kind, span: span, a: NONE, b: NONE, c: NONE, flag: false, text: Vec.new(),
+                      name_span: Span { start: 0, end: 0, file: 0 }, assign_op: AssignOp.Assign };
+    }
+}
+
+pub struct Block { pub Span span; pub Vec<uint> stmts; pub uint tail; }
+pub struct Param { pub Span span; pub SelfKind self_kind; pub uint type; pub Vec<byte> name; }
+pub struct Function {
+    pub Span span;
+    pub Vec<byte> doc;
+    pub bool is_pub;
+    pub bool is_async;
+    pub bool async_send;
+    pub uint ret;
+    pub Vec<byte> name;
+    pub Span name_span;
+    pub Vec<GenericParam> generics;
+    pub Vec<Param> params;
+    pub uint body;
+}
+pub struct Field { pub Span span; pub Vec<byte> doc; pub bool is_pub; pub uint type; pub Vec<byte> name; }
+pub struct Variant {
+    pub Span span;
+    pub Vec<byte> doc;
+    pub Vec<byte> name;
+    pub VariantKind kind;
+    pub Vec<uint> tuple_types;
+    pub Vec<Field> fields;
+}
+
+/// Item fields by kind (function indexes refer to Ast.functions):
+///   Import: path, names.  Const: a = type or NONE, text = name, b = value expression.
+///   Function: function.  Struct: text, generics, fields, methods.
+///   Enum: text, generics, variants, methods.  Trait: text, generics, methods.
+///   Impl: is_unsafe, generics, bound, a = target type, methods.
+///   Extern: text = ABI, methods = signatures.
+pub struct Item {
+    pub ItemKind kind;
+    pub Span span;
+    pub Vec<byte> doc;
+    pub bool is_pub;
+    pub Vec<byte> text;
+    pub Path path;
+    pub Vec<PathSegment> names;
+    pub uint a;
+    pub uint b;
+    pub uint function;
+    pub bool is_unsafe;
+    pub Vec<GenericParam> generics;
+    pub Vec<Field> fields;
+    pub Vec<Variant> variants;
+    pub Vec<uint> methods;
+    pub Bound bound;
+    pub Item new(ItemKind kind, Span span) {
+        return Item { kind: kind, span: span, doc: Vec.new(), is_pub: false, text: Vec.new(), path: empty_path(),
+                      names: Vec.new(), a: NONE, b: NONE, function: NONE, is_unsafe: false, generics: Vec.new(),
+                      fields: Vec.new(), variants: Vec.new(), methods: Vec.new(), bound: empty_bound() };
+    }
+}
+
+pub struct Ast {
+    pub Vec<Type> types;
+    pub Vec<Expr> exprs;
+    pub Vec<Pattern> patterns;
+    pub Vec<Stmt> stmts;
+    pub Vec<Block> blocks;
+    pub Vec<Function> functions;
+    pub Vec<Item> items;
+    pub Ast new() {
+        return Ast { types: Vec.new(), exprs: Vec.new(), patterns: Vec.new(), stmts: Vec.new(), blocks: Vec.new(),
+                     functions: Vec.new(), items: Vec.new() };
+    }
+    pub uint add_type(&self, Type node) { uint id = self.types.len() as uint; self.types.push(node); return id; }
+    pub uint add_expr(&self, Expr node) { uint id = self.exprs.len() as uint; self.exprs.push(node); return id; }
+    pub uint add_pattern(&self, Pattern node) { uint id = self.patterns.len() as uint; self.patterns.push(node); return id; }
+    pub uint add_stmt(&self, Stmt node) { uint id = self.stmts.len() as uint; self.stmts.push(node); return id; }
+    pub uint add_block(&self, Block node) { uint id = self.blocks.len() as uint; self.blocks.push(node); return id; }
+    pub uint add_function(&self, Function node) { uint id = self.functions.len() as uint; self.functions.push(node); return id; }
+    pub &const Type type(&const self, uint id) { return self.types.get(id as usize).unwrap(); }
+    pub &const Expr expr(&const self, uint id) { return self.exprs.get(id as usize).unwrap(); }
+    pub &const Pattern pattern(&const self, uint id) { return self.patterns.get(id as usize).unwrap(); }
+    pub &const Stmt stmt(&const self, uint id) { return self.stmts.get(id as usize).unwrap(); }
+    pub &const Block block(&const self, uint id) { return self.blocks.get(id as usize).unwrap(); }
+    pub &const Function function(&const self, uint id) { return self.functions.get(id as usize).unwrap(); }
+}

@@ -1,0 +1,6 @@
+// The smallest Synx program. main has no return statement, so its return
+// type is inferred as void and the process exits with code 0.
+
+main() {
+    print("Hello from Synx");
+}

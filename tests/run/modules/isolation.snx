@@ -1,0 +1,2 @@
+import bundle;
+pub int read() { return bundle.child.value(); }

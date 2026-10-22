@@ -1,0 +1,18 @@
+exit 0
+make 225
+make 245
+lt 245 225
+false
+make 225
+make 245
+lt 245 225
+true
+lt 135 315
+lt 135 315
+lt 135 315
+lt 135 315
+true false true false
+-45
+Teardrop!8
+42
+0 0 7 0

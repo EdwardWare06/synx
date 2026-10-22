@@ -1,0 +1,109 @@
+/// Owned linker inputs. Names are byte strings; IDs never borrow arena storage.
+/// Object readers must normalize addends to S + A or S + A - P.
+/// Unsupported weak/common symbols fail before resolution. No TLS input yet.
+/// Tests: selfhost/link/native_checks.snx, tests/linker/native_test.py.
+import std.utf8;
+
+pub enum Code { Invalid, Unsupported, Duplicate, Unresolved, Range, Entry }
+pub struct Failure { pub Code code; pub usize input; pub usize record; pub String symbol; }
+pub Failure fail(Code code, usize input, usize record) { return Failure { code: code, input: input, record: record, symbol: String.new() }; }
+pub Failure named(Code code, usize input, usize record, &const str symbol) { return Failure { code: code, input: input, record: record, symbol: String.from(symbol) }; }
+pub &const str description(Code code) { return match code {
+    Invalid => "invalid input", Unsupported => "unsupported input", Duplicate => "duplicate symbol",
+    Unresolved => "unresolved symbol", Range => "image or relocation out of range", Entry => "invalid entry point"
+}; }
+pub struct InputId { pub usize index; }
+pub struct SymbolId { pub InputId input; pub usize index; }
+pub struct SectionId { pub InputId input; pub usize index; }
+pub enum SectionKind { Text, ReadOnly, Data, Bss }
+pub enum Binding { Local, Global, Weak }
+pub enum Definition { Undefined, Section(usize, ulong), Absolute(ulong), Common(ulong) }
+pub enum RelocKind { Abs64, Pc32, Abs32, Signed32, Rva32 }
+
+pub struct Section {
+    pub SectionKind kind;
+    pub ulong alignment;
+    pub Vec<byte> data;
+    pub ulong size;
+    pub Section new(SectionKind kind, ulong alignment, Vec<byte> data) {
+        ulong size = data.len() as ulong;
+        return Section { kind: kind, alignment: alignment, data: data, size: size };
+    }
+    pub Section bss(ulong size, ulong alignment) {
+        return Section { kind: SectionKind.Bss, alignment: alignment, data: Vec.new(), size: size };
+    }
+}
+pub struct Symbol {
+    pub Vec<byte> name;
+    pub Binding binding;
+    pub Definition definition;
+    pub Symbol new(&const str name, Binding binding, Definition definition) {
+        return Symbol { name: utf8.encode(name), binding: binding, definition: definition };
+    }
+}
+pub struct Relocation {
+    pub usize section;
+    pub ulong offset;
+    pub usize symbol;
+    pub RelocKind kind;
+    pub long addend;
+}
+pub struct Object {
+    pub String name;
+    pub bool archive_member;
+    pub Vec<Section> sections;
+    pub Vec<Symbol> symbols;
+    pub Vec<Relocation> relocations;
+    pub Object new(&const str name, bool archive_member) {
+        return Object { name: String.from(name), archive_member: archive_member,
+            sections: Vec.new(), symbols: Vec.new(), relocations: Vec.new() };
+    }
+}
+/// Reversible ASCII key for arbitrary symbol bytes. No UTF-8 assumption.
+pub String key(&const Vec<byte> name) {
+    String out = String.new();
+    for (ch in name) {
+        byte high = *ch >> 4; byte low = *ch & 15;
+        out.push((if (high < 10) { high + 48 } else { high + 87 }) as char);
+        out.push((if (low < 10) { low + 48 } else { low + 87 }) as char);
+    }
+    return out;
+}
+pub usize group(SectionKind kind) { return match kind { Text => 0, ReadOnly => 1, Data => 2, Bss => 3 }; }
+pub ulong width(RelocKind kind) { return match kind { Abs64 => 8, _ => 4 }; }
+pub bool defined(Definition value) { return match value { Undefined => false, _ => true }; }
+/// Checks all indices/ranges, including unselected archive member records.
+/// BSS contains no file bytes; relocations into BSS are unsupported.
+pub Result<bool, Failure> validate(&const Object obj, usize input) {
+    for (i in 0..obj.sections.len()) {
+        var section = obj.sections.get(i).unwrap();
+        if (section.alignment == 0 || (section.alignment & (section.alignment - 1)) != 0) { return Err(fail(Code.Invalid, input, i)); }
+        if (section.alignment > 4096) { return Err(fail(Code.Unsupported, input, i)); }
+        match section.kind {
+            Bss => { if (!section.data.is_empty()) { return Err(fail(Code.Invalid, input, i)); } },
+            _ => { if (section.size != section.data.len() as ulong) { return Err(fail(Code.Invalid, input, i)); } }
+        }
+    }
+    for (i in 0..obj.symbols.len()) {
+        var symbol = obj.symbols.get(i).unwrap();
+        if (symbol.name.is_empty()) { return Err(fail(Code.Invalid, input, i)); }
+        for (ch in &const symbol.name) { if (*ch == 0) { return Err(fail(Code.Invalid, input, i)); } }
+        match symbol.binding { Weak => return Err(fail(Code.Unsupported, input, i)), _ => {} }
+        match symbol.definition {
+            Common(_) => return Err(fail(Code.Unsupported, input, i)),
+            Section(section, offset) => {
+                if (section >= obj.sections.len() || offset > obj.sections.get(section).unwrap().size) { return Err(fail(Code.Invalid, input, i)); }
+            },
+            Undefined => { match symbol.binding { Local => return Err(fail(Code.Invalid, input, i)), _ => {} } },
+            _ => {}
+        }
+    }
+    for (i in 0..obj.relocations.len()) {
+        var reloc = obj.relocations.get(i).unwrap();
+        if (reloc.section >= obj.sections.len() || reloc.symbol >= obj.symbols.len()) { return Err(fail(Code.Invalid, input, i)); }
+        var section = obj.sections.get(reloc.section).unwrap();
+        match section.kind { Bss => return Err(fail(Code.Unsupported, input, i)), _ => {} }
+        if (reloc.offset > section.size || width(reloc.kind) > section.size - reloc.offset) { return Err(fail(Code.Invalid, input, i)); }
+    }
+    return Ok(true);
+}

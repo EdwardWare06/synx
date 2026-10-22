@@ -1,0 +1,32 @@
+import std.task.block_on;
+struct Counter { int value; }
+impl Future<int> for Counter {
+    Poll<int> poll(&self, Waker wake) {
+        self.value += 1;
+        if (self.value < 2) { wake.wake(); return Poll.Pending; }
+        return Poll.Ready(self.value);
+    }
+}
+async T bounded<T,F:Future<T>>(F value) { return await value; }
+async int through_ref(&Counter value) { return await value; }
+async int through_dyn(&dyn Future<int> value) { return await value; }
+struct Reference { int value; }
+impl Future<&const int> for Reference {
+    Poll<&const int> poll(&self,Waker wake) { return Poll.Ready(&const self.value); }
+}
+async &const int through_borrow(&Reference value) { return await value; }
+async int conditional(bool first) {
+    if (first) { return await Counter { value:0 }; }
+    return await Counter { value:2 };
+}
+main() {
+    print("generic {block_on(bounded<int,Counter>(Counter { value:0 }))}");
+    var counter=Counter { value:0 };
+    print("reference {block_on(through_ref(&counter))}");
+    var other=Counter { value:0 };
+    &dyn Future<int> dynamic=&other;
+    print("dynamic {block_on(through_dyn(dynamic))}");
+    print("conditional {block_on(conditional(true))} {block_on(conditional(false))}");
+    var owner=Reference { value:44 };
+    { var result=block_on(through_borrow(&owner)); print("external output {*result}"); }
+}

@@ -1,0 +1,32 @@
+enum ParseError { Empty, Bad(String) }
+
+Result<int, ParseError> parse(&const str s) {
+    if (s.len() == 0) { return Err(ParseError.Empty); }
+    match s.parse_int() {
+        Some(n) => return Ok(n),
+        None => return Err(ParseError.Bad(String.from(s))),
+    }
+}
+
+Result<int, ParseError> sum(&const str a, &const str b) {
+    int x = parse(a)?;
+    int y = parse(b)?;
+    return Ok(x + y);
+}
+
+show(Result<int, ParseError> r) {
+    match r {
+        Ok(v) => print("ok {v}"),
+        Err(ParseError.Empty) => print("empty"),
+        Err(ParseError.Bad(s)) => print("bad {s}"),
+    }
+}
+
+main() {
+    show(sum("3", "4"));
+    show(sum("", "4"));
+    show(sum("3", "x"));
+    int? a = Some(5);
+    int? b = None;
+    print("{a ?? 0} {b ?? 0} {a.is_some()} {b.is_none()}");
+}

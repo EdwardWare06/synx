@@ -1,0 +1,1 @@
+main() { byte a = 255; byte b = 2; byte result = a * b; if (result != 254) { panic("wrong release result"); } }

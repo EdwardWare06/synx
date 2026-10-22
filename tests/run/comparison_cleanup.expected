@@ -1,0 +1,11 @@
+compared
+drop 7
+body 0
+drop 0
+body 1
+drop 1
+drop 2
+drop 3
+drop 4
+drop 2
+cleanup complete

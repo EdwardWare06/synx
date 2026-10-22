@@ -1,0 +1,4 @@
+/// Standalone compiler entry point. Returns the command's process status.
+import driver;
+import std.env;
+int main() { var args = env.args(); return driver.run(args); }

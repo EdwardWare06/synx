@@ -1,0 +1,1 @@
+main() { long value=1; long count=64; long result=value << count; if (result != 1) { panic("wrong release shift"); } }

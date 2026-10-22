@@ -1,0 +1,2 @@
+import link.elf_dynamic_probe;
+main() { elf_dynamic_probe.run(); }

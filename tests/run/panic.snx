@@ -1,0 +1,7 @@
+main() {
+    int[2] a = [1, 2];
+    usize i = 5;
+    print("before");
+    int x = a[i];
+    print("after {x}");
+}

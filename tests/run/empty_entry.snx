@@ -1,0 +1,2 @@
+/// Entry startup must link when the body calls no runtime adapters.
+main() {}

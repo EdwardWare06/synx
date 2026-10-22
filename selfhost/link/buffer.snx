@@ -1,0 +1,35 @@
+/// Executable serialization. User-controlled sizes are bounded before allocation.
+/// Invalid field widths are internal writer bugs. No filesystem side effects.
+import link.model.{Failure, Code};
+import link.model;
+import std.binary;
+
+pub const ulong LIMIT = 268435456;
+pub Result<ulong, Failure> align(ulong value, ulong alignment) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    ulong extra = (alignment - (value % alignment)) % alignment;
+    if (value > LIMIT || extra > LIMIT - value) { return Err(model.fail(Code.Range, 0, 0)); }
+    return Ok(value + extra);
+}
+pub struct Buffer {
+    pub Vec<byte> data;
+    pub Buffer new() { return Buffer { data: Vec.new() }; }
+    pub void word(&self, ulong value, usize width) {
+        if (!binary.write_uint(&self.data, value, width, true)) { panic("linker writer field overflow"); }
+    }
+    pub void append(&self, &const Vec<byte> data) { for (ch in data) { self.data.push(*ch); } }
+    pub Result<bool, Failure> pad(&self, ulong size) {
+        if (size > LIMIT || size < self.data.len() as ulong) { return Err(model.fail(Code.Range, 0, 0)); }
+        while (self.data.len() as ulong < size) { self.data.push(0); }
+        return Ok(true);
+    }
+    pub void patch(&self, usize offset, ulong value, usize width) {
+        if (width == 0 || width > 8 || offset > self.data.len() || width > self.data.len() - offset) { panic("linker writer patch range"); }
+        if (width < 8 && value >> (width * 8) != 0) { panic("linker writer patch overflow"); }
+        for (i in 0..width) { *self.data.get_mut(offset + i).unwrap() = ((value >> (8 * i as ulong)) & 255) as byte; }
+    }
+    pub void name(&self, &const str name) {
+        if (name.len() > 8) { panic("linker writer section name too long"); }
+        for (i in 0..8) { self.data.push(if (i < name.len()) { unsafe { *((name.as_ptr() as usize + i) as *const byte) } } else { 0 }); }
+    }
+}

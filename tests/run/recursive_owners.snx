@@ -1,0 +1,135 @@
+import std.collections.HashMap;
+
+void assert(bool condition) { if (!condition) { panic("ownership assertion failed"); } }
+
+struct Ticket { int id; }
+impl Drop for Ticket { void drop(&self) { print("ticket {self.id}"); } }
+struct Empty {}
+impl Drop for Empty { void drop(&self) { print("empty"); } }
+struct Pair { String first; Ticket second; }
+struct Node<T> { T value; Vec<Node<T>> children; }
+impl<T> Drop for Node<T> { void drop(&self) { print("node"); } }
+enum List { Nil, Cons(Ticket, Box<List>) }
+struct Left { Ticket ticket; Box<Right>? next; }
+struct Right { Ticket ticket; Box<Left>? next; }
+struct Address { int id; *int original; }
+impl Drop for Address {
+    void drop(&self) {
+        self.id = 77;
+        assert(unsafe { *self.original } == 77);
+        print("in place");
+    }
+}
+struct Tally { *int count; }
+impl Drop for Tally { void drop(&self) { unsafe { *self.count += 1; } } }
+enum Deep { End, Next(Tally, Box<Deep>) }
+enum Marked { End, Item(Ticket) }
+impl Drop for Marked { void drop(&self) { print("enum"); } }
+struct MapNode { Ticket ticket; HashMap<int, MapNode> children; }
+
+List list(int n) {
+    if (n == 0) { return List.Nil; }
+    return List.Cons(Ticket { id: n }, Box<List>.new(list(n - 1)));
+}
+void consume(Box<Ticket> b) { print("consume {b.as_ref().id}"); }
+void early() { var b = Box<Ticket>.new(Ticket { id: 60 }); return; }
+fn() -> int captured() {
+    var node = Node { value: 3, children: Vec<Node<int>>.new() };
+    node.children.push(Node { value: 4, children: Vec<Node<int>>.new() });
+    return || node.value;
+}
+int across_drop(int seed) {
+    int a = seed * 3 + 1;
+    int b = seed * 5 + 3;
+    int c = seed * 7 + 3;
+    { var b = Box<Ticket>.new(Ticket { id: 100 }); }
+    return a + b + c;
+}
+main() {
+    {
+        var b = Box<int>.new(12);
+        *b.as_mut() = 42;
+        assert(*b.as_ref() == 42);
+        var moved = b;
+        assert(moved.into_inner() == 42);
+        print("scalar");
+    }
+    {
+        var b = Box<Ticket>.new(Ticket { id: 10 });
+        var value = b.into_inner();
+        print("extracted {value.id}");
+    }
+    {
+        var b = Box<Box<Ticket>>.new(Box<Ticket>.new(Ticket { id: 11 }));
+        var text = Box<String>.new(String.from("boxed"));
+        assert(text.as_ref().len() == 5);
+        var v = Vec<Ticket>.new();
+        v.push(Ticket { id: 12 });
+        var values = Box<Vec<Ticket>>.new(v);
+    }
+    { var empty = Box<Empty>.new(Empty {}); }
+    { var pair = Pair { first: String.from("first"), second: Ticket { id: 20 } }; }
+    {
+        var root = Node { value: Ticket { id: 30 }, children: Vec<Node<Ticket>>.new() };
+        root.children.push(Node { value: Ticket { id: 31 }, children: Vec<Node<Ticket>>.new() });
+        root.children.push(Node { value: Ticket { id: 32 }, children: Vec<Node<Ticket>>.new() });
+        var b = Box<Node<Ticket>>.new(root);
+    }
+    { var chain = list(3); }
+    {
+        var root = Left { ticket: Ticket { id: 40 }, next: Some(Box<Right>.new(Right {
+            ticket: Ticket { id: 41 }, next: Some(Box<Left>.new(Left { ticket: Ticket { id: 42 }, next: None }))
+        })) };
+    }
+    { var array = [Box<Ticket>.new(Ticket { id: 50 }), Box<Ticket>.new(Ticket { id: 51 })]; }
+    { var tuple = (Box<Ticket>.new(Ticket { id: 52 }), Box<Ticket>.new(Ticket { id: 53 })); }
+    for (i in 0..2) {
+        var b = Box<Ticket>.new(Ticket { id: 54 + i });
+        if (i == 0) { continue; }
+        break;
+    }
+    for (i in 0..2) {
+        var b = Box<Ticket>.new(Ticket { id: 56 + i });
+        if (i == 0) { consume(b); }
+    }
+    early();
+    {
+        var b = Box<Ticket>.new(Ticket { id: 61 });
+        b = Box<Ticket>.new(Ticket { id: 62 });
+        print("replaced");
+    }
+    {
+        var f = captured();
+        assert(f() == 3);
+        print("captured");
+    }
+    {
+        var b = Box<Address>.new(Address { id: 1, original: 0 as *int });
+        var p = b.as_mut_ptr() as *int;
+        b.as_mut().original = p;
+    }
+    {
+        var root = MapNode { ticket: Ticket { id: 70 }, children: HashMap<int, MapNode>.new() };
+        root.children.insert(1, MapNode { ticket: Ticket { id: 71 }, children: HashMap<int, MapNode>.new() });
+    }
+    { var marked = Marked.Item(Ticket { id: 80 }); }
+    { var empty_array = [Empty {}, Empty {}]; }
+    {
+        var ticket = Ticket { id: 90 };
+        var callback = || ticket.id;
+        var b = Box.new(callback);
+    }
+    {
+        var counter = Box<int>.new(0);
+        {
+            var root = Deep.End;
+            for (i in 0..1024) {
+                root = Deep.Next(Tally { count: counter.as_mut_ptr() }, Box<Deep>.new(root));
+            }
+        }
+        assert(*counter.as_ref() == 1024);
+        print("deep 1024");
+    }
+    assert(across_drop(7) == 112);
+    print("done");
+}

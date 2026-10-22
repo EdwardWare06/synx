@@ -1,0 +1,1 @@
+main() { long a = 9223372036854775807; long b = 2; long result = a * b; if (result != -2) { panic("wrong release result"); } }

@@ -1,0 +1,1477 @@
+/// Borrow checking and drop elaboration over Dendrite. Source:
+/// compiler/src/borrow.cpp, a function-by-function port.
+/// Parity: tests/selfhost_modules_test.cpp (borrow stage).
+/// Runs move analysis, drop elaboration, liveness, and loan checking per
+/// lowered function. Sets are sorted vectors so iteration order, and with it
+/// the first reported conflict, matches std::set in C++.
+import ast;
+import ids.{TypeId, DefId, DefKind, NONE};
+import defs.{FnOwner};
+import defs;
+import types.{Subst};
+import types;
+import check.{Checker, K_PRIM, K_STR, K_DYN, K_STRUCT, K_ENUM, K_REF, K_PTR, K_ARRAY, K_SLICE, K_TUPLE, K_FN, same_def};
+import check;
+import ir.{Place, ProjKind, Constant, ConstantKind, Operand, OperandKind, Rvalue, RvalueKind, AggregateKind, Statement, StatementKind,
+    Callee, CalleeKind, Terminator, TerminatorKind, BasicBlock, Local, Function, Module, Pair};
+import ir;
+import source.Span;
+import diagnostics.Severity;
+import bytes;
+import std.collections.HashMap;
+import std.mem;
+
+// ---------- sorted sets ----------
+
+/// Inserts into a sorted set; returns true when added.
+pub bool set_add(&Vec<uint> set, uint value) {
+    usize lo = 0; usize hi = set.len();
+    while (lo < hi) { usize mid = lo + (hi - lo) / 2; if (*set.get(mid).unwrap() < value) { lo = mid + 1; } else { hi = mid; } }
+    if (lo < set.len() && *set.get(lo).unwrap() == value) { return false; }
+    set.push(value);
+    usize i = set.len() - 1;
+    while (i > lo) { set.swap(i, i - 1); i -= 1; }
+    return true;
+}
+pub bool set_has(&const Vec<uint> set, uint value) {
+    usize lo = 0; usize hi = set.len();
+    while (lo < hi) { usize mid = lo + (hi - lo) / 2; if (*set.get(mid).unwrap() < value) { lo = mid + 1; } else { hi = mid; } }
+    return lo < set.len() && *set.get(lo).unwrap() == value;
+}
+/// Adds every element of from into into; returns true when into grew.
+pub bool set_union(&Vec<uint> into, &const Vec<uint> from) {
+    if (from.is_empty()) { return false; }
+    Vec<uint> merged = Vec.new(); usize i = 0; usize j = 0; bool grew = false;
+    while (i < into.len() || j < from.len()) {
+        if (j >= from.len()) { merged.push(*into.get(i).unwrap()); i += 1; }
+        else if (i >= into.len()) { merged.push(*from.get(j).unwrap()); j += 1; grew = true; }
+        else {
+            uint a = *into.get(i).unwrap(); uint b = *from.get(j).unwrap();
+            if (a < b) { merged.push(a); i += 1; }
+            else if (b < a) { merged.push(b); j += 1; grew = true; }
+            else { merged.push(a); i += 1; j += 1; }
+        }
+    }
+    if (grew) { *into = merged; }
+    return grew;
+}
+pub Vec<uint> set_copy(&const Vec<uint> set) { Vec<uint> out = Vec.new(); for (v in set) { out.push(*v); } return out; }
+Vec<Vec<uint>> sets_copy(&const Vec<Vec<uint>> sets) { Vec<Vec<uint>> out = Vec.new(); for (s in sets) { out.push(set_copy(s)); } return out; }
+bool sets_equal(&const Vec<uint> a, &const Vec<uint> b) {
+    if (a.len() != b.len()) { return false; }
+    for (i in 0..a.len()) { if (*a.get(i).unwrap() != *b.get(i).unwrap()) { return false; } }
+    return true;
+}
+
+// ---------- helpers over the IR ----------
+
+/// Source text for a place, such as `a.name` or `*r`. Field names come from
+/// the declared types; a field reached through a type parameter keeps its
+/// position, as in `p.0`.
+pub String place_text(&const Checker ck, &const Function f, &const Place p) {
+    var local = f.locals.get(p.local as usize).unwrap();
+    if (local.name.is_empty()) { return String.from("a temporary"); }
+    var s = String.from(local.name); var t = local.type;
+    DefId variant_def = DefId.none(); usize variant = 0; bool has_variant = false;
+    for (pr in &const p.proj) {
+        match pr.kind {
+            ProjKind.Field => {
+                usize i = pr.index as usize; var name = "{i}"; var next = TypeId.none();
+                uint k = if (t.index != NONE) { ck.tk(t) } else { NONE };
+                if (k == K_STRUCT && i < ck.r.program.def(ck.def_of(t)).fields.len()) {
+                    var field = ck.r.program.def(ck.def_of(t)).fields.get(i).unwrap();
+                    name = String.from(field.name); next = field.type;
+                } else if (k == K_TUPLE && i < ck.n_elems(t)) {
+                    next = ck.elem(t, i);
+                } else if (has_variant) {
+                    var v = ck.r.program.def(variant_def).variants.get(variant).unwrap();
+                    if (i < v.tuple_types.len()) { next = *v.tuple_types.get(i).unwrap(); }
+                    else if (i < v.fields.len()) { name = String.from(v.fields.get(i).unwrap().name); next = v.fields.get(i).unwrap().type; }
+                }
+                s.push_str("."); s.push_str(name.as_str()); t = next; has_variant = false;
+            }
+            ProjKind.Index => { s.push_str("[..]"); if (t.index != NONE) { t = ck.inner(t); } }
+            ProjKind.Deref => { s = "*{s}"; if (t.index != NONE) { t = ck.inner(t); } }
+            ProjKind.Downcast => {
+                has_variant = false;
+                if (t.index != NONE && ck.tk(t) == K_ENUM && (pr.index as usize) < ck.r.program.def(ck.def_of(t)).variants.len()) {
+                    variant_def = ck.def_of(t); variant = pr.index as usize; has_variant = true;
+                }
+            }
+        }
+    }
+    return "`{s}`";
+}
+/// One place is a prefix of the other. Index matches any index; downcasts are transparent.
+pub bool overlaps(&const Place a, &const Place b) {
+    if (a.local != b.local) { return false; }
+    usize i = 0; usize j = 0;
+    while (i < a.proj.len() && j < b.proj.len()) {
+        var x = a.proj.get(i).unwrap(); var y = b.proj.get(j).unwrap();
+        if (ir.proj_index(x.kind) == 3) { i += 1; continue; }
+        if (ir.proj_index(y.kind) == 3) { j += 1; continue; }
+        if (ir.proj_index(x.kind) != ir.proj_index(y.kind)) { return false; }
+        if (ir.proj_index(x.kind) == 0 && x.index != y.index) { return false; }
+        i += 1; j += 1;
+    }
+    return true;
+}
+pub bool starts_with_deref(&const Place p) {
+    for (pr in &const p.proj) { uint k = ir.proj_index(pr.kind); if (k == 3) { continue; } return k == 2; }
+    return false;
+}
+const byte INIT = 1;
+const byte MOVED = 2;
+const byte UNINIT = 4;
+
+pub struct Loan { Place place; bool is_mut; Span span; uint ref_local; bool external; }
+pub enum AccessKind { Read, Move, Write, BorrowShared, BorrowMut, Drop, Dead }
+uint access_index(AccessKind k) {
+    match k { AccessKind.Read => return 0, AccessKind.Move => return 1, AccessKind.Write => return 2, AccessKind.BorrowShared => return 3,
+        AccessKind.BorrowMut => return 4, AccessKind.Drop => return 5, AccessKind.Dead => return 6 }
+}
+pub struct Access { AccessKind kind; Place place; }
+const uint A_READ = 0;
+const uint A_MOVE = 1;
+const uint A_WRITE = 2;
+const uint A_SHARED = 3;
+const uint A_MUT = 4;
+const uint A_DROP = 5;
+const uint A_DEAD = 6;
+
+/// Per lowered function: argument indexes written through and returned.
+pub struct Effects { bool present; Vec<uint> writes; Vec<uint> returns; }
+
+
+pub struct BorrowChecker {
+    Vec<Effects> effects;
+    bool has_effects;
+    pub BorrowChecker new() { return BorrowChecker { effects: Vec.new(), has_effects: false }; }
+    /// Checks and rewrites every function in the module. Returns false on error.
+    pub bool check_module(&self, &Checker ck, &Module m) {
+        self.effects = infer_write_effects(&*ck, &const *m);
+        self.has_effects = !self.effects.is_empty();
+        bool ok = true;
+        for (i in 0..m.functions.len()) {
+            var f = m.functions.get(i).unwrap();
+            if (!f.lowered || f.blocks.is_empty()) { continue; }
+            var fc = FunctionCheck.new(&*ck, i);
+            var func = mem.replace(m.functions.get_mut(i).unwrap(), Function.new(String.new()));
+            fc.f = func;
+            if (!fc.run(&*ck, &self.effects, self.has_effects, &const *m)) { ok = false; }
+            var finished = mem.replace(&fc.f, Function.new(String.new())); var slot = m.functions.get_mut(i).unwrap(); *slot = finished;
+        }
+        return ok;
+    }
+}
+
+// ---------- shared type queries ----------
+
+bool is_copy(&Checker ck, TypeId t) {
+    uint k = ck.tk(t);
+    if (k == K_STR || k == K_SLICE || k == K_DYN) { return true; }
+    return ck.is_copy_type(t);
+}
+TypeId projected_type(&Checker ck, &const Function f, &const Place place) {
+    var ty = f.locals.get(place.local as usize).unwrap().type; uint variant = 0;
+    for (pr in &const place.proj) {
+        uint k = ir.proj_index(pr.kind);
+        if (k == 3) { variant = pr.index; continue; }
+        if (k == 2 || k == 1) { ty = ck.inner(ty); continue; }
+        if (ck.tk(ty) == K_TUPLE) { ty = ck.elem(ty, pr.index as usize); }
+        else {
+            var def = ck.def_of(ty); var s = full_subst(&*ck, def, ty);
+            if (ck.tk(ty) == K_STRUCT) { ty = ck.apply(&s, ck.r.program.def(def).fields.get(pr.index as usize).unwrap().type); }
+            else {
+                var payload = ck.r.program.def(def).variants.get(variant as usize).unwrap();
+                var raw = if (payload.tuple_types.is_empty()) { payload.fields.get(pr.index as usize).unwrap().type } else { *payload.tuple_types.get(pr.index as usize).unwrap() };
+                ty = ck.apply(&s, raw);
+            }
+        }
+    }
+    return ty;
+}
+/// Binds every generic of def to the type arguments of t (no bound check, as C++).
+Subst full_subst(&Checker ck, DefId def, TypeId t) {
+    var s = Subst.new(); usize ng = ck.r.program.def(def).generics.len();
+    for (k in 0..ng) { s.bind(ck.r.program.def(def).generics.get(k).unwrap().type, ck.elem(t, k)); }
+    return s;
+}
+/// Children of a struct or enum for type walks: fields, then for enums each
+/// variant's fields before its tuple types (the C++ order differs by caller).
+bool loan_carrier_type(&Checker ck, TypeId root, bool writable_only, bool raw_writes) {
+    Vec<TypeId> work = Vec.new(); work.push(root); HashMap<ulong, bool> seen = HashMap.new();
+    while (!work.is_empty()) {
+        var ty = work.pop().unwrap(); ulong key = ty.index as ulong;
+        if (seen.contains_key(&key)) { continue; }
+        seen.insert(key, true);
+        uint k = ck.tk(ty);
+        if (k == K_REF) { if (!writable_only || !ck.const_of(ty)) { return true; } continue; }
+        if (raw_writes && k == K_PTR && !ck.const_of(ty)) { return true; }
+        if (k == K_DYN) { return true; }
+        if (k == K_FN) { if (!ck.send_of(ty)) { return true; } continue; }
+        if (k == K_ARRAY || k == K_SLICE) { work.push(ck.inner(ty)); }
+        if (k == K_TUPLE || k == K_STRUCT || k == K_ENUM) { var es = ck.elems(ty); for (e in &const es) { work.push(*e); } }
+        if (k != K_STRUCT && k != K_ENUM) { continue; }
+        var def = ck.def_of(ty); var s = full_subst(&*ck, def, ty);
+        if (k == K_STRUCT) {
+            usize nf = ck.r.program.def(def).fields.len();
+            for (f in 0..nf) { var ft = ck.r.program.def(def).fields.get(f).unwrap().type; work.push(ck.apply(&s, ft)); }
+        } else {
+            usize nv = ck.r.program.def(def).variants.len();
+            for (v in 0..nv) {
+                usize nf = ck.r.program.def(def).variants.get(v).unwrap().fields.len();
+                for (f in 0..nf) { var ft = ck.r.program.def(def).variants.get(v).unwrap().fields.get(f).unwrap().type; work.push(ck.apply(&s, ft)); }
+                usize nt = ck.r.program.def(def).variants.get(v).unwrap().tuple_types.len();
+                for (f in 0..nt) { var ft = *ck.r.program.def(def).variants.get(v).unwrap().tuple_types.get(f).unwrap(); work.push(ck.apply(&s, ft)); }
+            }
+        }
+    }
+    return false;
+}
+
+// ---------- write effects ----------
+
+/// Interned origin sets for one function analysis. Set 0 is empty. Unions are
+/// cached by unordered pair; a union with the size of an operand is that
+/// operand, so a repeated join never reports growth.
+struct OriginPool {
+    Vec<Vec<uint>> sets;
+    HashMap<ulong, uint> unions;
+    HashMap<ulong, uint> singles;
+    OriginPool new() { Vec<Vec<uint>> sets = Vec.new(); sets.push(Vec.new()); return OriginPool { sets: sets, unions: HashMap.new(), singles: HashMap.new() }; }
+    uint single(&self, uint local) {
+        ulong key = local as ulong;
+        if (self.singles.contains_key(&key)) { return *self.singles.get(&key).unwrap(); }
+        Vec<uint> set = Vec.new(); set.push(local);
+        uint id = self.sets.len() as uint; self.sets.push(set); self.singles.insert(key, id);
+        return id;
+    }
+    uint join(&self, uint a, uint b) {
+        if (a == b || b == 0) { return a; }
+        if (a == 0) { return b; }
+        uint lo = if (a < b) { a } else { b }; uint hi = if (a < b) { b } else { a };
+        ulong key = ((lo as ulong) << 32) | (hi as ulong);
+        if (self.unions.contains_key(&key)) { return *self.unions.get(&key).unwrap(); }
+        var merged = set_copy(self.sets.get(lo as usize).unwrap());
+        set_union(&merged, self.sets.get(hi as usize).unwrap());
+        uint id = lo;
+        if (merged.len() == self.sets.get(hi as usize).unwrap().len()) { id = hi; }
+        else if (merged.len() != self.sets.get(lo as usize).unwrap().len()) { id = self.sets.len() as uint; self.sets.push(merged); }
+        self.unions.insert(key, id);
+        return id;
+    }
+    Vec<uint> members(&const self, uint id) { return set_copy(self.sets.get(id as usize).unwrap()); }
+}
+/// Only nonempty origin sets are stored. Missing locals denote the empty set.
+/// Entries stay sorted by local index, matching the C++ sparse state.
+struct OriginEntry { uint local; uint set; }
+struct OriginState {
+    Vec<OriginEntry> entries;
+    OriginState new() { return OriginState { entries: Vec.new() }; }
+    usize index(&const self, uint local) {
+        usize lo = 0; usize hi = self.entries.len();
+        while (lo < hi) { usize mid = lo + (hi - lo) / 2; if (self.entries.get(mid).unwrap().local < local) { lo = mid + 1; } else { hi = mid; } }
+        return lo;
+    }
+    uint get(&const self, uint local) {
+        usize at = self.index(local);
+        if (at == self.entries.len() || self.entries.get(at).unwrap().local != local) { return 0; }
+        return self.entries.get(at).unwrap().set;
+    }
+    void put(&self, uint local, uint set) {
+        usize at = self.index(local); bool found = at < self.entries.len() && self.entries.get(at).unwrap().local == local;
+        if (set == 0) {
+            if (found) { usize i = at; while (i + 1 < self.entries.len()) { self.entries.swap(i, i + 1); i += 1; } var removed = self.entries.pop(); }
+            return;
+        }
+        if (found) { self.entries.get_mut(at).unwrap().set = set; return; }
+        self.entries.push(OriginEntry { local: local, set: set });
+        usize i = self.entries.len() - 1; while (i > at) { self.entries.swap(i, i - 1); i -= 1; }
+    }
+    void unite(&self, &OriginPool pool, uint local, uint set) {
+        if (set != 0) { self.put(local, pool.join(self.get(local), set)); }
+    }
+    OriginState copy(&const self) {
+        var out = OriginState.new();
+        for (entry in &const self.entries) { out.entries.push(OriginEntry { local: entry.local, set: entry.set }); }
+        return out;
+    }
+}
+
+uint operand_origins(&Checker ck, &const Function f, &const OriginState state, &const Operand value) {
+    if (value.is_const()) { return 0; }
+    if (!value.place.proj.is_empty() && ck.tk(projected_type(&*ck, f, &const value.place)) == K_PRIM) { return 0; }
+    return state.get(value.place.local);
+}
+TypeId operand_type(&Checker ck, &const Function f, &const Operand o) {
+    if (o.is_const()) { return o.constant.type; }
+    return projected_type(&*ck, f, &const o.place);
+}
+/// Records argument roots written through; returns true when the set grew.
+bool record_writes(&Vec<uint> written, &const Vec<uint> origins, uint arg_count) {
+    bool grew = false;
+    for (root in origins) { if (*root > 0 && *root <= arg_count) { if (set_add(&*written, *root - 1)) { grew = true; } } }
+    return grew;
+}
+void store_origins(&const Place place, uint value, &OriginState state, &OriginPool pool, &Vec<uint> written, uint arg_count, &bool changed) {
+    if (place.is_none()) { return; }
+    if (place.is_local()) { state.put(place.local, value); return; }
+    var roots = pool.members(state.get(place.local));
+    if (record_writes(&*written, &roots, arg_count)) { *changed = true; }
+    state.unite(&*pool, place.local, value);
+    for (root in &const roots) { state.unite(&*pool, *root, value); }
+}
+/// Summaries only grow, and every transfer is a monotone union, so any visit
+/// order reaches the same least fixed point. A function is analyzed again only
+/// when the summary of a direct callee (or its own) has grown, and a block is
+/// visited again only when its incoming state has grown.
+pub Vec<Effects> infer_write_effects(&Checker ck, &const Module m) {
+    Vec<Effects> effects = Vec.new();
+    for (f in &const m.functions) { effects.push(Effects { present: f.lowered && !f.blocks.is_empty(), writes: Vec.new(), returns: Vec.new() }); }
+    bool any = false; for (e in &const effects) { if (e.present) { any = true; } }
+    if (!any) { return Vec.new(); }
+    Vec<Vec<uint>> callers = Vec.new(); for (fi in 0..m.functions.len()) { callers.push(Vec.new()); }
+    for (fi in 0..m.functions.len()) {
+        if (!effects.get(fi).unwrap().present) { continue; }
+        for (blk in &const m.functions.get(fi).unwrap().blocks) {
+            var term = &const blk.term;
+            if (ir.terminator_index(term.kind) != 2 || ir.callee_index(term.callee.kind) != 0 || term.callee.fn_index == NONE) { continue; }
+            if (!effects.get(term.callee.fn_index as usize).unwrap().present) { continue; }
+            var list = callers.get_mut(term.callee.fn_index as usize).unwrap();
+            if (list.is_empty() || *list.get(list.len() - 1).unwrap() != fi as uint) { list.push(fi as uint); }
+        }
+    }
+    Vec<uint> queue = Vec.new(); Vec<bool> queued = Vec.new();
+    for (fi in 0..m.functions.len()) {
+        bool present = effects.get(fi).unwrap().present; queued.push(present);
+        if (present) { queue.push(fi as uint); }
+    }
+    usize next_function = 0;
+    while (next_function < queue.len()) {
+        usize fi = *queue.get(next_function).unwrap() as usize; next_function += 1;
+        *queued.get_mut(fi).unwrap() = false;
+        bool changed = false;
+        var fn_ref = m.functions.get(fi).unwrap(); uint argc = fn_ref.arg_count;
+        usize nb = fn_ref.blocks.len();
+        var pool = OriginPool.new();
+        uint all_args = 0; for (arg in 1..argc + 1) { all_args = pool.join(all_args, pool.single(arg)); }
+        Vec<OriginState> incoming = Vec.new();
+        for (b in 0..nb) { incoming.push(OriginState.new()); }
+        for (arg in 1..argc + 1) { uint root = pool.single(arg); incoming.get_mut(0).unwrap().put(arg, root); }
+        Vec<bool> dirty = Vec.new(); for (b in 0..nb) { dirty.push(true); }
+        bool flow_changed = true;
+        while (flow_changed) {
+            flow_changed = false;
+            for (block in 0..nb) {
+                bool pending = *dirty.get(block).unwrap(); *dirty.get_mut(block).unwrap() = false;
+                if (!pending) { continue; }
+                var state = incoming.get(block).unwrap().copy();
+                var blk = fn_ref.blocks.get(block).unwrap();
+                for (statement in &const blk.stmts) {
+                    uint sk = ir.statement_index(statement.kind);
+                    if (sk == 1 || sk == 2) {
+                        var roots = pool.members(state.get(statement.place.local));
+                        if (record_writes(&effects.get_mut(fi).unwrap().writes, &roots, argc)) { changed = true; }
+                        continue;
+                    }
+                    if (sk != 0) { continue; }
+                    var r = &const statement.rvalue; uint rk = ir.rvalue_index(r.kind);
+                    uint value = 0;
+                    if (rk == 1) { value = pool.join(state.get(r.place.local), pool.single(r.place.local)); }
+                    else if (rk == 7 || rk == 6) {}
+                    else {
+                        value = pool.join(operand_origins(&*ck, fn_ref, &state, &const r.a), operand_origins(&*ck, fn_ref, &state, &const r.b));
+                        for (part in &const r.elems) { value = pool.join(value, operand_origins(&*ck, fn_ref, &state, part)); }
+                        for (cap in &const r.captures) { value = pool.join(value, operand_origins(&*ck, fn_ref, &state, cap)); }
+                    }
+                    if (rk == 5 && r.type.index != NONE && ck.tk(r.type) == K_FN) {
+                        value = 0;
+                        for (cap in &const r.captures) {
+                            var ct = operand_type(&*ck, fn_ref, cap);
+                            if (loan_carrier_type(&*ck, ct, false, false)) { value = pool.join(value, operand_origins(&*ck, fn_ref, &state, cap)); }
+                        }
+                    }
+                    var destination = projected_type(&*ck, fn_ref, &const statement.place);
+                    if (ck.tk(destination) == K_PRIM && rk == 0 && !r.a.is_const() && !r.a.place.proj.is_empty()) { value = 0; }
+                    if (ck.tk(destination) == K_PRIM && ck.is_bool(destination)) { value = 0; }
+                    if (rk == 4 && ck.tk(destination) == K_PTR && value == 0 && !(r.a.is_const() && r.a.constant.int_value == 0)) { value = all_args; }
+                    bool grew = false;
+                    store_origins(&const statement.place, value, &state, &pool, &effects.get_mut(fi).unwrap().writes, argc, &grew);
+                    if (grew) { changed = true; }
+                }
+                var term = &const blk.term; uint tk = ir.terminator_index(term.kind);
+                if (tk == 2) {
+                    uint result = 0; uint passed = 0;
+                    for (arg in &const term.args) { passed = pool.join(passed, operand_origins(&*ck, fn_ref, &state, arg)); }
+                    bool known = ir.callee_index(term.callee.kind) == 0 && term.callee.fn_index != NONE && effects.get(term.callee.fn_index as usize).unwrap().present;
+                    for (a in 0..term.args.len()) {
+                        var actual = term.args.get(a).unwrap();
+                        uint origins = operand_origins(&*ck, fn_ref, &state, actual);
+                        bool mutates = false;
+                        if (known) {
+                            var e = effects.get(term.callee.fn_index as usize).unwrap();
+                            if (set_has(&const e.returns, a as uint)) { result = pool.join(result, origins); }
+                            mutates = set_has(&const e.writes, a as uint);
+                        } else {
+                            result = pool.join(result, origins);
+                            var at = operand_type(&*ck, fn_ref, actual);
+                            mutates = loan_carrier_type(&*ck, at, true, true);
+                        }
+                        if (mutates) {
+                            var roots = pool.members(origins);
+                            if (record_writes(&effects.get_mut(fi).unwrap().writes, &roots, argc)) { changed = true; }
+                            for (root in &const roots) { state.unite(&pool, *root, passed); }
+                        }
+                    }
+                    if (ir.callee_index(term.callee.kind) == 2) {
+                        uint origins = operand_origins(&*ck, fn_ref, &state, &const term.callee.fn_operand); result = pool.join(result, origins);
+                        var ft = projected_type(&*ck, fn_ref, &const term.callee.fn_operand.place);
+                        if ((ck.tk(ft) == K_REF && !ck.const_of(ft)) || ck.tk(ft) == K_FN) {
+                            var roots = pool.members(origins);
+                            if (record_writes(&effects.get_mut(fi).unwrap().writes, &roots, argc)) { changed = true; }
+                            for (root in &const roots) { state.unite(&pool, *root, passed); }
+                        }
+                    }
+                    bool grew = false;
+                    store_origins(&const term.dest, result, &state, &pool, &effects.get_mut(fi).unwrap().writes, argc, &grew);
+                    if (grew) { changed = true; }
+                }
+                if (tk == 4) {
+                    var roots = pool.members(state.get(0)); bool grew = false;
+                    for (root in &const roots) { if (*root > 0 && *root <= argc) { if (set_add(&effects.get_mut(fi).unwrap().returns, *root - 1)) { grew = true; } } }
+                    if (grew) { changed = true; }
+                }
+                Vec<uint> successors = Vec.new();
+                if (tk == 0 || tk == 3 || (tk == 2 && !term.diverges)) { successors.push(term.target); }
+                if (tk == 1) { successors.push(term.otherwise); for (arm in &const term.cases) { successors.push(arm.block); } }
+                for (next in &const successors) {
+                    var target = incoming.get_mut(*next as usize).unwrap();
+                    for (entry in &const state.entries) {
+                        uint before = target.get(entry.local); uint after = pool.join(before, entry.set);
+                        if (after != before) { target.put(entry.local, after); flow_changed = true; *dirty.get_mut(*next as usize).unwrap() = true; }
+                    }
+                }
+            }
+        }
+        if (changed) {
+            for (caller in callers.get(fi).unwrap()) {
+                if (!*queued.get(*caller as usize).unwrap()) { *queued.get_mut(*caller as usize).unwrap() = true; queue.push(*caller); }
+            }
+        }
+    }
+    return effects;
+}
+
+// ---------- one function ----------
+
+pub struct FunctionCheck {
+    uint fi;
+    pub Function f;
+    usize nlocals;
+    bool ok;
+    Vec<Vec<uint>> succ;
+    Vec<uint> rpo;
+    Vec<bool> reachable;
+    Vec<Vec<byte>> move_in;
+    Vec<Vec<bool>> live_in;
+    Vec<Vec<bool>> live_out;
+    Vec<Loan> loan_list;
+    /// Per local: loan id of its boundary origin, or NONE.
+    Vec<uint> boundary_origins;
+    Vec<Vec<uint>> loan_bases;
+    Vec<Vec<uint>> boundary_stores;
+    bool provenance_changed;
+    Vec<Vec<Vec<uint>>> carriers_in;
+    HashMap<ulong, bool> has_refs_cache;
+    /// Persists between place_type calls, as current_variant_ does in C++.
+    usize current_variant;
+    bool use_effects;
+
+    pub FunctionCheck new(&Checker ck, usize fi) {
+        return FunctionCheck { fi: fi as uint, f: Function.new(String.new()), nlocals: 0, ok: true, succ: Vec.new(), rpo: Vec.new(),
+            reachable: Vec.new(), move_in: Vec.new(), live_in: Vec.new(), live_out: Vec.new(), loan_list: Vec.new(), boundary_origins: Vec.new(),
+            loan_bases: Vec.new(), boundary_stores: Vec.new(), provenance_changed: false, carriers_in: Vec.new(), has_refs_cache: HashMap.new(),
+            current_variant: 0, use_effects: false };
+    }
+    void error(&self, &Checker ck, Span span, &const str message, &const str code) { ck.r.sink.error(span, message, code); self.ok = false; }
+    void note(&self, &Checker ck, Span span, &const str message) { Vec<byte> data = Vec.new(); bytes.text(&data, message); ck.r.sink.add(Severity.Note, span, data, String.new()); }
+    TypeId local_type(&const self, uint l) { return self.f.locals.get(l as usize).unwrap().type; }
+
+    pub bool run(&self, &Checker ck, &const Vec<Effects> effects, bool has_effects, &const Module m) {
+        self.nlocals = self.f.locals.len();
+        self.use_effects = has_effects;
+        for (b in 0..self.f.blocks.len()) {
+            usize ns = self.f.blocks.get(b).unwrap().stmts.len();
+            for (s in 0..ns) {
+                var accesses = self.statement_accesses(self.f.blocks.get(b).unwrap().stmts.get(s).unwrap());
+                Span span = self.f.blocks.get(b).unwrap().stmts.get(s).unwrap().span;
+                self.check_readonly_access(&*ck, &accesses, span);
+            }
+            var taccesses = self.terminator_accesses(&*ck, &const self.f.blocks.get(b).unwrap().term);
+            Span tspan = self.f.blocks.get(b).unwrap().term.span;
+            self.check_readonly_access(&*ck, &taccesses, tspan);
+        }
+        self.compute_successors();
+        self.move_analysis(&*ck);
+        self.elaborate_drops(&*ck);
+        self.liveness(&*ck);
+        self.loans(&*ck, effects, m);
+        return self.ok;
+    }
+
+    // ----- CFG -----
+
+    void compute_successors(&self) {
+        usize nb = self.f.blocks.len();
+        self.succ = Vec.new();
+        for (b in 0..nb) {
+            Vec<uint> out = Vec.new(); var t = &const self.f.blocks.get(b).unwrap().term;
+            match t.kind {
+                TerminatorKind.Goto => { out.push(t.target); }
+                TerminatorKind.Switch => { for (c in &const t.cases) { out.push(c.block); } out.push(t.otherwise); }
+                TerminatorKind.Call => { if (!t.diverges) { out.push(t.target); } }
+                TerminatorKind.Assert => { out.push(t.target); }
+                _ => {}
+            }
+            self.succ.push(out);
+        }
+        Vec<bool> seen = Vec.new(); for (b in 0..nb) { seen.push(false); }
+        Vec<uint> post = Vec.new(); Vec<uint> stack_block = Vec.new(); Vec<usize> stack_next = Vec.new();
+        stack_block.push(0); stack_next.push(0); *seen.get_mut(0).unwrap() = true;
+        while (!stack_block.is_empty()) {
+            usize top = stack_block.len() - 1; uint b = *stack_block.get(top).unwrap(); usize i = *stack_next.get(top).unwrap();
+            if (i < self.succ.get(b as usize).unwrap().len()) {
+                uint s = *self.succ.get(b as usize).unwrap().get(i).unwrap(); *stack_next.get_mut(top).unwrap() = i + 1;
+                if (!*seen.get(s as usize).unwrap()) { *seen.get_mut(s as usize).unwrap() = true; stack_block.push(s); stack_next.push(0); }
+            } else { post.push(b); var u1 = stack_block.pop(); var u2 = stack_next.pop(); }
+        }
+        self.rpo = Vec.new(); usize k = post.len(); while (k > 0) { k -= 1; self.rpo.push(*post.get(k).unwrap()); }
+        self.reachable = seen;
+    }
+
+    // ----- accesses -----
+
+    void index_reads(&const self, &const Place p, &Vec<Access> out) {
+        for (pr in &const p.proj) { if (ir.proj_index(pr.kind) == 1) { out.push(Access { kind: AccessKind.Read, place: Place.of(pr.index) }); } }
+    }
+    void operand_accesses(&const self, &const Operand o, &Vec<Access> out) {
+        match o.kind {
+            OperandKind.Copy => { out.push(Access { kind: AccessKind.Read, place: o.place.copy() }); }
+            OperandKind.Move => { out.push(Access { kind: AccessKind.Move, place: o.place.copy() }); }
+            OperandKind.Const => {}
+        }
+        if (!o.is_const()) { self.index_reads(&const o.place, &*out); }
+    }
+    void rvalue_accesses(&const self, &const Rvalue r, &Vec<Access> out) {
+        uint k = ir.rvalue_index(r.kind);
+        if (k == 0 || k == 3 || k == 4 || k == 11 || k == 8 || k == 9 || k == 10) { self.operand_accesses(&const r.a, &*out); }
+        else if (k == 2) { self.operand_accesses(&const r.a, &*out); self.operand_accesses(&const r.b, &*out); }
+        else if (k == 1) {
+            out.push(Access { kind: if (r.is_const) { AccessKind.BorrowShared } else { AccessKind.BorrowMut }, place: r.place.copy() });
+            self.index_reads(&const r.place, &*out);
+        } else if (k == 5) {
+            for (e in &const r.elems) { self.operand_accesses(e, &*out); }
+            for (e in &const r.captures) { self.operand_accesses(e, &*out); }
+        } else if (k == 6 || k == 7) {
+            out.push(Access { kind: AccessKind.Read, place: r.place.copy() }); self.index_reads(&const r.place, &*out);
+        }
+    }
+    Vec<Access> statement_accesses(&const self, &const Statement s) {
+        Vec<Access> out = Vec.new();
+        match s.kind {
+            StatementKind.Assign => {
+                self.rvalue_accesses(&const s.rvalue, &out);
+                out.push(Access { kind: AccessKind.Write, place: s.place.copy() }); self.index_reads(&const s.place, &out);
+            }
+            StatementKind.Drop => { out.push(Access { kind: AccessKind.Drop, place: s.place.copy() }); }
+            StatementKind.DropIf => { out.push(Access { kind: AccessKind.Drop, place: s.place.copy() }); }
+            StatementKind.StorageDead => { out.push(Access { kind: AccessKind.Dead, place: s.place.copy() }); }
+            StatementKind.Nop => {}
+        }
+        return out;
+    }
+    Vec<Access> terminator_accesses(&const self, &Checker ck, &const Terminator t) {
+        Vec<Access> out = Vec.new();
+        match t.kind {
+            TerminatorKind.Switch => { self.operand_accesses(&const t.discr, &out); }
+            TerminatorKind.Assert => { self.operand_accesses(&const t.cond, &out); }
+            TerminatorKind.Call => {
+                if (ir.callee_index(t.callee.kind) == 2) { self.operand_accesses(&const t.callee.fn_operand, &out); }
+                for (a in &const t.args) { self.operand_accesses(a, &out); }
+                if (!t.diverges && !t.dest.is_none()) { out.push(Access { kind: AccessKind.Write, place: t.dest.copy() }); self.index_reads(&const t.dest, &out); }
+            }
+            TerminatorKind.Return => {
+                if (self.f.ret.index != NONE && !ck.is_void(self.f.ret)) { out.push(Access { kind: AccessKind.Read, place: Place.of(0) }); }
+            }
+            _ => {}
+        }
+        return out;
+    }
+    void check_readonly_access(&self, &Checker ck, &const Vec<Access> accesses, Span span) {
+        for (access in accesses) {
+            uint k = access_index(access.kind);
+            if (k != A_WRITE && k != A_MUT) { continue; }
+            var prefix = Place.of(access.place.local); bool readonly = false;
+            for (pr in &const access.place.proj) {
+                var ty = self.place_type(&*ck, &prefix);
+                if (ir.proj_index(pr.kind) == 2) {
+                    if (ck.tk(ty) == K_REF && ck.const_of(ty)) { readonly = true; }
+                    if (ck.tk(ty) == K_PTR) { readonly = false; }
+                }
+                prefix.proj.push(ir.Projection { kind: pr.kind, index: pr.index });
+            }
+            if (readonly) { self.error(&*ck, span, "cannot change a value through a shared reference", "SNX0505"); return; }
+        }
+    }
+    /// Type of a place; the enum variant persists between calls as in C++.
+    TypeId place_type(&self, &Checker ck, &const Place p) {
+        var base = self.f.locals.get(p.local as usize).unwrap().type;
+        for (pr in &const p.proj) {
+            match pr.kind {
+                ProjKind.Deref => { if (ck.inner(base).index != NONE) { base = ck.inner(base); } }
+                ProjKind.Index => { if (ck.inner(base).index != NONE) { base = ck.inner(base); } }
+                ProjKind.Field => {
+                    usize i = pr.index as usize; uint k = ck.tk(base);
+                    if (k == K_TUPLE && i < ck.n_elems(base)) { base = ck.elem(base, i); }
+                    else if (k == K_STRUCT && i < ck.r.program.def(ck.def_of(base)).fields.len()) {
+                        var def = ck.def_of(base); var s = full_subst(&*ck, def, base);
+                        base = ck.apply(&s, ck.r.program.def(def).fields.get(i).unwrap().type);
+                    } else if (k == K_ENUM && self.current_variant < ck.r.program.def(ck.def_of(base)).variants.len()) {
+                        var def = ck.def_of(base); var s = full_subst(&*ck, def, base);
+                        var v = ck.r.program.def(def).variants.get(self.current_variant).unwrap();
+                        if (i < v.tuple_types.len()) { var raw = *v.tuple_types.get(i).unwrap(); base = ck.apply(&s, raw); }
+                        else if (i < v.fields.len()) { var raw = v.fields.get(i).unwrap().type; base = ck.apply(&s, raw); }
+                    }
+                }
+                ProjKind.Downcast => { self.current_variant = pr.index as usize; }
+            }
+        }
+        return base;
+    }
+    bool deref_is_raw(&const self, &Checker ck, &const Place p) {
+        var t = self.f.locals.get(p.local as usize).unwrap().type;
+        for (pr in &const p.proj) {
+            uint k = ir.proj_index(pr.kind);
+            if (k == 3) { continue; }
+            if (k == 2) { return ck.tk(t) == K_PTR; }
+            return false;
+        }
+        return false;
+    }
+
+    // ----- move analysis -----
+
+    void move_analysis(&self, &Checker ck) {
+        usize nb = self.f.blocks.len(); usize nl = self.nlocals;
+        Vec<Vec<byte>> incoming = Vec.new(); for (b in 0..nb) { Vec<byte> st = Vec.new(); for (l in 0..nl) { st.push(0); } incoming.push(st); }
+        Vec<byte> entry = Vec.new(); for (l in 0..nl) { entry.push(UNINIT); }
+        for (i in 1..self.f.arg_count + 1) { *entry.get_mut(i as usize).unwrap() = INIT; }
+        if (self.f.ret.index != NONE && ck.is_void(self.f.ret)) { *entry.get_mut(0).unwrap() = INIT; }
+        var first = incoming.get_mut(0).unwrap(); *first = entry;
+        Vec<bool> has_in = Vec.new(); for (b in 0..nb) { has_in.push(false); } *has_in.get_mut(0).unwrap() = true;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            var order = set_copy(&self.rpo);
+            for (b in &const order) {
+                if (!*has_in.get(*b as usize).unwrap()) { continue; }
+                var state = bytes.copy(incoming.get(*b as usize).unwrap(), 0, nl);
+                self.transfer_block(&*ck, *b, &state, false);
+                var succs = set_copy(self.succ.get(*b as usize).unwrap());
+                for (s in &const succs) {
+                    if (!*has_in.get(*s as usize).unwrap()) { *incoming.get_mut(*s as usize).unwrap() = bytes.copy(&state, 0, nl); *has_in.get_mut(*s as usize).unwrap() = true; changed = true; continue; }
+                    for (i in 0..nl) {
+                        byte old = *incoming.get(*s as usize).unwrap().get(i).unwrap(); byte merged = old | *state.get(i).unwrap();
+                        if (merged != old) { *incoming.get_mut(*s as usize).unwrap().get_mut(i).unwrap() = merged; changed = true; }
+                    }
+                }
+            }
+        }
+        self.move_in = incoming;
+        var order = set_copy(&self.rpo);
+        for (b in &const order) {
+            var state = bytes.copy(self.move_in.get(*b as usize).unwrap(), 0, nl);
+            self.transfer_block(&*ck, *b, &state, true);
+        }
+    }
+    void note_use(&self, &Checker ck, &const Place p, uint kind, Span span, &Vec<byte> state, bool report) {
+        uint l = p.local; byte st = *state.get(l as usize).unwrap();
+        var t = self.place_type(&*ck, p);
+        bool through_ref = starts_with_deref(p);
+        if (report) {
+            var what = place_text(&const *ck, &const self.f, p);
+            if (kind == A_DROP) {}
+            else if (st == MOVED) { self.error(&*ck, span, "use of moved value {what}; it was moved earlier", "SNX0501"); }
+            else if (st == UNINIT) { self.error(&*ck, span, "{what} is used before it is assigned", "SNX0501"); }
+            else if ((st & MOVED) != 0) { self.error(&*ck, span, "{what} may have been moved on another path", "SNX0501"); }
+            else if ((st & UNINIT) != 0) { self.error(&*ck, span, "{what} may not be assigned on every path", "SNX0501"); }
+            if (kind == A_MOVE && through_ref && !self.deref_is_raw(&*ck, p) && !is_copy(&*ck, t)) {
+                self.error(&*ck, span, "cannot move {what} out of a reference; it is borrowed, not owned", "SNX0501");
+            }
+            if (kind == A_MOVE && !through_ref && !is_copy(&*ck, t)) {
+                bool indexed = false;
+                for (pr in &const p.proj) { match pr.kind { ProjKind.Index => { indexed = true; }, _ => {} } }
+                if (indexed) {
+                    // The other elements would have no owner left to drop them.
+                    var owner = place_text(&const *ck, &const self.f, &const Place.of(l));
+                    self.error(&*ck, span, "cannot move an element out of {owner}; use swap, pop, or std.mem.replace", "SNX0508");
+                }
+            }
+        }
+        if (kind == A_MOVE && !through_ref) { *state.get_mut(l as usize).unwrap() = MOVED; }
+    }
+    void transfer_block(&self, &Checker ck, uint b, &Vec<byte> state, bool report) {
+        usize ns = self.f.blocks.get(b as usize).unwrap().stmts.len();
+        for (si in 0..ns) {
+            var s = self.f.blocks.get(b as usize).unwrap().stmts.get(si).unwrap().copy();
+            match s.kind {
+                StatementKind.Assign => {
+                    var accesses = self.statement_accesses(&s);
+                    for (a in &const accesses) {
+                        if (access_index(a.kind) == A_WRITE) {
+                            if (starts_with_deref(&const a.place)) { self.note_use(&*ck, &const Place.of(a.place.local), A_READ, s.span, &*state, report); }
+                            continue;
+                        }
+                        self.note_use(&*ck, &const a.place, access_index(a.kind), s.span, &*state, report);
+                    }
+                    if (s.place.is_local()) { *state.get_mut(s.place.local as usize).unwrap() = INIT; }
+                    else if (report && !starts_with_deref(&const s.place) && (*state.get(s.place.local as usize).unwrap() & INIT) == 0) {
+                        var what = place_text(&const *ck, &const self.f, &const s.place);
+                        self.error(&*ck, s.span, "{what} is assigned a field before the whole value is assigned", "SNX0501");
+                    }
+                }
+                StatementKind.StorageDead => { *state.get_mut(s.place.local as usize).unwrap() = UNINIT; }
+                _ => {}
+            }
+        }
+        var t = self.f.blocks.get(b as usize).unwrap().term.copy();
+        var accesses = self.terminator_accesses(&*ck, &t);
+        for (a in &const accesses) {
+            if (access_index(a.kind) == A_WRITE) {
+                if (starts_with_deref(&const a.place)) { self.note_use(&*ck, &const Place.of(a.place.local), A_READ, t.span, &*state, report); }
+                continue;
+            }
+            self.note_use(&*ck, &const a.place, access_index(a.kind), t.span, &*state, report);
+        }
+        match t.kind { TerminatorKind.Call => {
+            if (!t.diverges && !t.dest.is_none() && t.dest.is_local()) { *state.get_mut(t.dest.local as usize).unwrap() = INIT; }
+        }, _ => {} }
+    }
+
+    // ----- drop elaboration -----
+
+    usize predecessors(&const self, uint block) {
+        usize count = 0;
+        for (targets in &const self.succ) { for (t in targets) { if (*t == block) { count += 1; } } }
+        return count;
+    }
+    Vec<Statement> partial_move_drops(&self, &Checker ck, &const Vec<Access> accesses, &const Vec<byte> state, Span span) {
+        Vec<uint> locals = Vec.new();
+        for (a in accesses) {
+            if (access_index(a.kind) != A_MOVE || a.place.is_local() || starts_with_deref(&const a.place)) { continue; }
+            if (*state.get(a.place.local as usize).unwrap() != INIT) { continue; }
+            set_add(&locals, a.place.local);
+        }
+        Vec<Statement> out = Vec.new();
+        for (local in &const locals) {
+            Vec<Place> paths = Vec.new();
+            for (a in accesses) {
+                if (access_index(a.kind) != A_MOVE || a.place.is_local() || starts_with_deref(&const a.place)) { continue; }
+                if (*state.get(a.place.local as usize).unwrap() != INIT || a.place.local != *local) { continue; }
+                paths.push(a.place.copy());
+            }
+            bool whole = false;
+            for (a in accesses) { if (access_index(a.kind) == A_MOVE && a.place.is_local() && a.place.local == *local) { whole = true; } }
+            if (!whole) { self.remaining_parts(&*ck, Place.of(*local), &paths, 0, span, &out); }
+        }
+        return out;
+    }
+    void remaining_parts(&self, &Checker ck, Place prefix, &const Vec<Place> paths, usize depth, Span span, &Vec<Statement> out) {
+        for (p in paths) { if (p.proj.len() == depth) { return; } }
+        var next = paths.get(0).unwrap().proj.get(depth).unwrap(); uint nk = ir.proj_index(next.kind); uint ni = next.index;
+        if (nk == 2 || nk == 1) { return; }
+        if (nk == 3) {
+            for (p in paths) { var step = p.proj.get(depth).unwrap(); if (ir.proj_index(step.kind) != 3 || step.index != ni) { return; } }
+            self.remaining_parts(&*ck, prefix.downcast(ni), paths, depth + 1, span, &*out); return;
+        }
+        var ty = projected_type(&*ck, &const self.f, &prefix);
+        usize count = 0; uint k = ck.tk(ty);
+        if (k == K_TUPLE) { count = ck.n_elems(ty); }
+        else if (k == K_STRUCT) { count = ck.r.program.def(ck.def_of(ty)).fields.len(); }
+        else if (k == K_ENUM && !prefix.proj.is_empty() && ir.proj_index(prefix.proj.get(prefix.proj.len() - 1).unwrap().kind) == 3) {
+            var v = ck.r.program.def(ck.def_of(ty)).variants.get(prefix.proj.get(prefix.proj.len() - 1).unwrap().index as usize).unwrap();
+            count = if (v.tuple_types.is_empty()) { v.fields.len() } else { v.tuple_types.len() };
+        } else { return; }
+        for (j in 0..count) {
+            Vec<Place> below = Vec.new();
+            for (p in paths) { var step = p.proj.get(depth).unwrap(); if (ir.proj_index(step.kind) == 0 && step.index == j as uint) { below.push(p.copy()); } }
+            var part = prefix.field(j as uint);
+            if (!below.is_empty()) { self.remaining_parts(&*ck, part, &below, depth + 1, span, &*out); continue; }
+            if (part_is_copy(&*ck, &const self.f, &part)) { continue; }
+            out.push(Statement.new(StatementKind.Drop, part, span));
+        }
+    }
+    Statement set_flag(&const self, &Checker ck, uint flag, bool value, Span span) {
+        var s = Statement.new(StatementKind.Assign, Place.of(flag), span);
+        var k = Constant.new(ConstantKind.Bool, ck.bool_t()); k.int_value = if (value) { 1 } else { 0 };
+        s.rvalue = Rvalue.use_of(Operand.constant_of(k));
+        return s;
+    }
+    uint flag_of(&const self, &const Vec<Pair> flags, uint local) { for (p in flags) { if (p.key == local) { return p.value; } } return NONE; }
+    void elaborate_drops(&self, &Checker ck) {
+        Vec<Pair> flags = Vec.new();
+        Vec<uint> pending_blocks = Vec.new(); Vec<Vec<Statement>> pending_drops = Vec.new();
+        var drop_locals = set_copy(&self.f.async_drop_locals);
+        for (local in &const drop_locals) {
+            uint index = self.f.locals.len() as uint;
+            var ls = self.f.locals.get(*local as usize).unwrap().span;
+            self.f.locals.push(Local.new(ck.bool_t(), "", false, ls));
+            ir.map_put(&flags, *local, index);
+        }
+        var order = set_copy(&self.rpo);
+        for (b in &const order) {
+            var state = bytes.copy(self.move_in.get(*b as usize).unwrap(), 0, self.move_in.get(*b as usize).unwrap().len());
+            var old = mem.replace(&self.f.blocks.get_mut(*b as usize).unwrap().stmts, Vec.new());
+            Vec<Statement> rewritten = Vec.new();
+            for (s in &const old) {
+                match s.kind {
+                    StatementKind.Drop => {
+                        uint l = s.place.local; byte st = *state.get(l as usize).unwrap();
+                        if (self.f.async_body && s.place.is_local() && self.flag_of(&flags, l) != NONE) {
+                            if ((st & INIT) == 0) { continue; }
+                            var drop = s.copy(); drop.kind = StatementKind.DropIf; drop.flag_local = self.flag_of(&flags, l);
+                            rewritten.push(drop); continue;
+                        }
+                        if (st == INIT) { rewritten.push(s.copy()); }
+                        else if (st == MOVED || st == UNINIT || st == (MOVED | UNINIT)) {}
+                        else {
+                            uint flag = self.flag_of(&flags, l);
+                            if (flag == NONE) {
+                                var ls = self.f.locals.get(l as usize).unwrap().span;
+                                self.f.locals.push(Local.new(ck.bool_t(), "", false, ls));
+                                flag = (self.f.locals.len() - 1) as uint; ir.map_put(&flags, l, flag);
+                            }
+                            var d = s.copy(); d.kind = StatementKind.DropIf; d.flag_local = flag; rewritten.push(d);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                rewritten.push(s.copy());
+                match s.kind {
+                    StatementKind.Assign => {
+                        var accesses = self.statement_accesses(s);
+                        var remaining = self.partial_move_drops(&*ck, &accesses, &state, s.span);
+                        for (a in &const accesses) {
+                            if (access_index(a.kind) == A_MOVE && !starts_with_deref(&const a.place)) { *state.get_mut(a.place.local as usize).unwrap() = MOVED; }
+                        }
+                        for (d in &const remaining) { if (!(s.place.is_local() && s.place.local == d.place.local)) { rewritten.push(d.copy()); } }
+                        if (s.place.is_local()) { *state.get_mut(s.place.local as usize).unwrap() = INIT; }
+                    }
+                    _ => {}
+                }
+            }
+            self.f.blocks.get_mut(*b as usize).unwrap().stmts = rewritten;
+            var t = self.f.blocks.get(*b as usize).unwrap().term.copy();
+            var accesses = self.terminator_accesses(&*ck, &t);
+            var remaining = self.partial_move_drops(&*ck, &accesses, &state, t.span);
+            for (a in &const accesses) {
+                if (access_index(a.kind) == A_MOVE && !starts_with_deref(&const a.place)) { *state.get_mut(a.place.local as usize).unwrap() = MOVED; }
+            }
+            if (!remaining.is_empty()) {
+                bool is_call = ir.terminator_index(t.kind) == 2;
+                bool continuation = is_call && !t.diverges && self.predecessors(t.target) == 1;
+                if (continuation) {
+                    usize at = pending_blocks.len();
+                    for (i in 0..pending_blocks.len()) { if (*pending_blocks.get(i).unwrap() == t.target) { at = i; } }
+                    if (at == pending_blocks.len()) {
+                        // Keep std::map key order for the later insertion.
+                        pending_blocks.push(t.target); pending_drops.push(Vec.new());
+                        usize i = pending_blocks.len() - 1;
+                        while (i > 0 && *pending_blocks.get(i - 1).unwrap() > t.target) { pending_blocks.swap(i, i - 1); pending_drops.swap(i, i - 1); i -= 1; }
+                        at = i;
+                    }
+                    for (d in &const remaining) { pending_drops.get_mut(at).unwrap().push(d.copy()); }
+                } else if (!is_call || !t.diverges) {
+                    for (d in &const remaining) { self.f.blocks.get_mut(*b as usize).unwrap().stmts.push(d.copy()); }
+                }
+            }
+        }
+        for (i in 0..pending_blocks.len()) {
+            uint block = *pending_blocks.get(i).unwrap();
+            var old = mem.replace(&self.f.blocks.get_mut(block as usize).unwrap().stmts, Vec.new());
+            Vec<Statement> merged = Vec.new();
+            for (d in pending_drops.get(i).unwrap()) { merged.push(d.copy()); }
+            for (s in &const old) { merged.push(s.copy()); }
+            self.f.blocks.get_mut(block as usize).unwrap().stmts = merged;
+        }
+        if (self.f.async_body) { self.f.async_drop_flags = Vec.new(); for (p in &const flags) { self.f.async_drop_flags.push(Pair { key: p.key, value: p.value }); } }
+        if (flags.is_empty()) { return; }
+        self.nlocals = self.f.locals.len();
+        for (b in 0..self.f.blocks.len()) {
+            var old = mem.replace(&self.f.blocks.get_mut(b).unwrap().stmts, Vec.new());
+            Vec<Statement> rewritten = Vec.new();
+            if (b == 0) {
+                for (p in &const flags) {
+                    var ls = self.f.locals.get(p.key as usize).unwrap().span;
+                    rewritten.push(self.set_flag(&*ck, p.value, p.key >= 1 && p.key <= self.f.arg_count, ls));
+                }
+            }
+            for (s in &const old) {
+                match s.kind {
+                    StatementKind.Assign => {
+                        var accesses = self.statement_accesses(s);
+                        for (a in &const accesses) {
+                            if (access_index(a.kind) == A_MOVE && !starts_with_deref(&const a.place)) {
+                                uint flag = self.flag_of(&flags, a.place.local);
+                                if (flag != NONE) { rewritten.push(self.set_flag(&*ck, flag, false, s.span)); }
+                            }
+                        }
+                        rewritten.push(s.copy());
+                        if (s.place.is_local()) { uint flag = self.flag_of(&flags, s.place.local); if (flag != NONE) { rewritten.push(self.set_flag(&*ck, flag, true, s.span)); } }
+                        continue;
+                    }
+                    StatementKind.DropIf => { rewritten.push(s.copy()); rewritten.push(self.set_flag(&*ck, s.flag_local, false, s.span)); continue; }
+                    _ => {}
+                }
+                rewritten.push(s.copy());
+            }
+            var t = self.f.blocks.get(b).unwrap().term.copy();
+            var accesses = self.terminator_accesses(&*ck, &t);
+            for (a in &const accesses) {
+                if (access_index(a.kind) == A_MOVE && !starts_with_deref(&const a.place)) {
+                    uint flag = self.flag_of(&flags, a.place.local);
+                    if (flag != NONE) { rewritten.push(self.set_flag(&*ck, flag, false, t.span)); }
+                }
+            }
+            self.f.blocks.get_mut(b).unwrap().stmts = rewritten;
+            match t.kind {
+                TerminatorKind.Call => {
+                    if (!t.diverges && !t.dest.is_none() && t.dest.is_local()) {
+                        uint flag = self.flag_of(&flags, t.dest.local);
+                        if (flag != NONE) {
+                            var target = t.target; var setter = self.set_flag(&*ck, flag, true, t.span);
+                            var old2 = mem.replace(&self.f.blocks.get_mut(target as usize).unwrap().stmts, Vec.new());
+                            Vec<Statement> merged = Vec.new(); merged.push(setter); for (x in &const old2) { merged.push(x.copy()); }
+                            self.f.blocks.get_mut(target as usize).unwrap().stmts = merged;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ----- liveness -----
+
+    void uses_and_defs(&const self, &const Vec<Access> accesses, &Vec<uint> uses, &Vec<uint> defs) {
+        for (a in accesses) {
+            uint k = access_index(a.kind);
+            if ((k == A_WRITE || k == A_DEAD) && a.place.is_local()) { defs.push(a.place.local); } else { uses.push(a.place.local); }
+        }
+    }
+    void apply_backward(&self, &Checker ck, uint b, &Vec<bool> live) {
+        Vec<uint> uses = Vec.new(); Vec<uint> defs = Vec.new();
+        var t = self.f.blocks.get(b as usize).unwrap().term.copy();
+        self.uses_and_defs(&const self.terminator_accesses(&*ck, &t), &uses, &defs);
+        if (ir.terminator_index(t.kind) == 4) { uses.push(0); }
+        for (d in &const defs) { *live.get_mut(*d as usize).unwrap() = false; }
+        for (u in &const uses) { *live.get_mut(*u as usize).unwrap() = true; }
+        usize i = self.f.blocks.get(b as usize).unwrap().stmts.len();
+        while (i > 0) {
+            i -= 1;
+            uses.clear(); defs.clear();
+            var s = self.f.blocks.get(b as usize).unwrap().stmts.get(i).unwrap().copy();
+            self.uses_and_defs(&const self.statement_accesses(&s), &uses, &defs);
+            match s.kind { StatementKind.DropIf => { uses.push(s.flag_local); }, _ => {} }
+            for (d in &const defs) { *live.get_mut(*d as usize).unwrap() = false; }
+            for (u in &const uses) { *live.get_mut(*u as usize).unwrap() = true; }
+        }
+    }
+    void liveness(&self, &Checker ck) {
+        usize nb = self.f.blocks.len(); usize nl = self.nlocals;
+        self.live_in = Vec.new(); Vec<Vec<bool>> live_out = Vec.new();
+        for (b in 0..nb) { Vec<bool> a = Vec.new(); Vec<bool> c = Vec.new(); for (l in 0..nl) { a.push(false); c.push(false); } self.live_in.push(a); live_out.push(c); }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            usize k = self.rpo.len();
+            while (k > 0) {
+                k -= 1; uint b = *self.rpo.get(k).unwrap();
+                Vec<bool> out = Vec.new(); for (l in 0..nl) { out.push(false); }
+                for (s in self.succ.get(b as usize).unwrap()) { for (i in 0..nl) { if (*self.live_in.get(*s as usize).unwrap().get(i).unwrap()) { *out.get_mut(i).unwrap() = true; } } }
+                *live_out.get_mut(b as usize).unwrap() = bools_copy(&out);
+                var live = out;
+                self.apply_backward(&*ck, b, &live);
+                if (!bools_equal(&live, self.live_in.get(b as usize).unwrap())) { *self.live_in.get_mut(b as usize).unwrap() = live; changed = true; }
+            }
+        }
+        self.live_out = live_out;
+    }
+    Vec<Vec<bool>> live_before_points(&self, &Checker ck, uint b) {
+        usize ns = self.f.blocks.get(b as usize).unwrap().stmts.len();
+        Vec<Vec<bool>> out = Vec.new(); for (i in 0..ns + 1) { out.push(Vec.new()); }
+        var live = bools_copy(self.live_out.get(b as usize).unwrap());
+        Vec<uint> uses = Vec.new(); Vec<uint> defs = Vec.new();
+        var t = self.f.blocks.get(b as usize).unwrap().term.copy();
+        self.uses_and_defs(&const self.terminator_accesses(&*ck, &t), &uses, &defs);
+        if (ir.terminator_index(t.kind) == 4) { uses.push(0); }
+        for (d in &const defs) { *live.get_mut(*d as usize).unwrap() = false; }
+        for (u in &const uses) { *live.get_mut(*u as usize).unwrap() = true; }
+        *out.get_mut(ns).unwrap() = bools_copy(&live);
+        usize i = ns;
+        while (i > 0) {
+            i -= 1;
+            uses.clear(); defs.clear();
+            var s = self.f.blocks.get(b as usize).unwrap().stmts.get(i).unwrap().copy();
+            self.uses_and_defs(&const self.statement_accesses(&s), &uses, &defs);
+            match s.kind { StatementKind.DropIf => { uses.push(s.flag_local); }, _ => {} }
+            for (d in &const defs) { *live.get_mut(*d as usize).unwrap() = false; }
+            for (u in &const uses) { *live.get_mut(*u as usize).unwrap() = true; }
+            *out.get_mut(i).unwrap() = bools_copy(&live);
+        }
+        return out;
+    }
+
+    // ----- loans -----
+
+    Vec<TypeId> value_parts(&self, &Checker ck, TypeId t) {
+        Vec<TypeId> parts = Vec.new(); uint k = ck.tk(t);
+        if (k == K_FN && ck.send_of(t)) { return parts; }
+        if (k == K_ARRAY || k == K_SLICE) { parts.push(ck.inner(t)); }
+        if (k == K_FN && ck.ret_of(t).index != NONE) { parts.push(ck.ret_of(t)); }
+        if (k == K_TUPLE || k == K_FN || k == K_STRUCT || k == K_ENUM) { var es = ck.elems(t); for (e in &const es) { parts.push(*e); } }
+        if (k == K_STRUCT) {
+            var def = ck.def_of(t); var s = Subst.new(); usize ne = ck.n_elems(t);
+            for (i in 0..ne) { s.bind(ck.r.program.def(def).generics.get(i).unwrap().type, ck.elem(t, i)); }
+            usize nf = ck.r.program.def(def).fields.len();
+            for (f in 0..nf) { var ft = ck.r.program.def(def).fields.get(f).unwrap().type; parts.push(ck.apply(&s, ft)); }
+        } else if (k == K_ENUM) {
+            var def = ck.def_of(t); var s = Subst.new(); usize ne = ck.n_elems(t);
+            for (i in 0..ne) { s.bind(ck.r.program.def(def).generics.get(i).unwrap().type, ck.elem(t, i)); }
+            usize nv = ck.r.program.def(def).variants.len();
+            for (v in 0..nv) {
+                usize nt = ck.r.program.def(def).variants.get(v).unwrap().tuple_types.len();
+                for (f in 0..nt) { var ft = *ck.r.program.def(def).variants.get(v).unwrap().tuple_types.get(f).unwrap(); parts.push(ck.apply(&s, ft)); }
+                usize nf = ck.r.program.def(def).variants.get(v).unwrap().fields.len();
+                for (f in 0..nf) { var ft = ck.r.program.def(def).variants.get(v).unwrap().fields.get(f).unwrap().type; parts.push(ck.apply(&s, ft)); }
+            }
+        }
+        return parts;
+    }
+    bool type_has_ref(&self, &Checker ck, TypeId t) {
+        ulong root = t.index as ulong;
+        match self.has_refs_cache.get(&root) { Some(v) => return *v, None => {} }
+        Vec<TypeId> work = Vec.new(); work.push(t); HashMap<ulong, bool> seen = HashMap.new();
+        while (!work.is_empty()) {
+            var ty = work.pop().unwrap(); ulong key = ty.index as ulong;
+            if (seen.contains_key(&key)) { continue; }
+            seen.insert(key, true);
+            uint k = ck.tk(ty);
+            if (k == K_REF || k == K_DYN) { self.has_refs_cache.insert(root, true); return true; }
+            if (k == K_FN) { if (!ck.send_of(ty)) { self.has_refs_cache.insert(root, true); return true; } continue; }
+            var parts = self.value_parts(&*ck, ty); for (p in &const parts) { work.push(*p); }
+        }
+        self.has_refs_cache.insert(root, false); return false;
+    }
+    bool external_mutability(&self, &Checker ck, TypeId t) { return loan_carrier_type(&*ck, t, true, false); }
+    /// type_has_ref(place_type(p)), evaluated in that order.
+    bool place_has_ref(&self, &Checker ck, &const Place p) { var t = self.place_type(&*ck, p); return self.type_has_ref(&*ck, t); }
+    bool inner_has_ref(&self, &Checker ck, TypeId t) { var inner = ck.inner(t); return self.type_has_ref(&*ck, inner); }
+    bool inner_stores_reference(&self, &Checker ck, TypeId container, TypeId r) { var inner = ck.inner(container); return self.stores_reference(&*ck, inner, r); }
+    bool stores_reference(&self, &Checker ck, TypeId container, TypeId r) {
+        Vec<TypeId> work = Vec.new(); work.push(container); HashMap<ulong, bool> seen = HashMap.new();
+        while (!work.is_empty()) {
+            var ty = work.pop().unwrap(); ulong key = ty.index as ulong;
+            if (seen.contains_key(&key)) { continue; }
+            seen.insert(key, true);
+            uint k = ck.tk(ty);
+            if (k == K_DYN) { return true; }
+            if (k == K_REF) { if (ck.inner(ty).index == ck.inner(r).index) { return true; } continue; }
+            var parts = self.value_parts(&*ck, ty); for (p in &const parts) { work.push(*p); }
+        }
+        return false;
+    }
+    void loans(&self, &Checker ck, &const Vec<Effects> effects, &const Module m) {
+        for (b in 0..self.f.blocks.len()) {
+            for (s in &const self.f.blocks.get(b).unwrap().stmts) {
+                match s.kind { StatementKind.Assign => {
+                    match s.rvalue.kind { RvalueKind.Ref => {
+                        self.loan_list.push(Loan { place: s.rvalue.place.copy(), is_mut: !s.rvalue.is_const, span: s.span, ref_local: s.place.local, external: false });
+                    }, _ => {} }
+                }, _ => {} }
+            }
+        }
+        for (l in 0..self.nlocals) { self.boundary_origins.push(NONE); self.boundary_stores.push(Vec.new()); }
+        for (local in 1..self.nlocals) {
+            var lt = self.local_type(local as uint);
+            bool candidate = self.f.locals.get(local).unwrap().is_arg || self.f.locals.get(local).unwrap().escape_boundary;
+            if (!candidate || !self.external_mutability(&*ck, lt)) { continue; }
+            var place = if (ck.tk(lt) == K_REF) { Place.of(local as uint).deref() } else { Place.of(local as uint) };
+            Span ls = self.f.locals.get(local).unwrap().span;
+            *self.boundary_origins.get_mut(local).unwrap() = self.loan_list.len() as uint;
+            self.loan_list.push(Loan { place: place, is_mut: true, span: ls, ref_local: local as uint, external: true });
+        }
+        if (self.loan_list.is_empty()) { return; }
+        for (i in 0..self.loan_list.len()) { self.loan_bases.push(Vec.new()); }
+        usize nb = self.f.blocks.len();
+        Vec<Vec<Vec<uint>>> incoming = Vec.new();
+        for (b in 0..nb) { Vec<Vec<uint>> st = Vec.new(); for (l in 0..self.nlocals) { st.push(Vec.new()); } incoming.push(st); }
+        for (local in 0..self.nlocals) {
+            uint origin = *self.boundary_origins.get(local).unwrap();
+            if (origin != NONE && self.f.locals.get(local).unwrap().is_arg) { set_add(incoming.get_mut(0).unwrap().get_mut(local).unwrap(), origin); }
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            self.provenance_changed = false;
+            var order = set_copy(&self.rpo);
+            for (b in &const order) {
+                var state = sets_copy(incoming.get(*b as usize).unwrap());
+                self.transfer_carriers(&*ck, effects, m, *b, &state);
+                var succs = set_copy(self.succ.get(*b as usize).unwrap());
+                for (s in &const succs) {
+                    for (i in 0..self.nlocals) {
+                        if (set_union(incoming.get_mut(*s as usize).unwrap().get_mut(i).unwrap(), state.get(i).unwrap())) { changed = true; }
+                    }
+                }
+            }
+            changed = changed || self.provenance_changed;
+        }
+        self.carriers_in = incoming;
+        var order = set_copy(&self.rpo);
+        for (b in &const order) {
+            var state = sets_copy(self.carriers_in.get(*b as usize).unwrap());
+            var live = self.live_before_points(&*ck, *b);
+            usize ns = self.f.blocks.get(*b as usize).unwrap().stmts.len();
+            for (i in 0..ns) {
+                var s = self.f.blocks.get(*b as usize).unwrap().stmts.get(i).unwrap().copy();
+                var accesses = self.statement_accesses(&s);
+                bool is_drop = match s.kind { StatementKind.Drop => true, StatementKind.DropIf => true, _ => false };
+                self.check_point(&*ck, s.span, &accesses, &state, live.get(i).unwrap(), is_drop);
+                self.step_carriers_stmt(&*ck, &s, &state);
+            }
+            var t = self.f.blocks.get(*b as usize).unwrap().term.copy();
+            var taccesses = self.terminator_accesses(&*ck, &t);
+            self.check_point(&*ck, t.span, &taccesses, &state, live.get(ns).unwrap(), false);
+            if (ir.terminator_index(t.kind) == 4) { self.check_return(&*ck, &state, t.span); }
+            bool suspends = false; for (p in &const self.f.async_suspends) { if (p.key == *b) { suspends = true; } }
+            if (suspends) {
+                Vec<uint> retained = Vec.new();
+                for (local in 1..self.nlocals) { if (*live.get(ns).unwrap().get(local).unwrap()) { set_add(&retained, local as uint); } }
+                Vec<Pair> edges = Vec.new();
+                for (holder in 1..self.nlocals) {
+                    for (id in state.get(holder).unwrap()) {
+                        var loan = self.loan_list.get(*id as usize).unwrap();
+                        if (!loan.external && !starts_with_deref(&const loan.place) && holder as uint != loan.place.local) { pair_add(&edges, holder as uint, loan.place.local); }
+                    }
+                }
+                self.merge_async(*b, &retained, &edges);
+                var cancelled = sets_copy(&state);
+                var drops = set_copy(&self.f.async_drop_locals);
+                for (local in &const drops) {
+                    var held = set_copy(cancelled.get(*local as usize).unwrap());
+                    self.retain_external_aliases(&*ck, &const held, &const held, &cancelled);
+                }
+                self.check_return(&*ck, &cancelled, t.span);
+            }
+            self.step_carriers_term(&*ck, effects, m, &t, &state);
+        }
+    }
+    /// Adds liveness and borrow edges at a suspension block (std::map operator[]).
+    void merge_async(&self, uint block, &const Vec<uint> retained, &const Vec<Pair> edges) {
+        usize at = self.f.async_live.len();
+        for (i in 0..self.f.async_live.len()) { if (self.f.async_live.get(i).unwrap().block == block) { at = i; } }
+        if (at == self.f.async_live.len()) {
+            self.f.async_live.push(ir.LiveSet { block: block, locals: Vec.new() });
+            usize i = self.f.async_live.len() - 1;
+            while (i > 0 && self.f.async_live.get(i - 1).unwrap().block > block) { self.f.async_live.swap(i, i - 1); i -= 1; }
+            at = i;
+        }
+        set_union(&self.f.async_live.get_mut(at).unwrap().locals, retained);
+        usize bt = self.f.async_borrows.len();
+        for (i in 0..self.f.async_borrows.len()) { if (self.f.async_borrows.get(i).unwrap().block == block) { bt = i; } }
+        if (bt == self.f.async_borrows.len()) {
+            self.f.async_borrows.push(ir.BorrowSet { block: block, pairs: Vec.new() });
+            usize i = self.f.async_borrows.len() - 1;
+            while (i > 0 && self.f.async_borrows.get(i - 1).unwrap().block > block) { self.f.async_borrows.swap(i, i - 1); i -= 1; }
+            bt = i;
+        }
+        for (p in edges) { pair_add(&self.f.async_borrows.get_mut(bt).unwrap().pairs, p.key, p.value); }
+    }
+    Vec<uint> operand_loans(&const self, &const Operand o, &const Vec<Vec<uint>> state) {
+        if (o.is_const()) { return Vec.new(); }
+        return set_copy(state.get(o.place.local as usize).unwrap());
+    }
+    uint loan_index_for(&const self, &const Statement s) {
+        for (i in 0..self.loan_list.len()) {
+            var loan = self.loan_list.get(i).unwrap();
+            if (loan.span.start == s.span.start && loan.span.end == s.span.end && loan.ref_local == s.place.local &&
+                overlaps(&const loan.place, &const s.rvalue.place) && loan.place.proj.len() == s.rvalue.place.proj.len()) { return i as uint; }
+        }
+        return NONE;
+    }
+    void retain_in_roots(&self, &Checker ck, uint carrier, &const Vec<uint> receiver_loans, &const Vec<uint> stored, &Vec<Vec<uint>> state, bool erased) {
+        Vec<uint> roots = Vec.new(); set_add(&roots, carrier);
+        for (id in receiver_loans) {
+            var lp = self.loan_list.get(*id as usize).unwrap().place.copy();
+            if (erased || self.place_has_ref(&*ck, &lp)) { set_add(&roots, lp.local); }
+        }
+        for (root in &const roots) {
+            for (id in stored) {
+                if (set_has(receiver_loans, *id)) { continue; }
+                set_add(state.get_mut(*root as usize).unwrap(), *id);
+            }
+        }
+    }
+    void retain_external_aliases(&self, &Checker ck, &const Vec<uint> receiver_loans, &const Vec<uint> stored, &Vec<Vec<uint>> state) {
+        for (id in receiver_loans) {
+            var receiver = self.loan_list.get(*id as usize).unwrap(); bool is_mut = receiver.is_mut; var rp = receiver.place.copy();
+            if (!is_mut || !self.place_has_ref(&*ck, &rp)) { continue; }
+            uint root = rp.local;
+            for (value in stored) {
+                var loan = self.loan_list.get(*value as usize).unwrap();
+                if (loan.place.local != root || starts_with_deref(&const loan.place)) { set_add(state.get_mut(root as usize).unwrap(), *value); }
+            }
+        }
+    }
+    void step_carriers_stmt(&self, &Checker ck, &const Statement s, &Vec<Vec<uint>> state) {
+        match s.kind {
+            StatementKind.StorageDead => { state.get_mut(s.place.local as usize).unwrap().clear(); return; }
+            StatementKind.Drop => { var stored = set_copy(state.get(s.place.local as usize).unwrap()); self.retain_external_aliases(&*ck, &const stored, &const stored, &*state); return; }
+            StatementKind.DropIf => { var stored = set_copy(state.get(s.place.local as usize).unwrap()); self.retain_external_aliases(&*ck, &const stored, &const stored, &*state); return; }
+            StatementKind.Assign => {}
+            _ => return,
+        }
+        Vec<uint> incoming = Vec.new();
+        var r = &const s.rvalue; uint rk = ir.rvalue_index(r.kind);
+        if (rk == 1) {
+            uint id = self.loan_index_for(s);
+            if (id != NONE) { set_add(&incoming, id); }
+            if (starts_with_deref(&const r.place) || self.place_has_ref(&*ck, &const r.place)) {
+                set_union(&incoming, state.get(r.place.local as usize).unwrap());
+                usize derefs = 0; for (pr in &const r.place.proj) { if (ir.proj_index(pr.kind) == 2) { derefs += 1; } }
+                bool within_owner = derefs == 1 || (self.f.closure != NO_CLOSURE && r.place.local == 1);
+                if (id != NONE && starts_with_deref(&const r.place) && within_owner && !self.deref_is_raw(&*ck, &const r.place)) {
+                    var from = set_copy(state.get(r.place.local as usize).unwrap());
+                    bool grew = set_union(self.loan_bases.get_mut(id as usize).unwrap(), &from);
+                    self.provenance_changed = self.provenance_changed || grew;
+                }
+            }
+        } else if (rk == 0 || rk == 4 || rk == 3 || rk == 11 || rk == 8 || rk == 9 || rk == 10) {
+            incoming = self.operand_loans(&const r.a, &*state);
+        } else if (rk == 2) {
+        } else if (rk == 5) {
+            for (e in &const r.elems) { set_union(&incoming, &const self.operand_loans(e, &*state)); }
+            for (e in &const r.captures) { set_union(&incoming, &const self.operand_loans(e, &*state)); }
+        }
+        if (!self.place_has_ref(&*ck, &const s.place)) { incoming.clear(); }
+        if (s.place.is_local()) {
+            uint origin = *self.boundary_origins.get(s.place.local as usize).unwrap();
+            if (origin != NONE) { set_add(&incoming, origin); }
+            var slot = state.get_mut(s.place.local as usize).unwrap(); *slot = incoming;
+        } else if (starts_with_deref(&const s.place) && !self.deref_is_raw(&*ck, &const s.place) && self.place_has_ref(&*ck, &const s.place)) {
+            var receiver_loans = set_copy(state.get(s.place.local as usize).unwrap());
+            self.record_stored_loans(&receiver_loans, &incoming);
+            self.retain_in_roots(&*ck, s.place.local, &receiver_loans, &incoming, &*state, false);
+        } else { set_union(state.get_mut(s.place.local as usize).unwrap(), &incoming); }
+    }
+    void record_stored_loans(&self, &const Vec<uint> roots, &const Vec<uint> values) {
+        for (id in roots) {
+            var loan = self.loan_list.get(*id as usize).unwrap();
+            if (!loan.external) { continue; }
+            uint local = loan.ref_local;
+            bool grew = set_union(self.boundary_stores.get_mut(local as usize).unwrap(), values);
+            self.provenance_changed = self.provenance_changed || grew;
+        }
+    }
+    /// Definition of a callee; the function under check is held outside the module.
+    DefId callee_def(&const self, &const Module m, uint index) {
+        if (index == self.fi) { return self.f.def; }
+        return m.functions.get(index as usize).unwrap().def;
+    }
+    void step_carriers_term(&self, &Checker ck, &const Vec<Effects> effects, &const Module m, &const Terminator t, &Vec<Vec<uint>> state) {
+        if (ir.terminator_index(t.kind) != 2 || t.diverges) { return; }
+        var before = sets_copy(&*state);
+        bool direct = ir.callee_index(t.callee.kind) == 0;
+        bool indirect = ir.callee_index(t.callee.kind) == 2;
+        usize receivers = t.args.len() + (if (indirect) { 1 } else { 0 });
+        for (ri in 0..receivers) {
+            bool is_fn_operand = ri == t.args.len();
+            var receiver = if (is_fn_operand) { t.callee.fn_operand.copy() } else { t.args.get(ri).unwrap().copy() };
+            if (self.use_effects && direct && !is_fn_operand) {
+                if (t.callee.fn_index != NONE && effects.get(t.callee.fn_index as usize).unwrap().present) {
+                    if (!set_has(&const effects.get(t.callee.fn_index as usize).unwrap().writes, ri as uint)) { continue; }
+                }
+            }
+            if (receiver.is_const()) { continue; }
+            var rt = self.place_type(&*ck, &const receiver.place);
+            if (ck.tk(rt) == K_REF) { if (ck.const_of(rt) || !self.inner_has_ref(&*ck, rt)) { continue; } }
+            else if (!self.external_mutability(&*ck, rt)) { continue; }
+            var receiver_loans = self.operand_loans(&receiver, &before);
+            Vec<uint> stored = Vec.new(); Vec<uint> passed_values = Vec.new();
+            for (id in &const receiver_loans) {
+                if (ck.tk(rt) != K_REF || self.loan_list.get(*id as usize).unwrap().ref_local != receiver.place.local) { set_add(&stored, *id); }
+            }
+            for (j in 0..t.args.len()) {
+                if (!is_fn_operand && j == ri) { continue; }
+                var value = t.args.get(j).unwrap();
+                var vt = if (value.is_const()) { value.constant.type } else { self.place_type(&*ck, &const value.place) };
+                if (!self.type_has_ref(&*ck, vt)) { continue; }
+                var loans = self.operand_loans(value, &before);
+                if (ck.tk(rt) == K_REF && ck.tk(vt) == K_REF && self.inner_has_ref(&*ck, vt) && !self.inner_stores_reference(&*ck, rt, vt)) {
+                    for (id in &const loans) {
+                        uint local = self.loan_list.get(*id as usize).unwrap().place.local;
+                        var contents = set_copy(before.get(local as usize).unwrap());
+                        set_union(&stored, &contents); set_union(&passed_values, &contents);
+                    }
+                } else { set_union(&stored, &loans); set_union(&passed_values, &loans); }
+            }
+            self.record_stored_loans(&receiver_loans, &passed_values);
+            bool erased = ck.tk(rt) == K_REF && ck.tk(ck.inner(rt)) == K_DYN;
+            self.retain_in_roots(&*ck, receiver.place.local, &receiver_loans, &stored, &*state, erased);
+            self.retain_external_aliases(&*ck, &receiver_loans, &stored, &*state);
+        }
+        if (t.dest.is_none()) { return; }
+        Vec<uint> incoming = Vec.new();
+        if (self.place_has_ref(&*ck, &const t.dest)) {
+            for (arg in 0..t.args.len()) {
+                var value = t.args.get(arg).unwrap();
+                var vt = if (value.is_const()) { value.constant.type } else { self.place_type(&*ck, &const value.place) };
+                if (!self.type_has_ref(&*ck, vt)) { continue; }
+                if (self.use_effects && direct && t.callee.fn_index != NONE && effects.get(t.callee.fn_index as usize).unwrap().present) {
+                    if (!set_has(&const effects.get(t.callee.fn_index as usize).unwrap().returns, arg as uint)) { continue; }
+                }
+                var loans = self.operand_loans(value, &*state);
+                bool task_poll = false;
+                if (arg == 0 && direct && t.callee.fn_index != NONE) {
+                    var def = self.callee_def(m, t.callee.fn_index);
+                    if (def.index != NONE) {
+                        var d = ck.r.program.def(def);
+                        if (d.is_prelude && d.name == String.from("poll") && check.owner_index(d.owner) == 4 && d.self_type.index != NONE && ck.tk(d.self_type) == K_STRUCT) {
+                            var sd = ck.def_of(d.self_type);
+                            task_poll = same_def(sd, ck.r.program.task_def) || same_def(sd, ck.r.program.send_task_def);
+                        }
+                    }
+                }
+                if (task_poll && !value.is_const()) {
+                    Vec<uint> kept = Vec.new();
+                    for (id in &const loans) {
+                        var loan = self.loan_list.get(*id as usize).unwrap();
+                        if (!loan.external && loan.ref_local == value.place.local) { continue; }
+                        kept.push(*id);
+                    }
+                    loans = kept;
+                }
+                set_union(&incoming, &loans);
+            }
+            if (ir.callee_index(t.callee.kind) == 2) { set_union(&incoming, &const self.operand_loans(&const t.callee.fn_operand, &*state)); }
+        }
+        if (t.dest.is_local()) { *state.get_mut(t.dest.local as usize).unwrap() = incoming; }
+        else if (starts_with_deref(&const t.dest) && !self.deref_is_raw(&*ck, &const t.dest) && self.place_has_ref(&*ck, &const t.dest)) {
+            var receiver_loans = set_copy(state.get(t.dest.local as usize).unwrap());
+            self.retain_in_roots(&*ck, t.dest.local, &receiver_loans, &incoming, &*state, false);
+        } else { set_union(state.get_mut(t.dest.local as usize).unwrap(), &incoming); }
+    }
+    void transfer_carriers(&self, &Checker ck, &const Vec<Effects> effects, &const Module m, uint b, &Vec<Vec<uint>> state) {
+        usize ns = self.f.blocks.get(b as usize).unwrap().stmts.len();
+        for (i in 0..ns) { var s = self.f.blocks.get(b as usize).unwrap().stmts.get(i).unwrap().copy(); self.step_carriers_stmt(&*ck, &s, &*state); }
+        var t = self.f.blocks.get(b as usize).unwrap().term.copy();
+        self.step_carriers_term(&*ck, effects, m, &t, &*state);
+    }
+    void check_point(&self, &Checker ck, Span span, &const Vec<Access> accesses, &const Vec<Vec<uint>> state, &const Vec<bool> live, bool is_drop) {
+        Vec<uint> ids = Vec.new(); Vec<uint> carriers = Vec.new();
+        for (l in 0..self.nlocals) {
+            if (!*live.get(l).unwrap()) { continue; }
+            for (id in state.get(l).unwrap()) { ids.push(*id); carriers.push(l as uint); }
+        }
+        if (ids.is_empty()) { return; }
+        for (a in accesses) {
+            uint ak = access_index(a.kind);
+            for (n in 0..ids.len()) {
+                uint id = *ids.get(n).unwrap(); uint carrier = *carriers.get(n).unwrap();
+                var loan = self.loan_list.get(id as usize).unwrap();
+                if (!overlaps(&const loan.place, &const a.place)) { continue; }
+                if (ak == A_DEAD && a.place.is_local() && starts_with_deref(&const loan.place)) { continue; }
+                bool ends_owner = !loan.external && a.place.is_local() && a.place.local == loan.place.local && (ak == A_MOVE || ak == A_DROP || ak == A_DEAD);
+                if (!ends_owner && (a.place.local == carrier || set_has(state.get(a.place.local as usize).unwrap(), id))) { continue; }
+                var what = place_text(&const *ck, &const self.f, &const loan.place); Span ls = loan.span; bool is_mut = loan.is_mut;
+                if (ak == A_READ) {
+                    if (is_mut) { self.error(&*ck, span, "cannot read {what} while it is borrowed as writable", "SNX0501"); self.note(&*ck, ls, "the writable borrow is here and is still in use"); return; }
+                } else if (ak == A_MOVE) {
+                    self.error(&*ck, span, "cannot move {what} while it is borrowed", "SNX0501"); self.note(&*ck, ls, "the borrow is here and is still in use"); return;
+                } else if (ak == A_WRITE) {
+                    self.error(&*ck, span, "cannot assign to {what} while it is borrowed", "SNX0501"); self.note(&*ck, ls, "the borrow is here and is still in use"); return;
+                } else if (ak == A_SHARED) {
+                    if (is_mut) { self.error(&*ck, span, "cannot borrow {what} as read only while it is borrowed as writable", "SNX0501"); self.note(&*ck, ls, "the writable borrow is here and is still in use"); return; }
+                } else if (ak == A_MUT) {
+                    self.error(&*ck, span, "cannot borrow {what} as writable while it is already borrowed", "SNX0501"); self.note(&*ck, ls, "the other borrow is here and is still in use"); return;
+                } else if (ak == A_DEAD) {
+                    self.error(&*ck, span, "{what} does not live past this scope; a reference is still in use", "SNX0504"); self.note(&*ck, ls, "the borrow is here"); return;
+                } else if (ak == A_DROP) {
+                    if (is_drop) { self.error(&*ck, span, "{what} is dropped while it is still borrowed", "SNX0501"); self.note(&*ck, ls, "the borrow is here and is still in use"); return; }
+                }
+            }
+        }
+    }
+    /// Returns true after reporting an escape.
+    bool check_escape(&self, &Checker ck, &const Vec<Vec<uint>> state, uint local) {
+        uint self_reference = NONE;
+        var escaping = set_copy(state.get(local as usize).unwrap());
+        if (local != 0) { set_union(&escaping, self.boundary_stores.get(local as usize).unwrap()); }
+        for (id in &const escaping) {
+            var loan = self.loan_list.get(*id as usize).unwrap();
+            if (loan.external) { continue; }
+            if (starts_with_deref(&const loan.place)) {
+                uint boundary = if (local != 0) { *self.boundary_origins.get(local as usize).unwrap() } else { NONE };
+                if (local != 0 && boundary != NONE && set_has(self.boundary_stores.get(local as usize).unwrap(), *id)) {
+                    Vec<uint> work = Vec.new(); work.push(*id); Vec<uint> seen = Vec.new();
+                    while (!work.is_empty()) {
+                        uint base = work.pop().unwrap();
+                        if (!set_add(&seen, base)) { continue; }
+                        if (base == boundary) { self_reference = *id; break; }
+                        if (base as usize < self.loan_bases.len()) { for (p in self.loan_bases.get(base as usize).unwrap()) { work.push(*p); } }
+                    }
+                }
+                continue;
+            }
+            var what = place_text(&const *ck, &const self.f, &const loan.place); Span ls = loan.span;
+            self.error(&*ck, ls, "this returns a reference to {what}, which does not live past the function", "SNX0502");
+            return true;
+        }
+        if (self_reference != NONE) {
+            Span ls = self.loan_list.get(self_reference as usize).unwrap().span;
+            self.error(&*ck, ls, "cannot store a reference to an owner inside that same owner; moving it would invalidate the reference", "SNX0506");
+        }
+        return false;
+    }
+    void check_return(&self, &Checker ck, &const Vec<Vec<uint>> state, Span span) {
+        self.check_escape(&*ck, state, 0);
+        for (local in 1..self.nlocals) {
+            var l = self.f.locals.get(local).unwrap(); bool candidate = l.is_arg || l.escape_boundary; var lt = l.type;
+            if (candidate && self.external_mutability(&*ck, lt)) { self.check_escape(&*ck, state, local as uint); }
+        }
+    }
+}
+
+const ulong NO_CLOSURE = 18446744073709551615;
+Vec<bool> bools_copy(&const Vec<bool> values) { Vec<bool> out = Vec.new(); for (v in values) { out.push(*v); } return out; }
+bool bools_equal(&const Vec<bool> a, &const Vec<bool> b) {
+    if (a.len() != b.len()) { return false; }
+    for (i in 0..a.len()) { if (*a.get(i).unwrap() != *b.get(i).unwrap()) { return false; } }
+    return true;
+}
+/// Inserts a pair into a set of pairs ordered like std::set<std::pair>.
+void pair_add(&Vec<Pair> set, uint a, uint b) {
+    for (p in &const *set) { if (p.key == a && p.value == b) { return; } }
+    set.push(Pair { key: a, value: b });
+    usize i = set.len() - 1;
+    while (i > 0) {
+        var prev = set.get(i - 1).unwrap();
+        bool greater = prev.key > a || (prev.key == a && prev.value > b);
+        if (!greater) { break; }
+        set.swap(i, i - 1); i -= 1;
+    }
+}
+bool part_is_copy(&Checker ck, &const Function f, &const Place p) { var t = projected_type(&*ck, f, p); return is_copy(&*ck, t); }

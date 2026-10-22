@@ -1,0 +1,7 @@
+import std.io;
+main() {
+    match io.read_line() {
+        Err(error) => { match error.kind { InvalidUtf8 => print("invalid UTF-8 rejected"), _ => panic("wrong input error") } }
+        Ok(_) => panic("invalid input accepted"),
+    }
+}

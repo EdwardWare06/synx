@@ -1,0 +1,1 @@
+main() { int value=1; int count=32; int result=value << count; if (result != 1) { panic("wrong release shift"); } }

@@ -1,0 +1,134 @@
+/// Files and input run on a separate pool with a fixed worker count.
+import std.task.pool.{BlockingSpawner, Join};
+import std.fs;
+import std.io;
+import std.sync.{Arc, Mutex};
+pub enum Error { Io(fs.IoError), Closed, Cancelled }
+
+async send Result<T, Error> dispatch<T: Send + Owned>(BlockingSpawner pool, fn once send() -> Result<T, fs.IoError> job) {
+    match pool.spawn(job) {
+        Err(_) => return Err(Error.Closed),
+        Ok(handle) => match await handle {
+            Ok(result) => match result { Ok(value) => return Ok(value), Err(error) => return Err(Error.Io(error)) },
+            Err(_) => return Err(Error.Cancelled)
+        }
+    }
+}
+
+pub SendTask<Result<Vec<byte>, Error>> read(BlockingSpawner pool, String path) { return dispatch(pool, send once || fs.read(path)); }
+pub SendTask<Result<String, Error>> read_text(BlockingSpawner pool, String path) { return dispatch(pool, send once || fs.read_text(path)); }
+pub SendTask<Result<bool, Error>> write(BlockingSpawner pool, String path, Vec<byte> bytes) { return dispatch(pool, send once || fs.write(path, bytes)); }
+pub SendTask<Result<bool, Error>> write_text(BlockingSpawner pool, String path, String text) { return dispatch(pool, send once || fs.write_text(path, text)); }
+pub SendTask<Result<String?, Error>> read_line(BlockingSpawner pool) { return dispatch(pool, send once || io.read_line()); }
+
+struct FileState { Mutex<fs.File?> file; }
+pub struct AsyncFile {
+    Arc<FileState> state;
+    BlockingSpawner pool;
+    pub AsyncFile clone(&const self) { return AsyncFile { state: self.state.clone(), pool: self.pool.clone() }; }
+    pub SendTask<Result<AsyncFile, Error>> open(BlockingSpawner pool, String path) { return open_file(pool, path, 0); }
+    pub SendTask<Result<AsyncFile, Error>> create(BlockingSpawner pool, String path) { return open_file(pool, path, 1); }
+    pub SendTask<Result<AsyncFile, Error>> open_read_write(BlockingSpawner pool, String path) { return open_file(pool, path, 2); }
+    pub SendTask<Result<AsyncFile, Error>> append(BlockingSpawner pool, String path) { return open_file(pool, path, 3); }
+    pub SendTask<Result<ulong, Error>> position(&const self) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.position(),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<Vec<byte>, Error>> read_to_end(&const self) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.read_to_end(),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<Vec<byte>, Error>> read(&const self, usize length) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.read(length),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<String, Error>> read_text(&const self) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.read_text(),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<bool, Error>> write(&const self, Vec<byte> bytes) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.write_all(bytes),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<bool, Error>> write_text(&const self, String text) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.write_text(text),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<bool, Error>> flush(&const self) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.flush(),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<bool, Error>> seek(&const self, long offset, fs.SeekFrom origin) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            var guard = state.get().file.lock();
+            match guard.get_mut().as_mut() {
+                Some(file) => return file.seek(offset, origin),
+                None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 })
+            }
+        });
+    }
+    pub SendTask<Result<bool, Error>> close(&const self) {
+        var state = self.state.clone();
+        return dispatch(self.pool.clone(), send once || {
+            fs.File? file = None;
+            { var guard = state.get().file.lock(); file = guard.get_mut().take(); }
+            match file { Some(value) => return value.close(), None => return Err(fs.IoError { kind: fs.ErrorKind.Closed, os_code: 0 }) }
+        });
+    }
+}
+async send Result<AsyncFile, Error> open_file(BlockingSpawner pool, String path, int mode) {
+    var job = pool.spawn(send once || { if (mode == 1) { return fs.File.create(path); } if (mode == 2) { return fs.File.open_read_write(path); } if (mode == 3) { return fs.File.append(path); } return fs.File.open(path); });
+    match job {
+        Err(_) => return Err(Error.Closed),
+        Ok(handle) => match await handle {
+            Err(_) => return Err(Error.Cancelled),
+            Ok(result) => match result {
+                Err(error) => return Err(Error.Io(error)),
+                Ok(file) => return Ok(AsyncFile { state: Arc.new(FileState { file: Mutex.new(Some(file)) }), pool: pool })
+            }
+        }
+    }
+}

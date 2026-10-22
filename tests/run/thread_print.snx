@@ -1,0 +1,10 @@
+import std.thread;
+main() {
+    var handles = Vec<thread.JoinHandle<void>>.new();
+    for (i in 0..4) {
+        match thread.spawn(send once || { for (j in 0..32) { print("complete worker line"); } }) {
+            Ok(handle) => handles.push(handle), Err(_) => panic("spawn failed")
+        }
+    }
+    while (!handles.is_empty()) { handles.pop().unwrap().join(); }
+}

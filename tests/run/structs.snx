@@ -1,0 +1,33 @@
+struct Point {
+    double x;
+    double y;
+
+    double len2(&const self) { return self.x * self.x + self.y * self.y; }
+    void scale(&self, double k) { self.x *= k; self.y *= k; }
+    Point origin() { return Point { x: 0.0, y: 0.0 }; }
+}
+
+enum Token {
+    Number(int),
+    Plus,
+    End,
+}
+
+describe(&const Token t) {
+    return match t {
+        Token.Number(n) => "number {n}",
+        Token.Plus => String.from("plus"),
+        Token.End => String.from("end"),
+    };
+}
+
+main() {
+    var p = Point { x: 3.0, y: 4.0 };
+    p.scale(2.0);
+    var o = Point.origin();
+    print("{p.len2()} {p.x} {o.y}");
+    Token[3] tokens = [Token.Number(4), Token.Plus, Token.End];
+    for (t in &const tokens) { print(describe(t)); }
+    var pair = (1, true);
+    print("{pair.0} {pair.1}");
+}

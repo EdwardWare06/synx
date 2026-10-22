@@ -1,0 +1,6 @@
+import std.thread;
+main() {
+    match thread.spawn<void>(send once || { panic("worker failure"); }) {
+        Ok(handle) => handle.join(), Err(_) => panic("spawn failed")
+    }
+}

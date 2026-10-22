@@ -1,0 +1,41 @@
+/// Axon target settings and symbol naming. Sources: axon.hpp and axon.cpp.
+/// Parity: tests/selfhost_backend_test.cpp, selfhost_backend_0..3.
+/// The driver selects the target OS. Arithmetic and allocation default on.
+import objfile.ObjectFormat;
+import bytes;
+import std.utf8;
+
+pub enum TargetOs { Linux, Windows, MacOs }
+pub struct Target {
+    pub TargetOs os;
+    pub bool register_allocation;
+    pub bool checked_arithmetic;
+    pub Target new(TargetOs os) { return Target { os: os, register_allocation: true, checked_arithmetic: true }; }
+    pub ObjectFormat format(&const self) {
+        match self.os { Linux => return ObjectFormat.Elf, Windows => return ObjectFormat.Coff, MacOs => return ObjectFormat.MachO }
+    }
+    pub bool win64_abi(&const self) { match self.os { Windows => return true, _ => return false } }
+    pub &const str name(&const self) {
+        match self.os { Linux => return "x86_64-linux", Windows => return "x86_64-windows", MacOs => return "x86_64-macos" }
+    }
+}
+
+/// Returns an owned linker name. Non-ASCII and punctuation bytes become '_'.
+/// An eight-digit FNV-1a suffix distinguishes names with equal plain prefixes.
+pub String symbol_for(&const str ir_name) {
+    Vec<byte> out = Vec.new(); bytes.text(&out, "synx_");
+    uint hash = 2166136261;
+    for (i in 0..ir_name.len()) {
+        byte ch = unsafe { *((ir_name.as_ptr() as usize + i) as *const byte) };
+        bool ascii = (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57);
+        out.push(if (ascii) { ch } else { 95 });
+        hash ^= ch as uint;
+        hash = ((hash as ulong * 16777619) & 4294967295) as uint;
+    }
+    out.push(95);
+    for (i in 0..8) {
+        byte digit = ((hash >> ((7 - i) * 4)) & 15) as byte;
+        out.push(if (digit < 10) { 48 + digit } else { 97 + digit - 10 });
+    }
+    return utf8.decode(out).unwrap();
+}

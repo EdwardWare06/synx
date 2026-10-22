@@ -1,0 +1,88 @@
+import std.fs;
+import std.fs.{File, IoError, ErrorKind, SeekFrom};
+import std.binary;
+import std.utf8;
+
+T ok<T>(Result<T, IoError> result) {
+    match result { Ok(value) => return value, Err(_) => panic("unexpected I/O error") }
+}
+void require(bool value) { if (!value) { panic("file test failed"); } }
+void same(&const Vec<byte> left, &const Vec<byte> right) {
+    require(left.len() == right.len());
+    for (i in 0..left.len()) {
+        match left.get(i) { Some(a) => { match right.get(i) { Some(b) => require(*a == *b), None => panic("missing byte") } } None => panic("missing byte") }
+    }
+}
+main() {
+    Vec<byte> bytes = Vec.new();
+    bytes.push(0); bytes.push(13); bytes.push(10); bytes.push(255);
+    for (i in 0..1048576) { bytes.push((i & 255) as byte); }
+    ok(fs.write("roundtrip.bin", bytes));
+    { var copy = ok(fs.read("roundtrip.bin")); same(bytes, copy); }
+    {
+        var file = ok(File.open("roundtrip.bin"));
+        require(file.write_text("forbidden").is_err());
+        require(file.seek(-1, SeekFrom.Start).is_err());
+        require(ok(file.position()) == 0);
+        { var empty = ok(file.read(0)); require(empty.is_empty()); }
+        { var head = ok(file.read(4)); require(head.len() == 4); }
+        require(ok(file.position()) == 4);
+        ok(file.seek(-2, SeekFrom.End));
+        { var tail = ok(file.read(20)); require(tail.len() == 2); }
+        { var eof = ok(file.read(1)); require(eof.is_empty()); }
+        ok(file.seek(0, SeekFrom.Start));
+        { var again = ok(file.read(1)); require(again.len() == 1); }
+        ok(file.close());
+    }
+    {
+        var file = ok(File.open_read_write("roundtrip.bin"));
+        ok(file.seek(1, SeekFrom.Start)); ok(file.write_text("X")); ok(file.flush());
+        ok(file.seek(1, SeekFrom.Start));
+        { var one = ok(file.read_exact(1)); match one.get(0) { Some(b) => require(*b == 88), None => panic("overwrite failed") } }
+        ok(file.write_text("Y"));
+        { var next = ok(file.read(1)); require(next.len() == 1); }
+        ok(file.seek(0, SeekFrom.End));
+        match file.read_exact(1) { Err(e) => { match e.kind { UnexpectedEof => {} _ => panic("wrong EOF error") } } Ok(_) => panic("EOF accepted") }
+    }
+    ok(fs.remove("roundtrip.bin"));
+    { var file = ok(File.create("direction.bin")); require(file.read(1).is_err()); }
+    ok(fs.remove("direction.bin"));
+    require(fs.read(".").is_err());
+    ok(fs.write_text("synx-é-🧠.txt", "héllo 🧠\r\n"));
+    { var file = ok(File.append("synx-é-🧠.txt")); ok(file.write_text("tail")); ok(file.flush()); }
+    { var text = ok(fs.read_text("synx-é-🧠.txt")); require(text == String.from("héllo 🧠\r\ntail")); }
+    ok(fs.remove("synx-é-🧠.txt"));
+    require(File.open("missing-file").is_err());
+    match File.open("missing-file") { Err(e) => { match e.kind { NotFound => {} _ => panic("wrong error") } } Ok(_) => panic("missing file opened") }
+    match File.create("bad\0path") { Err(e) => { match e.kind { InvalidInput => {} _ => panic("wrong path error") } } Ok(_) => panic("NUL path accepted") }
+    Vec<byte> invalid = Vec.new();
+    invalid.push(192); invalid.push(128); require(utf8.decode(invalid).is_none());
+    ok(fs.write("invalid.bin", invalid));
+    match fs.read_text("invalid.bin") { Err(e) => { match e.kind { InvalidUtf8 => {} _ => panic("wrong text error") } } Ok(_) => panic("invalid text accepted") }
+    ok(fs.remove("invalid.bin"));
+    invalid.clear(); invalid.push(237); invalid.push(160); invalid.push(128); require(utf8.decode(invalid).is_none());
+    invalid.clear(); invalid.push(244); invalid.push(144); invalid.push(128); invalid.push(128); require(utf8.decode(invalid).is_none());
+    invalid.clear(); invalid.push(240); invalid.push(159); require(utf8.decode(invalid).is_none());
+    invalid.clear(); invalid.push(128); require(utf8.decode(invalid).is_none());
+    Vec<byte> encoded = Vec.new();
+    require(binary.write_uint(&encoded, 18446744073709551615, 8, true));
+    require(binary.write_uint(&encoded, 305419896, 4, false));
+    require(!binary.write_uint(&encoded, 256, 1, true));
+    require(encoded.len() == 12);
+    require(!binary.write_uint(&encoded, 0, 0, true));
+    require(!binary.write_uint(&encoded, 0, 9, true));
+    for (width in (1 as usize)..(9 as usize)) {
+        ulong maximum = if (width == 8) { 18446744073709551615 } else { (1 as ulong << (width * 8)) - 1 };
+        for (endian in 0..2) {
+            Vec<byte> sample = Vec.new();
+            require(binary.write_uint(&sample, maximum, width, endian == 0));
+            match binary.read_uint(sample, 0, width, endian == 0) { Some(n) => require(n == maximum), None => panic("width decode failed") }
+            if (width < 8) { require(!binary.write_uint(&sample, maximum + 1, width, endian == 0)); require(sample.len() == width); }
+        }
+    }
+    match binary.read_uint(encoded, 0, 8, true) { Some(n) => require(n == 18446744073709551615), None => panic("decode failed") }
+    match binary.read_uint(encoded, 8, 4, false) { Some(n) => require(n == 305419896), None => panic("decode failed") }
+    require(binary.read_uint(encoded, 18446744073709551615, 8, true).is_none());
+    require(binary.read_uint(encoded, 12, 1, true).is_none());
+    print("files and binary ok");
+}

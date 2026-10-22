@@ -1,0 +1,126 @@
+/// Checked ELF64 x86-64 relocatable input. Unsupported live records fail.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
+import link.model;
+import link.reader;
+import link.buffer;
+import std.utf8;
+struct Header { ulong kind; ulong flags; ulong offset; ulong size; usize link; usize info; ulong alignment; ulong entry_size; }
+Failure bad(usize at) { return model.fail(Code.Invalid, 0, at); }
+Failure unsupported(usize at) { return model.fail(Code.Unsupported, 0, at); }
+Result<ulong, Failure> word(&const Vec<byte> data, usize at, usize size) {
+    return match reader.word(data, at, size, true) { Ok(value) => Ok(value), Err(error) => Err(bad(error.offset)) };
+}
+Result<bool, Failure> extent(&const Vec<byte> data, ulong at, ulong size) {
+    if (at > data.len() as ulong || size > data.len() as ulong - at) { return Err(bad(0)); } return Ok(true);
+}
+Result<Vec<byte>, Failure> copy(&const Vec<byte> data, ulong at, ulong size) {
+    var checked = extent(data, at, size)?;
+    return match reader.copy(data, at as usize, size as usize) { Ok(value) => Ok(value), Err(error) => Err(bad(error.offset)) };
+}
+Result<Vec<byte>, Failure> name(&const Vec<byte> data, &const Header strings, ulong offset) {
+    if (offset >= strings.size) { return Err(bad(offset as usize)); }
+    ulong start = strings.offset + offset; ulong end = start;
+    while (end < strings.offset + strings.size) {
+        if (*data.get(end as usize).unwrap() == 0) { return copy(data, start, end - start); } end += 1;
+    } return Err(bad(start as usize));
+}
+pub Result<Object, Failure> read(&const Vec<byte> data, &const str object_name, bool archive_member) {
+    if (data.len() < 64 || data.len() as ulong > buffer.LIMIT) { return Err(bad(0)); }
+    if (word(data, 0, 4)? != 0x464c457f || word(data, 4, 1)? != 2 || word(data, 5, 1)? != 1 || word(data, 6, 1)? != 1) { return Err(unsupported(0)); }
+    if (word(data, 16, 2)? != 1 || word(data, 18, 2)? != 62 || word(data, 20, 4)? != 1) { return Err(unsupported(16)); }
+    if (word(data, 52, 2)? != 64 || word(data, 58, 2)? != 64 || word(data, 48, 4)? != 0) { return Err(unsupported(48)); }
+    ulong table = word(data, 40, 8)?; usize count = word(data, 60, 2)? as usize; usize section_names = word(data, 62, 2)? as usize;
+    if (count == 0 || count >= 0xff00 || section_names == 65535) { return Err(unsupported(60)); }
+    var table_extent = extent(data, table, count as ulong * 64)?;
+    if (section_names >= count) { return Err(bad(62)); }
+    Vec<Header> headers = Vec.new(); usize symtab = 18446744073709551615 as usize;
+    for (i in 0..count) {
+        usize at = table as usize + i * 64;
+        ulong kind = word(data, at + 4, 4)?; ulong flags = word(data, at + 8, 8)?;
+        ulong offset = word(data, at + 24, 8)?; ulong size = word(data, at + 32, 8)?; ulong alignment = word(data, at + 48, 8)?;
+        if (alignment != 0 && (alignment & (alignment - 1)) != 0) { return Err(bad(at + 48)); }
+        if (kind != 8) { var checked = extent(data, offset, size)?; }
+        if (kind == 2) { if (symtab != 18446744073709551615 as usize) { return Err(unsupported(i)); } symtab = i; }
+        if (kind == 17 || (flags & 2 != 0 && flags & ~(0x37 as ulong) != 0)) { return Err(unsupported(i)); }
+        if (flags & 2 != 0 && kind != 1 && kind != 8) { return Err(unsupported(i)); }
+        headers.push(Header { kind: kind, flags: flags, offset: offset, size: size, link: word(data, at + 40, 4)? as usize,
+            info: word(data, at + 44, 4)? as usize, alignment: alignment, entry_size: word(data, at + 56, 8)? });
+    }
+    if (headers.get(0).unwrap().kind != 0) { return Err(bad(0)); }
+    if (section_names != 0) {
+        var strings = headers.get(section_names).unwrap(); if (strings.kind != 3) { return Err(bad(section_names)); }
+        ulong scanned = 0;
+        for (i in 0..count) {
+            var checked_name = name(data, strings, word(data, table as usize + i * 64, 4)?)?;
+            if (checked_name.len() as ulong > buffer.LIMIT - scanned) { return Err(bad(i)); }
+            scanned += checked_name.len() as ulong;
+        }
+    }
+    var out = Object.new(object_name, archive_member); Vec<usize?> sections = Vec.new(); ulong total = 0;
+    for (i in 0..count) {
+        var header = headers.get(i).unwrap(); if (header.flags & 2 == 0) { sections.push(None); continue; }
+        ulong alignment = if (header.alignment == 0) { 1 } else { header.alignment };
+        if (alignment > 4096 || header.size > buffer.LIMIT - total) { return Err(unsupported(i)); } total += header.size;
+        sections.push(Some(out.sections.len()));
+        if (header.kind == 8) { if (header.flags & 4 != 0) { return Err(unsupported(i)); } out.sections.push(Section.bss(header.size, alignment)); }
+        else {
+            SectionKind kind = if (header.flags & 4 != 0) { SectionKind.Text } else { if (header.flags & 1 != 0) { SectionKind.Data } else { SectionKind.ReadOnly } };
+            if (header.flags & 5 == 5) { return Err(unsupported(i)); }
+            out.sections.push(Section.new(kind, alignment, copy(data, header.offset, header.size)?));
+        }
+    }
+    if (symtab == 18446744073709551615 as usize) { return Err(bad(0)); }
+    var symbols = headers.get(symtab).unwrap();
+    if (symbols.entry_size != 24 || symbols.size % 24 != 0 || symbols.size == 0 || symbols.link >= count || symbols.size / 24 > 1048576) { return Err(bad(symtab)); }
+    var strings = headers.get(symbols.link).unwrap();
+    if (strings.kind != 3 || strings.size == 0 || *data.get(strings.offset as usize).unwrap() != 0) { return Err(bad(symbols.link)); }
+    usize symbol_count = (symbols.size / 24) as usize; if (symbols.info > symbol_count) { return Err(bad(symtab)); }
+    Vec<usize?> symbol_map = Vec.new(); ulong name_bytes = 0;
+    for (i in 0..symbol_count) {
+        usize at = symbols.offset as usize + i * 24;
+        ulong name_offset = word(data, at, 4)?; ulong info = word(data, at + 4, 1)?; ulong other = word(data, at + 5, 1)?;
+        usize section = word(data, at + 6, 2)? as usize; ulong value = word(data, at + 8, 8)?; ulong size = word(data, at + 16, 8)?;
+        if (i == 0) {
+            if (name_offset != 0 || info != 0 || other != 0 || section != 0 || value != 0 || size != 0) { return Err(bad(at)); }
+            symbol_map.push(None); continue;
+        }
+        var raw_name = name(data, strings, name_offset)?;
+        if (raw_name.len() as ulong > buffer.LIMIT - name_bytes) { return Err(bad(at)); } name_bytes += raw_name.len() as ulong;
+        ulong binding = info >> 4; ulong kind = info & 15;
+        if (kind == 4) { if (binding != 0 || section != 65521) { return Err(bad(at)); } symbol_map.push(None); continue; }
+        if (section != 0 && section < count) { if (sections.get(section).unwrap().is_none()) { symbol_map.push(None); continue; } }
+        if (binding > 1 || kind > 3 || other & 252 != 0) { return Err(unsupported(i)); }
+        if ((i < symbols.info && binding != 0) || (i >= symbols.info && binding == 0)) { return Err(bad(at)); }
+        Binding normalized_binding = if (binding == 0) { Binding.Local } else { Binding.Global };
+        Definition definition = Definition.Undefined;
+        if (section == 0) { if (binding == 0 || value != 0) { return Err(bad(i)); } }
+        else if (section == 65521) { definition = Definition.Absolute(value); }
+        else {
+            if (section >= count) { return Err(unsupported(i)); }
+            usize mapped = (*sections.get(section).unwrap()).unwrap(); var target = out.sections.get(mapped).unwrap();
+            if (value > target.size || size > target.size - value) { return Err(bad(i)); }
+            definition = Definition.Section(mapped, value);
+        }
+        if (raw_name.is_empty()) { if (kind != 3 || binding != 0) { return Err(bad(i)); } raw_name = utf8.encode("$section:{i}"); }
+        symbol_map.push(Some(out.symbols.len())); out.symbols.push(Symbol { name: raw_name, binding: normalized_binding, definition: definition });
+    }
+    ulong relocation_count = 0;
+    for (i in 0..count) {
+        var header = headers.get(i).unwrap(); if (header.kind != 4 && header.kind != 9) { continue; }
+        if (header.info >= count || header.link >= count) { return Err(bad(i)); }
+        var target_map = *sections.get(header.info).unwrap(); if (target_map.is_none()) { continue; }
+        if (header.kind != 4) { return Err(unsupported(i)); }
+        if (header.link != symtab || header.entry_size != 24 || header.size % 24 != 0) { return Err(bad(i)); }
+        if (header.size / 24 > 1048576 - relocation_count) { return Err(bad(i)); } relocation_count += header.size / 24;
+        for (j in 0..(header.size / 24) as usize) {
+            usize at = header.offset as usize + j * 24; ulong offset = word(data, at, 8)?;
+            ulong info = word(data, at + 8, 8)?; ulong raw_addend = word(data, at + 16, 8)?;
+            ulong kind = info & 0xffffffff; usize symbol = (info >> 32) as usize;
+            if (symbol >= symbol_map.len()) { return Err(bad(at)); } if (kind == 0) { continue; }
+            RelocKind normalized = match kind { 1 => RelocKind.Abs64, 2 => RelocKind.Pc32, 4 => RelocKind.Pc32, 10 => RelocKind.Abs32, 11 => RelocKind.Signed32, _ => return Err(unsupported(at)) };
+            var mapped_symbol = *symbol_map.get(symbol).unwrap(); if (mapped_symbol.is_none()) { return Err(unsupported(at)); }
+            out.relocations.push(Relocation { section: target_map.unwrap(), offset: offset, symbol: mapped_symbol.unwrap(), kind: normalized, addend: raw_addend as long });
+        }
+    }
+    var valid = model.validate(out, 0)?; return Ok(out);
+}

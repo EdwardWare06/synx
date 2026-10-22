@@ -1,0 +1,2 @@
+pub struct S { fn() -> int callback; }
+pub S make() { return S { callback: || 1 }; }

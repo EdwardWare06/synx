@@ -1,0 +1,291 @@
+/// Module discovery and import binding. Source: compiler/src/modules.cpp.
+/// Parity: tests/selfhost_modules_test.cpp.
+/// Discovery is depth first. File identity breaks cycles and hard-link aliases.
+/// Binding runs to a fixed point. Namespace overlays belong to one importer.
+/// Sources and syntax trees remain owned by file ID until all passes finish.
+import ast;
+import ids.{ModuleId, NONE};
+import defs.{Symbol, ModuleDef, IndexMap, SymbolTable};
+import defs;
+import declare.Resolver;
+import resolve;
+import source.{SourceFile, Span};
+import diagnostics.DiagnosticSink;
+import parser.Parser;
+import lexer;
+import bytes;
+import std.fs;
+import std.path.{Path, Style, host_style};
+import std.text;
+import std.env;
+import std.mem;
+
+pub struct ImportSpec { pub Span span; pub ast.Path path; pub Vec<ast.PathSegment> names; pub bool is_pub; }
+pub struct Import { pub ModuleId from; pub ModuleId target; pub ImportSpec spec; pub usize consumed; pub bool done; }
+struct View { ModuleId owner; String name; ModuleId module; }
+ImportSpec copy_import(&const ast.Item item) {
+    var path = ast.empty_path(); path.span = item.path.span;
+    for (s in &const item.path.segments) { path.segments.push(ast.PathSegment { span: s.span, name: bytes.copy(s.name, 0, s.name.len()) }); }
+    Vec<ast.PathSegment> names = Vec.new(); for (s in &const item.names) { names.push(ast.PathSegment { span: s.span, name: bytes.copy(s.name, 0, s.name.len()) }); }
+    return ImportSpec { span: item.span, path: path, names: names, is_pub: item.is_pub };
+}
+pub String prefix(&const ast.Path path, usize count) {
+    var name = String.new(); for (i in 0..count) { if (i != 0) { name.push('.'); } var s = defs.name(path.segments.get(i).unwrap().name); name.push_str(s); } return name;
+}
+String display_path(&const str path) {
+    match host_style() { Style.Windows => return text.replace(path, "\\", "/"), Style.Unix => return String.from(path) }
+}
+String joined(&const str base, &const str child) { var p = Path.from(base).join(child); return String.from(p.as_str()); }
+Result<bool, fs.IoError> regular(&const str path) {
+    match fs.metadata(path) { Ok(m) => return Ok(m.is_file), Err(error) => { match error.kind { fs.ErrorKind.NotFound => return Ok(false), _ => return Err(error) } } }
+}
+Result<String, fs.IoError> canonical_key(&const str path) {
+    var raw = fs.canonicalize(path)?;
+    var normalized = Path.from(raw).normalize(); var value = String.from(normalized.as_str());
+    // Windows host service returns an extended path. std::filesystem does not.
+    if (value.starts_with("//?/UNC/")) {
+        var tail = unsafe { str_from_raw((value.as_str().as_ptr() as usize + 8) as *const byte, value.len() - 8) }; return Ok("//{tail}");
+    }
+    if (value.starts_with("//?/")) { return Ok(String.from(unsafe { str_from_raw((value.as_str().as_ptr() as usize + 4) as *const byte, value.len() - 4) })); }
+    return Ok(value);
+}
+/// SYNX_STD_PATH takes priority; fallback_root is the configured source tree.
+pub Result<String, fs.IoError> standard_library(&const str fallback_root) {
+    match env.get("SYNX_STD_PATH")? { Some(path) => {
+        bool use = true; match host_style() { Style.Windows => { use = !path.is_empty(); }, _ => {} }
+        if (use) { return Ok(path); }
+    }, None => {} }
+    match env.exe_path() { Ok(exe) => {
+        var dir = Path.from(exe).parent().unwrap();
+        for (up in 0..4) { var candidate = dir.join("std"); var io = candidate.join("io.snx"); if (regular(io.as_str())?) { return Ok(String.from(candidate.as_str())); }
+            match dir.parent() { Some(parent) => { dir = parent; }, None => {} }
+        }
+    }, _ => {} }
+    var io = joined(fallback_root, "io.snx"); if (regular(io)?) { return Ok(String.from(fallback_root)); } return Ok(String.new());
+}
+pub struct ModuleLoader {
+    pub Resolver resolver;
+    pub Vec<SourceFile> sources;
+    pub Vec<ast.Ast> trees;
+    pub DiagnosticSink prelude_sink;
+    pub bool host_failed;
+    Span error_span;
+    String root;
+    String std_root;
+    IndexMap names;
+    IndexMap files;
+    Vec<View> views;
+    Vec<Import> imports;
+    pub ModuleLoader new(SourceFile user, SourceFile prelude, String std_root) {
+        user.id = 0; prelude.id = 1;
+        bool failed = false; String path = String.new();
+        match fs.absolute(user.path()) { Ok(value) => { path = value; }, Err(_) => { failed = true; } }
+        var absolute = Path.from(path);
+        String root = String.new(); match absolute.parent() { Some(parent) => { root = display_path(parent.as_str()); }, None => {} }
+        Vec<SourceFile> sources = Vec.new(); sources.push(user); sources.push(prelude);
+        Vec<ast.Ast> trees = Vec.new(); trees.push(ast.Ast.new()); trees.push(ast.Ast.new());
+        return ModuleLoader { resolver: Resolver.new(), sources: sources, trees: trees, prelude_sink: DiagnosticSink.new(),
+            host_failed: failed, error_span: defs.zero_span(), root: root, std_root: display_path(std_root), names: IndexMap.new(), files: IndexMap.new(), views: Vec.new(), imports: Vec.new() };
+    }
+    void filesystem_failure(&self) {
+        self.host_failed = true;
+        self.resolver.sink.error(self.error_span, "module filesystem operation failed", "SNX0303");
+    }
+    bool regular(&self, &const str path) {
+        match regular(path) { Ok(value) => return value, Err(_) => { self.filesystem_failure(); return false; } }
+    }
+    ast.Ast parse(&self, uint file, bool prelude) {
+        var sink = if (prelude) { mem.replace(&self.prelude_sink, DiagnosticSink.new()) } else { mem.replace(&self.resolver.sink, DiagnosticSink.new()) };
+        var source = self.sources.get(file as usize).unwrap(); var tokens = lexer.tokenize(source, &sink);
+        var parser = Parser.new(source, tokens, sink); parser.parse_module();
+        if (prelude) { self.prelude_sink = mem.replace(&parser.sink, DiagnosticSink.new()); }
+        else { self.resolver.sink = mem.replace(&parser.sink, DiagnosticSink.new()); }
+        return mem.replace(&parser.ast, ast.Ast.new());
+    }
+    ModuleId scope(&self, &const str name) {
+        uint found = self.names.get(name); if (found != NONE) { return ModuleId { index: found }; }
+        var id = ModuleId { index: self.resolver.program.modules.len() as uint };
+        self.resolver.program.modules.push(ModuleDef.new(name)); self.names.put(name, id.index); return id;
+    }
+    ModuleId view(&self, ModuleId owner, &const str name, ModuleId base) {
+        for (v in &const self.views) {
+            if (v.owner.index != owner.index || v.name != String.from(name)) { continue; }
+            ModuleId id = v.module;
+            if (base.index != NONE) {
+                for (route in &const self.resolver.program.module(id).symbols.entries) {
+                    match self.resolver.program.module_find(base, route.name) { Some(existing) => {
+                        if (existing.symbol.kind != 6) { self.resolver.sink.error(route.symbol.span, "module namespace conflicts with '{route.name}'", "SNX0302"); }
+                    }, None => {} }
+                }
+                self.resolver.program.module_mut(id).base_module = base;
+            }
+            return id;
+        }
+        var d = ModuleDef.new(name); d.namespace_owner = owner; d.base_module = base;
+        var id = ModuleId { index: self.resolver.program.modules.len() as uint }; self.resolver.program.modules.push(d);
+        self.views.push(View { owner: owner, name: String.from(name), module: id }); return id;
+    }
+    ModuleId load(&self, &const str name, &const str path, Span span) {
+        String canonical = String.new();
+        match canonical_key(path) { Ok(value) => { canonical = value; }, Err(_) => { self.filesystem_failure(); return ModuleId.none(); } }
+        uint found = self.files.get(canonical);
+        if (found != NONE) { self.names.put(name, found); return ModuleId { index: found }; }
+        for (entry in &const self.files.entries) {
+            match fs.same_file(path, entry.name) { Ok(true) => { self.names.put(name, entry.index); return ModuleId { index: entry.index }; }, _ => {} }
+        }
+        uint file = self.sources.len() as uint;
+        var source = SourceFile.load(path, file);
+        match source {
+            Err(_) => { self.resolver.sink.error(span, "cannot read module '{name}'", "SNX0303"); return ModuleId.none(); }
+            Ok(value) => { self.sources.push(value); self.trees.push(ast.Ast.new()); }
+        }
+        var tree = self.parse(file, false); var module = self.scope(name); self.resolver.program.module_mut(module).file = file;
+        self.files.put(canonical, module.index); self.visit(module, tree); return module;
+    }
+    void visit(&self, ModuleId module, ast.Ast tree) {
+        self.resolver.declare_module(tree, module, false);
+        Vec<ImportSpec> requests = Vec.new(); for (item in &const tree.items) { match item.kind { ast.ItemKind.Import => requests.push(copy_import(item)), _ => {} } }
+        uint file = self.resolver.program.module(module).file; *self.trees.get_mut(file as usize).unwrap() = tree;
+        for (request in &const requests) { self.discover(module, request); if (self.host_failed) { break; } }
+    }
+    void discover(&self, ModuleId module, &const ImportSpec request) {
+        ModuleId target = ModuleId.none(); usize consumed = 0; usize n = request.path.segments.len();
+        while (n > 0) {
+            var name = prefix(request.path, n);
+            if (name == String.from("std.prelude")) { target = self.scope(name); consumed = n; break; }
+            bool standard = bytes.equals(request.path.segments.get(0).unwrap().name, "std");
+            if (standard && self.std_root.is_empty()) { self.resolver.sink.error(request.span, "standard library not found", "SNX0303"); break; }
+            var relative = String.new(); usize first = if (standard) { 1 } else { 0 };
+            for (i in first..n) { if (!relative.is_empty()) { relative.push('/'); } var part = defs.name(request.path.segments.get(i).unwrap().name); relative.push_str(part); }
+            if (relative.is_empty()) { n -= 1; continue; }
+            var base = joined(if (standard) { self.std_root.as_str() } else { self.root.as_str() }, relative);
+            var file = "{base}.snx"; bool is_file = self.regular(file); if (self.host_failed) { return; }
+            if (!is_file) { file = joined(base, "mod.snx"); }
+            is_file = self.regular(file); if (self.host_failed) { return; }
+            if (!is_file) { n -= 1; continue; }
+            target = self.load(name, file, request.span); consumed = n; break;
+        }
+        if (self.host_failed) { return; }
+        if (target.index == NONE) { var name = prefix(request.path, request.path.segments.len()); self.resolver.sink.error(request.span, "cannot find imported module '{name}'", "SNX0303"); return; }
+        // Each pending import owns its AST fields; later discovery can grow arenas.
+        var path = ast.empty_path(); path.span = request.path.span;
+        for (s in &const request.path.segments) { path.segments.push(ast.PathSegment { span: s.span, name: bytes.copy(s.name, 0, s.name.len()) }); }
+        Vec<ast.PathSegment> names = Vec.new(); for (s in &const request.names) { names.push(ast.PathSegment { span: s.span, name: bytes.copy(s.name, 0, s.name.len()) }); }
+        self.imports.push(Import { from: module, target: target, spec: ImportSpec { span: request.span, path: path, names: names, is_pub: request.is_pub }, consumed: consumed, done: false });
+    }
+    bool put(&self, ModuleId module, &const str name, Symbol symbol, Span span, bool exported) {
+        var value = symbol; value.is_pub = exported;
+        match self.resolver.program.module(module).symbols.get(name) {
+            Some(old) => {
+                if (old.same(value)) { value = old; value.is_pub = old.is_pub || exported; self.resolver.program.module_mut(module).symbols.put(name, value); return true; }
+                self.resolver.sink.error(span, "imported name '{name}' conflicts with an existing definition", "SNX0302"); return false;
+            }
+            None => {}
+        }
+        self.resolver.program.module_mut(module).symbols.put(name, value); return true;
+    }
+    Symbol? member(&self, ModuleId from, Symbol symbol, &const ast.PathSegment segment, bool report) {
+        var name = defs.name(segment.name);
+        if (symbol.kind == 6) {
+            var module = ModuleId { index: symbol.module_def };
+            match self.resolver.program.module_find(module, name) {
+                None => return None,
+                Some(found) => {
+                    if (found.owner.index != from.index && self.resolver.program.module(found.owner).namespace_owner.index != from.index && !found.symbol.is_pub) {
+                        if (report) { var mn = String.from(self.resolver.program.module(module).name); self.resolver.sink.error(segment.span, "'{name}' is private to module '{mn}'", "SNX0304"); } return None;
+                    }
+                    return Some(found.symbol);
+                }
+            }
+        }
+        if (symbol.kind == 1) {
+            for (v in &const self.resolver.program.enums.get(symbol.enum_def as usize).unwrap().variants) {
+                if (v.name == name) { var out = symbol; out.kind = 5; out.variant = v.index; return Some(out); }
+            }
+        }
+        return None;
+    }
+    bool bind(&self, &const Import request, bool report) {
+        var spec = &const request.spec; var symbol = Symbol.module(request.target); bool found = true;
+        for (i in request.consumed..spec.path.segments.len()) {
+            match self.member(request.from, symbol, spec.path.segments.get(i).unwrap(), report) { Some(s) => { symbol = s; }, None => { found = false; break; } }
+        }
+        Vec<defs.Binding> bindings = Vec.new();
+        if (found && !spec.names.is_empty()) {
+            Symbol base = symbol;
+            for (name in &const spec.names) {
+                match self.member(request.from, base, name, report) {
+                    Some(s) => { symbol = s; bindings.push(defs.Binding { name: defs.name(name.name), symbol: symbol }); }
+                    None => { found = false; break; }
+                }
+            }
+        } else if (found) { bindings.push(defs.Binding { name: defs.name(spec.path.segments.get(spec.path.segments.len() - 1).unwrap().name), symbol: symbol }); }
+        if (!found) {
+            if (report) { var name = prefix(spec.path, spec.path.segments.len()); self.resolver.sink.error(spec.span, "cannot resolve import '{name}' (missing or private item, or cyclic re-export)", "SNX0303"); } return false;
+        }
+        ModuleId previous = ModuleId.none();
+        for (i in 1..request.consumed + 1) {
+            var name = prefix(spec.path, i); var base = if (i == request.consumed) { request.target } else { ModuleId.none() };
+            var node = self.view(request.from, name, base);
+            if (previous.index != NONE) {
+                var child = defs.name(spec.path.segments.get(i - 1).unwrap().name); bool conflict = false;
+                match self.resolver.program.module_find(previous, child) { Some(existing) => { conflict = existing.symbol.kind != 6; }, None => {} }
+                if (conflict) { self.resolver.sink.error(spec.span, "module '{name}' conflicts with an existing definition", "SNX0302"); }
+                else { var route = Symbol.module(node); route.is_pub = false; route.span = spec.span; self.resolver.program.module_mut(previous).symbols.put(child, route); }
+            } else if (request.consumed > 1) { var first = defs.name(spec.path.segments.get(0).unwrap().name); self.put(request.from, first, Symbol.module(node), spec.span, false); }
+            previous = node;
+        }
+        for (binding in &const bindings) {
+            Symbol value = binding.symbol;
+            if (value.kind == 6 && self.resolver.program.module(ModuleId { index: value.module_def }).namespace_owner.index == NONE) {
+                var name = prefix(spec.path, spec.path.segments.len()); var view = self.view(request.from, name, ModuleId { index: value.module_def }); value = Symbol.module(view);
+            }
+            self.put(request.from, binding.name, value, spec.span, spec.is_pub);
+        }
+        return true;
+    }
+    pub bool run(&self) {
+        var prelude_tree = self.parse(1, true); var user_tree = self.parse(0, false);
+        if (self.resolver.sink.has_errors() || self.prelude_sink.has_errors()) { return false; }
+        self.resolver.register_builtins();
+        if (!user_tree.items.is_empty()) { self.error_span = user_tree.items.get(0).unwrap().span; }
+        if (self.host_failed) { self.filesystem_failure(); return false; }
+        var prelude = self.scope("<prelude>"); self.resolver.program.module_mut(prelude).is_prelude = true;
+        self.resolver.declare_module(prelude_tree, prelude, true); *self.trees.get_mut(1).unwrap() = prelude_tree;
+        var exported = self.scope("std.prelude"); var symbols = self.resolver.program.globals.copy();
+        for (entry in &symbols.entries) { entry.symbol.is_pub = true; }
+        self.resolver.program.module_mut(exported).symbols = symbols;
+        var main = self.scope(""); self.resolver.program.root_module = main; self.resolver.program.module_mut(main).file = 0;
+        String key = String.new();
+        match canonical_key(self.sources.get(0).unwrap().path()) { Ok(value) => { key = value; }, Err(_) => { self.filesystem_failure(); return false; } }
+        self.files.put(key, main.index);
+        self.visit(main, user_tree); if (self.host_failed) { return false; }
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (i in 0..self.imports.len()) {
+                if (self.imports.get(i).unwrap().done) { continue; }
+                // Temporarily remove the owned request so binding can mutate modules.
+                var request = self.take_import(i); bool done = self.bind(request, false); request.done = done;
+                *self.imports.get_mut(i).unwrap() = request; if (done) { progress = true; }
+            }
+        }
+        for (i in 0..self.imports.len()) {
+            if (!self.imports.get(i).unwrap().done) { var request = self.take_import(i); self.bind(request, true); *self.imports.get_mut(i).unwrap() = request; }
+        }
+        return !self.resolver.sink.has_errors();
+    }
+    /// Stage 4b: resolves signatures after run() succeeds. Call at most once.
+    /// Returns false when resolution reports an error; state stays readable.
+    pub bool resolve_signatures(&self) {
+        var trees = mem.replace(&self.trees, Vec.new());
+        resolve.signatures(&self.resolver, &trees);
+        self.trees = trees;
+        return !self.resolver.sink.has_errors();
+    }
+    Import take_import(&self, usize i) {
+        var placeholder = Import { from: ModuleId.none(), target: ModuleId.none(), consumed: 0, done: false,
+            spec: ImportSpec { span: defs.zero_span(), path: ast.empty_path(), names: Vec.new(), is_pub: false } };
+        return mem.replace(self.imports.get_mut(i).unwrap(), placeholder);
+    }
+}

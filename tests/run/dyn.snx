@@ -1,0 +1,66 @@
+trait Shape {
+    int area(&const self);
+    void grow(&self, int n);
+    int doubled(&const self) { return self.area() * 2; }
+    &const int side(&const self);
+}
+struct Square { int n; }
+struct Rectangle { int n; int h; }
+impl Shape for Square {
+    int area(&const self) { return self.n * self.n; }
+    void grow(&self, int n) { self.n += n; }
+    &const int side(&const self) { return &const self.n; }
+}
+impl Shape for Rectangle {
+    int area(&const self) { return self.n * self.h; }
+    void grow(&self, int n) { self.n += n; }
+    &const int side(&const self) { return &const self.n; }
+}
+impl Drop for Square { void drop(&self) { print("drop {self.n}"); } }
+int read(&const dyn Shape s) { return s.area(); }
+int bounded<T: Shape>(&const T s) { return s.area(); }
+&const dyn Shape erase<T: Shape>(&const T s) { return s; }
+&const dyn Shape relay(&const dyn Shape s) { return s; }
+trait Value<T> { T get(&const self); }
+struct Holder<T> { T value; }
+impl<T: Copy> Value<T> for Holder<T> { T get(&const self) { return self.value; } }
+T dynamic_value<T>(&const dyn Value<T> value) { return value.get(); }
+trait Echo<T> {
+    T echo(&const self, T value);
+    T again(&const self, T value) { return self.echo(value); }
+}
+struct Echoer {}
+impl<T> Echo<T> for Echoer { T echo(&const self, T value) { return value; } }
+trait Bundle { (long, long, long) get(&const self, int n); }
+impl Bundle for Rectangle { (long, long, long) get(&const self, int n) { return (self.n as long, self.h as long, n as long); } }
+main() {
+    var square = Square { n: 3 };
+    var rect = Rectangle { n: 4, h: 5 };
+    {
+        Vec<&const dyn Shape> shapes = Vec.new();
+        shapes.push(&const square);
+        shapes.push(&const rect);
+        for (shape in &const shapes) { print("area {shape.area()} double {shape.doubled()}"); }
+    }
+    print("direct {read(square)} {read(&const rect)}");
+    &dyn Shape writable = &square;
+    writable.grow(2);
+    print("mutable {writable.area()} {writable.doubled()}");
+    &const dyn Shape shared = &const rect;
+    var nested = &const shared;
+    print("nested {nested.area()} side {*nested.side()}");
+    print("bounded {bounded(&const rect)} erased {erase(&const rect).area()} relay {relay(shared).area()}");
+    var h = Holder { value: 17 };
+    &const dyn Value<int> v = h;
+    print("generic {v.get()} inferred {dynamic_value(h)}");
+    var h2 = Holder { value: true };
+    &const dyn Value<bool> v2 = h2;
+    print("generic bool {v2.get()}");
+    var e = Echoer {};
+    &const dyn Echo<int> ei = e;
+    &const dyn Echo<long> el = e;
+    print("echo {ei.echo(21)} {el.echo(22)} default {ei.again(23)} {el.again(24)}");
+    &const dyn Bundle bundle = rect;
+    var values = bundle.get(9);
+    print("bundle {values.0} {values.1} {values.2}");
+}

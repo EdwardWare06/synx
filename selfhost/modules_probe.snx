@@ -1,0 +1,95 @@
+/// Stage 4a/4b binary parity driver. Manifest entries are UTF-8 source paths.
+/// A trailing `signatures` argument resolves signatures after declarations
+/// succeed; `check` also checks bodies and appends the checker tables;
+/// `lower` checks bodies, lowers to Dendrite, and appends the strict IR;
+/// `borrow` also runs ownership checks and drop elaboration before the dump;
+/// `all` runs every pass and records the declarations, checker tables, and the
+/// IR after lowering, after ownership checks, and after async frame conversion,
+/// then the layouts and register allocation when every pass succeeds.
+/// Report records contain the declaration dump and rendered diagnostics.
+import modules.{ModuleLoader, standard_library};
+import module_dump;
+import check.Checker;
+import lower.Lowerer;
+import borrow.BorrowChecker;
+import async_frame;
+import declare.Resolver;
+import std.mem;
+import source.SourceFile;
+import bytes;
+import std.fs;
+import std.env;
+import std.text;
+import std.binary;
+
+T require<T, E>(Result<T, E> result) { match result { Ok(value) => return value, Err(_) => panic("module parity I/O failed") } }
+void blob(&Vec<byte> out, &const Vec<byte> data) { if (!binary.write_uint(&*out, data.len() as ulong, 8, true)) { panic("report overflow"); } bytes.append(&*out, data); }
+main() {
+    var args = env.args(); String stage = if (args.len() >= 6) { String.from(args.get(5).unwrap()) } else { String.new() };
+    // `all` takes the build mode: bit 0 disables register allocation, bit 1 checked arithmetic.
+    uint mode = 0;
+    if (args.len() == 7) {
+        var given = args.get(6).unwrap().as_str();
+        if (given == "1") { mode = 1; } else if (given == "2") { mode = 2; } else if (given == "3") { mode = 3; }
+    }
+    bool all = stage == String.from("all");
+    bool borrow = all || stage == String.from("borrow");
+    bool lower = borrow || stage == String.from("lower");
+    bool check = lower || stage == String.from("check"); bool signatures = check || stage == String.from("signatures");
+    if (args.len() != 5 && !signatures) { panic("usage: modules_probe <prelude> <std-fallback> <manifest> <report> [signatures|check|lower|borrow|all]"); }
+    var prelude = require(fs.read(args.get(1).unwrap().as_str()));
+    bool std_failed = false; String std_root = String.new();
+    match standard_library(args.get(2).unwrap().as_str()) { Ok(path) => { std_root = path; }, Err(_) => { std_failed = true; } }
+    var manifest = require(fs.read_text(args.get(3).unwrap().as_str())); var lines = text.lines(manifest);
+    Vec<byte> out = Vec.new();
+    for (line in &const lines) {
+        if (line.is_empty()) { continue; }
+        var user = require(SourceFile.load(line.as_str(), 0));
+        var prelude_file = SourceFile.new(String.from("<prelude>"), bytes.copy(prelude, 0, prelude.len()), 1);
+        var loader = ModuleLoader.new(user, prelude_file, String.from(std_root)); if (std_failed) { loader.host_failed = true; }
+        bool ok = loader.run();
+        if (ok && signatures) { ok = loader.resolve_signatures(); }
+        if (!check) {
+            var dump = module_dump.dump(loader.resolver); blob(&out, dump);
+            var rendered = loader.resolver.sink.render(loader.sources.get(0).unwrap(), loader.sources); blob(&out, rendered);
+            continue;
+        }
+        var checker = Checker.new(mem.replace(&loader.resolver, Resolver.new()));
+        if (ok) { checker.check_program(&loader.trees); ok = !checker.r.sink.has_errors(); }
+        if (all) {
+            // Every pass in order; the record matches staged_oracle in the C++ harness.
+            var lowerer = Lowerer.new(checker);
+            if (ok) { ok = lowerer.lower_program(&loader.trees, false); }
+            var lowered = module_dump.dump_ir(lowerer.ck.r, &loader.trees, &lowerer.module);
+            if (ok) { var checker_pass = BorrowChecker.new(); ok = checker_pass.check_module(&lowerer.ck, &lowerer.module); }
+            var borrowed = module_dump.dump_ir(lowerer.ck.r, &loader.trees, &lowerer.module);
+            if (ok) { ok = async_frame.convert(&lowerer.ck, &loader.trees, &lowerer.module); }
+            var converted = module_dump.dump_ir(lowerer.ck.r, &loader.trees, &lowerer.module);
+            // Allocation assumes complete IR, so the machine section needs every
+            // pass. Axon errors join the declaration dump, so it comes after.
+            Vec<byte> machine = Vec.new();
+            if (ok) {
+                machine = module_dump.dump_machine(&lowerer.ck, &lowerer.module);
+                var objects = module_dump.dump_objects(&lowerer.ck, &loader.trees, &lowerer.module, (mode & 1) == 0, (mode & 2) == 0);
+                bytes.append(&machine, objects);
+            } else { bytes.text(&machine, "machine skipped\n"); }
+            var dump = module_dump.dump(lowerer.ck.r);
+            var tables = module_dump.dump_check(lowerer.ck, &loader.trees); bytes.append(&dump, tables);
+            bytes.append(&dump, lowered); bytes.append(&dump, borrowed); bytes.append(&dump, converted); bytes.append(&dump, machine);
+            blob(&out, dump);
+            var rendered = lowerer.ck.r.sink.render(loader.sources.get(0).unwrap(), loader.sources); blob(&out, rendered);
+            continue;
+        }
+        if (lower) {
+            var lowerer = Lowerer.new(checker);
+            if (ok) { ok = lowerer.lower_program(&loader.trees, false); }
+            if (ok && borrow) { var checker_pass = BorrowChecker.new(); checker_pass.check_module(&lowerer.ck, &lowerer.module); }
+            var dump = module_dump.dump(lowerer.ck.r); var ir = module_dump.dump_ir(lowerer.ck.r, &loader.trees, &lowerer.module); bytes.append(&dump, ir); blob(&out, dump);
+            var rendered = lowerer.ck.r.sink.render(loader.sources.get(0).unwrap(), loader.sources); blob(&out, rendered);
+            continue;
+        }
+        var dump = module_dump.dump(checker.r); var tables = module_dump.dump_check(checker, &loader.trees); bytes.append(&dump, tables); blob(&out, dump);
+        var rendered = checker.r.sink.render(loader.sources.get(0).unwrap(), loader.sources); blob(&out, rendered);
+    }
+    require(fs.write(args.get(4).unwrap().as_str(), out));
+}

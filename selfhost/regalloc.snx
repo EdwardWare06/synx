@@ -1,0 +1,217 @@
+/// Linear scan register allocation for Axon's scalar locals. Source:
+/// compiler/src/regalloc.cpp, a function-by-function port.
+/// Parity: tests/selfhost_modules_test.cpp (all stage, machine section).
+/// Each statement and terminator is one event at an even position; uses
+/// precede definitions. Block liveness iterates to a fixed point in reverse
+/// block order. Scalar locals that are never pinned to a stack slot get an
+/// interval; intervals that cross a call avoid R8 and R9. Register numbers
+/// are x86-64 encodings (RAX = 0 ... R15 = 15); -1 keeps the stack slot.
+import ids.NONE;
+import types.TypeKind;
+import check.Checker;
+import check_data;
+import ir.{Place, ProjKind, Operand, Rvalue, RvalueKind, StatementKind, TerminatorKind, CalleeKind, Function};
+import borrow.{set_add, set_has, set_union};
+import layout.LayoutTable;
+
+pub const int RBX = 3;
+pub const int R8 = 8;
+pub const int R9 = 9;
+pub const int R12 = 12;
+pub const int R13 = 13;
+pub const int R14 = 14;
+pub const int R15 = 15;
+
+pub struct RegisterAllocation {
+    /// Register per local, or -1.
+    pub Vec<int> registers;
+    /// Callee-saved registers in first-use order.
+    pub Vec<int> saved;
+}
+
+/// after: read after a call returns (indexes of its destination).
+struct Event { Vec<uint> uses; Vec<uint> defs; Vec<uint> after; bool call; usize pos; }
+struct Block { Vec<Event> events; Vec<uint> successors; Vec<uint> uses; Vec<uint> defs; Vec<uint> live_in; Vec<uint> live_out; }
+struct Interval { uint local; usize start; usize end; bool crosses_call; }
+
+Event event() { return Event { uses: Vec.new(), defs: Vec.new(), after: Vec.new(), call: false, pos: 0 }; }
+
+void place(&Event e, &Vec<bool> pinned, &const Place p, bool write) {
+    if (p.is_none()) { return; }
+    if (write && p.is_local()) { set_add(&e.defs, p.local); } else { set_add(&e.uses, p.local); }
+    if (!p.is_local()) { *pinned.get_mut(p.local as usize).unwrap() = true; }
+    for (pr in &const p.proj) { match pr.kind { ProjKind.Index => { set_add(&e.uses, pr.index); }, _ => {} } }
+}
+void operand(&Event e, &Vec<bool> pinned, &const Operand o) { if (!o.is_const()) { place(&*e, &*pinned, &const o.place, false); } }
+void pin(&Vec<bool> pinned, uint local) { *pinned.get_mut(local as usize).unwrap() = true; }
+
+/// Appends e to b at the next position.
+void add(&Block b, &Vec<usize> calls, &usize pos, Event e) {
+    e.pos = *pos; *pos += 2;
+    if (e.call) { calls.push(e.pos); }
+    for (local in &const e.uses) { if (!set_has(b.defs, *local)) { set_add(&b.uses, *local); } }
+    set_union(&b.defs, &const e.defs);
+    b.events.push(e);
+}
+
+pub RegisterAllocation allocate_registers(&Checker ck, &const Function f, &LayoutTable lay) {
+    var result = RegisterAllocation { registers: Vec.new(), saved: Vec.new() };
+    for (i in 0..f.locals.len()) { result.registers.push(-1); }
+    if (f.blocks.is_empty()) { return result; }
+    Vec<bool> pinned = Vec.new(); for (i in 0..f.locals.len()) { pinned.push(false); }
+    // Common epilogue reads the return slot.
+    pin(&pinned, 0);
+    // R10 is spilled before parameter loads.
+    if (f.closure != check_data.NO_KEY) { pin(&pinned, 1); }
+    Vec<Block> blocks = Vec.new();
+    Vec<usize> calls = Vec.new();
+    usize pos = 0;
+    for (bi in 0..f.blocks.len()) {
+        var b = Block { events: Vec.new(), successors: Vec.new(), uses: Vec.new(), defs: Vec.new(), live_in: Vec.new(), live_out: Vec.new() };
+        var source = f.blocks.get(bi).unwrap();
+        for (s in &const source.stmts) {
+            var e = event();
+            match s.kind {
+                StatementKind.Assign => {
+                    place(&e, &pinned, &const s.place, true);
+                    var r = &const s.rvalue;
+                    bool direct = false; bool is_binary = false;
+                    match r.kind { RvalueKind.Use => { direct = true; }, RvalueKind.Binary => { direct = true; is_binary = true; },
+                        RvalueKind.Unary => { direct = true; }, RvalueKind.Cast => { direct = true; }, _ => {} }
+                    // Remaining emitters write through an address. Their
+                    // destinations retain the stack path until they gain register writes.
+                    if (!direct) { pin(&pinned, s.place.local); }
+                    match r.kind { RvalueKind.Cast => { if (ck.r.types.get(r.type).is_float()) { pin(&pinned, s.place.local); } }, _ => {} }
+                    match r.kind {
+                        RvalueKind.Ref => { pin(&pinned, r.place.local); place(&e, &pinned, &const r.place, false); }
+                        RvalueKind.Len => { pin(&pinned, r.place.local); place(&e, &pinned, &const r.place, false); }
+                        RvalueKind.Discriminant => { pin(&pinned, r.place.local); place(&e, &pinned, &const r.place, false); }
+                        RvalueKind.Aggregate => {
+                            for (o in &const r.elems) { operand(&e, &pinned, o); }
+                            for (o in &const r.captures) { operand(&e, &pinned, o); }
+                        }
+                        _ => { if (is_binary) { operand(&e, &pinned, &const r.b); } operand(&e, &pinned, &const r.a); }
+                    }
+                }
+                StatementKind.DropIf => {
+                    set_add(&e.uses, s.flag_local); pin(&pinned, s.flag_local);
+                    place(&e, &pinned, &const s.place, false); pin(&pinned, s.place.local);
+                    // Drop glue can call user code and the C runtime.
+                    e.call = true;
+                }
+                StatementKind.Drop => { place(&e, &pinned, &const s.place, false); pin(&pinned, s.place.local); e.call = true; }
+                StatementKind.StorageDead => { set_add(&e.defs, s.place.local); }
+                StatementKind.Nop => {}
+            }
+            add(&b, &calls, &pos, e);
+        }
+        var e = event();
+        var t = &const source.term;
+        match t.kind {
+            TerminatorKind.Goto => { b.successors.push(t.target); }
+            TerminatorKind.Switch => {
+                operand(&e, &pinned, &const t.discr);
+                for (c in &const t.cases) { b.successors.push(c.block); }
+                b.successors.push(t.otherwise);
+            }
+            TerminatorKind.Call => {
+                for (o in &const t.args) { operand(&e, &pinned, o); }
+                match t.callee.kind { CalleeKind.Indirect => { operand(&e, &pinned, &const t.callee.fn_operand); }, _ => {} }
+                place(&e, &pinned, &const t.dest, true);
+                // The result is stored after the call returns, so destination
+                // indexes must survive the call.
+                for (pr in &const t.dest.proj) { match pr.kind { ProjKind.Index => { set_add(&e.after, pr.index); }, _ => {} } }
+                // Includes intrinsics, conservatively.
+                e.call = true;
+                if (!t.diverges) { b.successors.push(t.target); }
+            }
+            // Panic never returns; the success path makes no call.
+            TerminatorKind.Assert => { operand(&e, &pinned, &const t.cond); b.successors.push(t.target); }
+            TerminatorKind.Return => { set_add(&e.uses, 0); }
+            TerminatorKind.Unreachable => {}
+        }
+        add(&b, &calls, &pos, e);
+        blocks.push(b);
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        usize i = blocks.len();
+        while (i > 0) {
+            i -= 1;
+            Vec<uint> out = Vec.new();
+            for (successor in &const blocks.get(i).unwrap().successors) { set_union(&out, &const blocks.get(*successor as usize).unwrap().live_in); }
+            var b = blocks.get_mut(i).unwrap();
+            Vec<uint> live = Vec.new(); set_union(&live, &const b.uses);
+            for (local in &const out) { if (!set_has(b.defs, *local)) { set_add(&live, *local); } }
+            if (!same(&const live, &const b.live_in) || !same(&const out, &const b.live_out)) {
+                b.live_in = live; b.live_out = out; changed = true;
+            }
+        }
+    }
+
+    Vec<Interval> intervals = Vec.new();
+    for (li in 0..f.locals.len()) {
+        uint local = li as uint;
+        var t = f.locals.get(li).unwrap().type;
+        var size = lay.size_of(&*ck, t);
+        var ty = ck.r.types.get(t);
+        bool scalar = false;
+        match ty.kind { TypeKind.Prim => { scalar = !ty.is_float(); }, TypeKind.Ptr => { scalar = true; }, TypeKind.Ref => { scalar = true; }, _ => {} }
+        if (*pinned.get(li).unwrap() || !scalar || size == 0 || size > 8) { continue; }
+        var interval = Interval { local: local, start: ~(0 as usize), end: 0, crosses_call: false };
+        // All arguments are loaded in the prologue. They interfere from entry.
+        if (local <= f.arg_count) { touch(&interval, 0); }
+        for (b in &const blocks) {
+            if (set_has(b.live_in, local)) { touch(&interval, b.events.get(0).unwrap().pos); }
+            if (set_has(b.live_out, local)) { touch(&interval, b.events.get(b.events.len() - 1).unwrap().pos + 1); }
+            for (e in &const b.events) {
+                if (set_has(e.uses, local)) { touch(&interval, e.pos); }
+                if (set_has(e.after, local)) { touch(&interval, e.pos + 1); }
+                // StorageDead kills liveness but does not define a machine value.
+                if (set_has(e.defs, local)) { touch(&interval, e.pos + 1); }
+            }
+        }
+        if (interval.start == ~(0 as usize)) { continue; }
+        for (call in &const calls) { if (interval.start <= *call && *call < interval.end) { interval.crosses_call = true; } }
+        intervals.push(interval);
+    }
+    // Sort by start, then local; locals were added in increasing order.
+    for (i in 0..intervals.len()) {
+        usize j = i;
+        while (j > 0 && intervals.get(j - 1).unwrap().start > intervals.get(j).unwrap().start) { intervals.swap(j, j - 1); j -= 1; }
+    }
+    Vec<Interval> active = Vec.new();
+    // Other volatile registers belong to the instruction selector.
+    Vec<int> pool = Vec.new(); pool.push(R8); pool.push(R9); pool.push(RBX); pool.push(R12); pool.push(R13); pool.push(R14); pool.push(R15);
+    for (interval in &const intervals) {
+        Vec<Interval> kept = Vec.new();
+        for (a in &const active) { if (!(a.end < interval.start)) { kept.push(Interval { local: a.local, start: a.start, end: a.end, crosses_call: a.crosses_call }); } }
+        active = kept;
+        for (reg in &const pool) {
+            if (interval.crosses_call && (*reg == R8 || *reg == R9)) { continue; }
+            bool used = false;
+            for (a in &const active) { if (*result.registers.get(a.local as usize).unwrap() == *reg) { used = true; } }
+            if (used) { continue; }
+            var slot = result.registers.get_mut(interval.local as usize).unwrap(); *slot = *reg;
+            if (*reg != R8 && *reg != R9) {
+                bool seen = false; for (s in &const result.saved) { if (*s == *reg) { seen = true; } }
+                if (!seen) { result.saved.push(*reg); }
+            }
+            active.push(Interval { local: interval.local, start: interval.start, end: interval.end, crosses_call: interval.crosses_call });
+            break;
+        }
+    }
+    return result;
+}
+
+void touch(&Interval interval, usize p) {
+    if (p < interval.start) { interval.start = p; }
+    if (p > interval.end) { interval.end = p; }
+}
+bool same(&const Vec<uint> a, &const Vec<uint> b) {
+    if (a.len() != b.len()) { return false; }
+    for (i in 0..a.len()) { if (*a.get(i).unwrap() != *b.get(i).unwrap()) { return false; } }
+    return true;
+}

@@ -1,0 +1,154 @@
+/// Memory layout of Synx types on x86-64. Source: compiler/src/layout.cpp.
+/// Parity: tests/selfhost_modules_test.cpp (all stage, machine section).
+/// Primitives use their natural size and alignment; void is empty.
+/// References and raw pointers are 8 bytes, or 16 (pointer, length) when the
+/// pointee is unsized. Structs and tuples place fields in declaration order
+/// with natural alignment and tail padding. Enums store a usize tag at offset
+/// 0, then the largest variant payload at the payload alignment. Arrays are
+/// element size times length.
+import ast.PrimKind;
+import ids.{TypeId, DefId};
+import types.{TypeKind, Subst};
+import check.Checker;
+import std.collections.HashMap;
+
+pub struct Layout {
+    pub ulong size;
+    pub ulong align;
+    /// Struct, tuple, or variant payload field offsets.
+    pub Vec<ulong> field_offsets;
+    /// Enums only.
+    pub ulong payload_offset;
+    /// &str and &T[].
+    pub bool is_fat_pointer;
+    pub Layout new() { return Layout { size: 0, align: 1, field_offsets: Vec.new(), payload_offset: 0, is_fat_pointer: false }; }
+    pub Layout copy(&const self) {
+        Vec<ulong> offsets = Vec.new(); for (o in &const self.field_offsets) { offsets.push(*o); }
+        return Layout { size: self.size, align: self.align, field_offsets: offsets, payload_offset: self.payload_offset, is_fat_pointer: self.is_fat_pointer };
+    }
+}
+
+pub ulong align_up(ulong v, ulong a) { return (v + a - 1) / a * a; }
+
+/// Computed layouts by TypeId. Interned types make the ID a complete key.
+pub struct LayoutTable {
+    HashMap<ulong, Layout> cache;
+    pub LayoutTable new() { return LayoutTable { cache: HashMap.new() }; }
+
+    pub Layout of(&self, &Checker ck, TypeId t) {
+        ulong key = t.index as ulong;
+        match self.cache.get(&key) { Some(l) => return l.copy(), None => {} }
+        var l = self.compute(&*ck, t);
+        self.cache.insert(key, l.copy());
+        return l;
+    }
+    pub ulong size_of(&self, &Checker ck, TypeId t) { return self.of(&*ck, t).size; }
+    /// Layout of one variant's payload fields as a struct.
+    pub Layout variant_payload(&self, &Checker ck, TypeId t, uint variant) {
+        var fields = variant_field_types(&*ck, t, variant); return self.sequential(&*ck, &const fields);
+    }
+
+    Layout sequential(&self, &Checker ck, &const Vec<TypeId> fields) {
+        var l = Layout.new(); ulong offset = 0;
+        for (f in fields) {
+            var fl = self.of(&*ck, *f);
+            offset = align_up(offset, fl.align);
+            l.field_offsets.push(offset);
+            offset += fl.size;
+            if (fl.align > l.align) { l.align = fl.align; }
+        }
+        l.size = align_up(offset, l.align);
+        return l;
+    }
+
+    Layout compute(&self, &Checker ck, TypeId t) {
+        var l = Layout.new();
+        var kind = ck.r.types.get(t).kind; var prim = ck.r.types.get(t).prim; var inner = ck.r.types.get(t).inner;
+        match kind {
+            TypeKind.Prim => {
+                match prim {
+                    PrimKind.Void => { l.size = 0; l.align = 1; }
+                    PrimKind.Bool => { l.size = 1; l.align = 1; }
+                    PrimKind.Byte => { l.size = 1; l.align = 1; }
+                    PrimKind.Short => { l.size = 2; l.align = 2; }
+                    PrimKind.Int => { l.size = 4; l.align = 4; }
+                    PrimKind.Uint => { l.size = 4; l.align = 4; }
+                    PrimKind.Float => { l.size = 4; l.align = 4; }
+                    PrimKind.Char => { l.size = 4; l.align = 4; }
+                    _ => { l.size = 8; l.align = 8; }
+                }
+                return l;
+            }
+            TypeKind.Never => { return l; }
+            TypeKind.Error => { return l; }
+            // Unsized: only reachable through a fat pointer; size 0.
+            TypeKind.Dyn => { return l; }
+            TypeKind.Str => { return l; }
+            TypeKind.Slice => { l.align = self.of(&*ck, inner).align; return l; }
+            TypeKind.Ref => { return pointer(&*ck, inner); }
+            TypeKind.Ptr => { return pointer(&*ck, inner); }
+            TypeKind.Fn => {
+                // Code pointer, owned environment pointer.
+                l.size = 16; l.align = 8; l.field_offsets.push(0); l.field_offsets.push(8);
+                return l;
+            }
+            TypeKind.Array => {
+                ulong length = ck.r.types.get(t).length;
+                var e = self.of(&*ck, inner);
+                l.size = e.size * length; l.align = e.align;
+                return l;
+            }
+            TypeKind.Tuple => {
+                Vec<TypeId> elems = Vec.new(); for (e in &const ck.r.types.get(t).elems) { elems.push(*e); }
+                return self.sequential(&*ck, &const elems);
+            }
+            TypeKind.Struct => { var fields = struct_field_types(&*ck, t); return self.sequential(&*ck, &const fields); }
+            TypeKind.Enum => {
+                ulong payload_size = 0; ulong payload_align = 1;
+                usize count = ck.r.program.def(ck.r.types.get(t).def).variants.len();
+                for (i in 0..count) {
+                    var p = self.variant_payload(&*ck, t, i as uint);
+                    if (p.size > payload_size) { payload_size = p.size; }
+                    if (p.align > payload_align) { payload_align = p.align; }
+                }
+                l.payload_offset = align_up(8, payload_align);
+                l.align = if (payload_align > 8) { payload_align } else { 8 as ulong };
+                l.size = align_up(l.payload_offset + payload_size, l.align);
+                return l;
+            }
+            _ => { l.size = 8; l.align = 8; return l; }
+        }
+    }
+}
+
+Layout pointer(&const Checker ck, TypeId inner) {
+    var l = Layout.new();
+    if (ck.r.types.get(inner).is_unsized()) { l.size = 16; l.align = 8; l.is_fat_pointer = true; }
+    else { l.size = 8; l.align = 8; }
+    return l;
+}
+
+/// Binds the owner generics of nominal type t to its arguments.
+Subst owner_subst(&const Checker ck, TypeId t) {
+    var s = Subst.new(); var ty = ck.r.types.get(t); var d = ck.r.program.def(ty.def);
+    usize i = 0;
+    while (i < d.generics.len() && i < ty.elems.len()) { s.bind(d.generics.get(i).unwrap().type, *ty.elems.get(i).unwrap()); i += 1; }
+    return s;
+}
+/// Field types of a struct type with its arguments applied.
+pub Vec<TypeId> struct_field_types(&Checker ck, TypeId t) {
+    var s = owner_subst(&const *ck, t);
+    Vec<TypeId> raw = Vec.new(); for (f in &const ck.r.program.def(ck.r.types.get(t).def).fields) { raw.push(f.type); }
+    Vec<TypeId> out = Vec.new(); for (f in &const raw) { out.push(ck.apply(&s, *f)); }
+    return out;
+}
+/// Payload types of one variant: tuple payload, then named fields.
+pub Vec<TypeId> variant_field_types(&Checker ck, TypeId t, uint variant) {
+    var s = owner_subst(&const *ck, t);
+    Vec<TypeId> raw = Vec.new();
+    var v = ck.r.program.def(ck.r.types.get(t).def).variants.get(variant as usize).unwrap();
+    for (tt in &const v.tuple_types) { raw.push(*tt); }
+    for (f in &const v.fields) { raw.push(f.type); }
+    Vec<TypeId> out = Vec.new(); for (f in &const raw) { out.push(ck.apply(&s, *f)); }
+    return out;
+}

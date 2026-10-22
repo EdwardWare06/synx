@@ -1,0 +1,44 @@
+/// Callable dynamic imports. Platform writers emit thunks and loader metadata.
+/// Names retain object spelling; DLL export names omit a leading __imp_.
+import link.model.{Object, Failure, Code};
+import link.model;
+import link.resolve;
+import std.collections.HashMap;
+import std.utf8;
+import std.text;
+pub struct Import { pub Vec<byte> name; pub String library; }
+pub Result<Vec<Import>, Failure> collect(&const Vec<Object> inputs, &const str runtime, int os) {
+    var selected = resolve.active(inputs, "__synx_start")?;
+    HashMap<String, bool> definitions = HashMap.new();
+    for (i in 0..inputs.len()) {
+        if (!*selected.get(i).unwrap()) { continue; }
+        var object = inputs.get(i).unwrap();
+        for (symbol in &const object.symbols) {
+        match symbol.binding { Local => continue, _ => {} }
+        if (model.defined(symbol.definition)) { definitions.insert(model.key(symbol.name), true); }
+    } }
+    HashMap<String, bool> seen = HashMap.new(); Vec<Import> result = Vec.new();
+    for (i in 0..inputs.len()) {
+        if (!*selected.get(i).unwrap()) { continue; }
+        var object = inputs.get(i).unwrap();
+        for (j in 0..object.symbols.len()) {
+        var symbol = object.symbols.get(j).unwrap();
+        match symbol.binding { Local => continue, _ => {} }
+        if (model.defined(symbol.definition)) { continue; }
+        var key = model.key(symbol.name); if (definitions.contains_key(key) || seen.contains_key(key)) { continue; }
+        var name = match utf8.decode(symbol.name) { Some(value) => value, None => return Err(model.fail(Code.Unsupported, i, j)) };
+        if (os == 1 && name.starts_with("__imp_")) { name = text.slice(name, 6, name.len()).unwrap(); }
+        key = model.key(utf8.encode(name));
+        if (seen.contains_key(key)) { continue; }
+        String library = String.from(runtime);
+        if (os == 1 && name == String.from("ExitProcess")) { library = String.from("kernel32.dll"); }
+        else if (os == 0 && name == String.from("__libc_start_main")) { library = String.from("libc.so.6"); }
+        else {
+            bool allowed = if (os == 2) { name.starts_with("_synx_rt_") } else { name.starts_with("synx_rt_") };
+            if (!allowed) { return Err(model.named(Code.Unresolved, i, j, name)); }
+        }
+        seen.insert(key, true);
+        result.push(Import { name: utf8.encode(name), library: library });
+    } }
+    return Ok(result);
+}

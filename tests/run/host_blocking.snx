@@ -1,0 +1,6 @@
+import std.env;
+import std.process.Command;
+import std.task.pool.Executor;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("host setup failed") } }
+async send void bad(String executable) { var child = Command.new(executable); child.status(); }
+main() { var executor = ok(Executor.new(1)); var job = ok(executor.spawn(bad(ok(env.exe_path())))); job.join(); }

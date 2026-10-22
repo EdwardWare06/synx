@@ -1,0 +1,341 @@
+/// Async frame conversion over Dendrite. Source: compiler/src/async.cpp, a
+/// function-by-function port.
+/// Parity: tests/selfhost_modules_test.cpp (all stage, IR after convert).
+/// Runs after ownership checks. Each async factory allocates a heap frame
+/// tuple (state word, then every poll local except the waker) and returns the
+/// task handle. The poll function becomes a state machine over the frame; the
+/// cancel function drops the values of the current state, then frees it.
+/// Map lookups that insert in C++ (async_borrows[block]) insert here too, so
+/// the dumped tables match.
+import ast;
+import ids.{TypeId, DefId, NONE};
+import check.Checker;
+import ir.{Place, Projection, ProjKind, Constant, ConstantKind, Operand, Rvalue, RvalueKind, AggregateKind, Statement, StatementKind,
+    Callee, Case, Terminator, TerminatorKind, BasicBlock, Local, Function, Module, Pair, BorrowSet};
+import borrow.{set_add, set_has, set_copy};
+import source.Span;
+import bytes;
+import std.mem;
+
+/// State of a completed task.
+const ulong COMPLETE = ~(0 as ulong);
+
+/// Value of key in a sorted map, or NONE.
+uint pair_get(&const Vec<Pair> map, uint key) { for (p in map) { if (p.key == key) { return p.value; } } return NONE; }
+/// Index of the borrow set for block; inserts an empty set like std::map::operator[].
+usize borrow_entry(&Vec<BorrowSet> sets, uint block) {
+    for (i in 0..sets.len()) { if (sets.get(i).unwrap().block == block) { return i; } }
+    sets.push(BorrowSet { block: block, pairs: Vec.new() });
+    usize i = sets.len() - 1;
+    while (i > 0 && sets.get(i - 1).unwrap().block > block) { sets.swap(i, i - 1); i -= 1; }
+    return i;
+}
+
+/// Builder in async.cpp: appends locals, blocks, and statements with one span.
+struct Builder {
+    Span span;
+    TypeId usize_t;
+    TypeId bool_t;
+    TypeId str_ref;
+    uint local(&const self, &Function f, TypeId ty, &const str name) {
+        f.locals.push(Local.new(ty, name, false, self.span)); return (f.locals.len() - 1) as uint;
+    }
+    uint block(&const self, &Function f) { f.blocks.push(BasicBlock.new()); return (f.blocks.len() - 1) as uint; }
+    Operand number(&const self, ulong value) { var k = Constant.new(ConstantKind.Int, self.usize_t); k.int_value = value; return Operand.constant_of(k); }
+    Operand flag(&const self, bool value) {
+        var k = Constant.new(ConstantKind.Bool, self.bool_t); k.int_value = if (value) { 1 as ulong } else { 0 as ulong }; return Operand.constant_of(k);
+    }
+    void assign(&const self, &Function f, uint block, Place place, Rvalue value) {
+        var s = Statement.new(StatementKind.Assign, place, self.span); s.rvalue = value;
+        f.blocks.get_mut(block as usize).unwrap().stmts.push(s);
+    }
+    void put(&const self, &Function f, uint block, Place dest, Operand value) { self.assign(&*f, block, dest, Rvalue.use_of(value)); }
+    void ret(&const self, &Function f, uint block) {
+        var b = f.blocks.get_mut(block as usize).unwrap(); b.term.kind = TerminatorKind.Return; b.term.span = self.span;
+    }
+    uint call(&const self, &Function f, uint block, &const str name, Vec<Operand> args, Place dest, Vec<TypeId> type_args) {
+        uint next = self.block(&*f);
+        var t = Terminator.new(TerminatorKind.Call); t.callee = Callee.builtin_of(name); t.callee.type_args = type_args;
+        t.args = args; t.dest = dest; t.target = next; t.span = self.span;
+        f.blocks.get_mut(block as usize).unwrap().term = t;
+        return next;
+    }
+    void panic_at(&const self, &Function f, uint block, &const str message) {
+        var k = Constant.new(ConstantKind.Str, self.str_ref); bytes.text(&k.str_value, message);
+        var t = Terminator.new(TerminatorKind.Call); t.callee = Callee.builtin_of("panic"); t.args.push(Operand.constant_of(k));
+        t.dest = Place.none(); t.diverges = true; t.span = self.span;
+        f.blocks.get_mut(block as usize).unwrap().term = t;
+    }
+}
+
+/// The frame layout: field[local] is the tuple field of an old poll local.
+struct Frame {
+    Vec<uint> field;
+    uint wake;
+    Builder make;
+    Place at(&const self, uint local) { return Place.of(1).deref().field(*self.field.get(local as usize).unwrap()); }
+    Place state(&const self) { return Place.of(1).deref().field(0); }
+    /// Copies an old local out of the frame into a new temporary (index projections).
+    uint load(&const self, &Function poll, &const Vec<Local> old_locals, uint old, &Vec<Statement> before) {
+        uint temp = self.make.local(&*poll, old_locals.get(old as usize).unwrap().type, "");
+        var s = Statement.new(StatementKind.Assign, Place.of(temp), self.make.span); s.rvalue.a = Operand.copy_of(self.at(old));
+        before.push(s); return temp;
+    }
+    Place place(&const self, &Function poll, &const Vec<Local> old_locals, &const Place original, &Vec<Statement> before) {
+        if (original.is_none()) { return original.copy(); }
+        var result = if (original.local == self.wake) { Place.of(2) } else { self.at(original.local) };
+        for (pr in &const original.proj) {
+            uint index = pr.index;
+            match pr.kind { ProjKind.Index => { index = self.load(&*poll, old_locals, pr.index, &*before); }, _ => {} }
+            result.proj.push(Projection { kind: pr.kind, index: index });
+        }
+        return result;
+    }
+    void operand(&const self, &Function poll, &const Vec<Local> old_locals, &Operand value, &Vec<Statement> before) {
+        if (value.is_const()) { return; }
+        var original = value.place.copy();
+        value.place = self.place(&*poll, old_locals, &const original, &*before);
+    }
+    /// Stores the next state and returns Pending, or Ready with the result.
+    void finish(&const self, &Checker ck, &Function poll, uint block, bool ready, ulong number, TypeId poll_type, TypeId output) {
+        self.make.put(&*poll, block, self.state(), self.make.number(number));
+        var result = Rvalue.new(RvalueKind.Aggregate); result.agg = AggregateKind.Variant;
+        result.type = poll_type; result.variant = if (ready) { 1 as uint } else { 0 as uint };
+        if (ready) {
+            if (ck.is_void(output) || ck.is_never(output)) { result.elems.push(Operand.constant_of(Constant.new(ConstantKind.Unit, output))); }
+            else if (ck.is_copy_type(output)) { result.elems.push(Operand.copy_of(self.at(0))); }
+            else { result.elems.push(Operand.move_of(self.at(0))); }
+        }
+        self.make.assign(&*poll, block, Place.of(0), result);
+        poll.blocks.get_mut(block as usize).unwrap().stmts.push(Statement.new(StatementKind.Drop, Place.of(2), self.make.span));
+        self.make.ret(&*poll, block);
+    }
+}
+
+/// Cancellation drop order for one state.
+struct Order { ulong number; Vec<uint> locals; }
+
+/// transform in async.cpp. On SNX0507 the poll locals and blocks stay empty,
+/// as after the moves in C++.
+bool transform(&Checker ck, &Function factory, &Function poll, &Function cancel) {
+    var output = ck.elem(factory.ret, 0);
+    Vec<TypeId> pa = Vec.new(); pa.push(output); var poll_type = ck.nominal(ck.r.program.poll_def, pa);
+    var wake_type = ck.nominal(ck.r.program.waker_def, Vec.new());
+    var raw = ck.r.types.ptr(ck.prim(ast.PrimKind.Byte), false);
+    var old_locals = mem.replace(&poll.locals, Vec.new());
+    var old_blocks = mem.replace(&poll.blocks, Vec.new());
+    uint old_wake = poll.async_waker;
+    Span span = ck.r.program.def(factory.def).span;
+    Vec<TypeId> fields = Vec.new(); fields.push(ck.usize_t());
+    Vec<uint> field = Vec.new();
+    for (i in 0..old_locals.len()) {
+        if (i as uint == old_wake) { field.push(NONE); continue; }
+        field.push(fields.len() as uint); fields.push(old_locals.get(i).unwrap().type);
+    }
+    var frame = ck.r.types.tuple(fields);
+    var frame_pointer = ck.r.types.ptr(frame, false);
+    Vec<Pair> states = Vec.new(); uint next_state = 1;
+    for (p in &const poll.async_suspends) { states.push(Pair { key: p.key, value: next_state }); next_state += 1; }
+    var drop_locals = set_copy(&const poll.async_drop_locals);
+
+    // Cancellation observes references held by destructors. Order each state
+    // by its may-borrow graph, with reverse declaration order for free choices.
+    Vec<Order> orders = Vec.new();
+    Vec<uint> first = Vec.new(); usize nd = drop_locals.len();
+    for (j in 0..nd) { first.push(*drop_locals.get(nd - 1 - j).unwrap()); }
+    orders.push(Order { number: 0, locals: first });
+    usize count = old_locals.len();
+    for (st in &const states) {
+        uint block = st.key;
+        usize bi = borrow_entry(&poll.async_borrows, block);
+        Vec<Vec<uint>> graph = Vec.new(); Vec<Vec<uint>> drops = Vec.new(); Vec<uint> incoming = Vec.new();
+        for (i in 0..count) { graph.push(Vec.new()); drops.push(Vec.new()); incoming.push(0); }
+        for (p in &const poll.async_borrows.get(bi).unwrap().pairs) { set_add(graph.get_mut(p.key as usize).unwrap(), p.value); }
+        for (holder in &const drop_locals) {
+            Vec<uint> seen = Vec.new();
+            var work = set_copy(graph.get(*holder as usize).unwrap());
+            while (!work.is_empty()) {
+                uint referent = work.pop().unwrap();
+                if (!set_add(&seen, referent) || referent == *holder) { continue; }
+                if (set_has(drop_locals, referent) && set_add(drops.get_mut(*holder as usize).unwrap(), referent)) {
+                    *incoming.get_mut(referent as usize).unwrap() += 1;
+                }
+                for (child in graph.get(referent as usize).unwrap()) { work.push(*child); }
+            }
+        }
+        // Largest ready local first, as std::set<uint32_t, std::greater>.
+        Vec<uint> ready = Vec.new();
+        for (local in &const drop_locals) { if (*incoming.get(*local as usize).unwrap() == 0) { set_add(&ready, *local); } }
+        Vec<uint> order = Vec.new();
+        while (!ready.is_empty()) {
+            uint local = ready.pop().unwrap(); order.push(local);
+            for (referent in drops.get(local as usize).unwrap()) {
+                var left = incoming.get_mut(*referent as usize).unwrap(); *left -= 1;
+                if (*left == 0) { set_add(&ready, *referent); }
+            }
+        }
+        if (order.len() != drop_locals.len()) {
+            ck.r.sink.error(old_blocks.get(block as usize).unwrap().term.span, "cannot suspend here; values with destructors borrow each other", "SNX0507");
+            return false;
+        }
+        orders.push(Order { number: st.value as ulong, locals: order });
+    }
+
+    // The factory transfers arguments into stable storage without running the
+    // body. Its checked capture metadata established the input lifetimes.
+    var make = Builder { span: span, usize_t: ck.usize_t(), bool_t: ck.bool_t(), str_ref: ck.r.types.ref_type(ck.r.types.str(), true) };
+    var handle = factory.blocks.get(0).unwrap().stmts.get(0).unwrap().rvalue.copy();
+    factory.blocks = Vec.new();
+    uint argc = factory.arg_count;
+    uint b = make.block(&*factory);
+    uint size = make.local(&*factory, ck.usize_t(), "");
+    Vec<TypeId> size_args = Vec.new(); size_args.push(frame);
+    b = make.call(&*factory, b, "size_of", Vec.new(), Place.of(size), size_args);
+    uint pointer = make.local(&*factory, frame_pointer, "@frame");
+    Vec<Operand> alloc_args = Vec.new(); alloc_args.push(Operand.copy_of(Place.of(size)));
+    b = make.call(&*factory, b, "synx_rt_alloc", alloc_args, Place.of(pointer), Vec.new());
+    make.put(&*factory, b, Place.of(pointer).deref().field(0), make.number(0));
+    for (arg in 1..argc + 1) { make.put(&*factory, b, Place.of(pointer).deref().field(*field.get(arg as usize).unwrap()), Operand.copy_of(Place.of(arg))); }
+    for (p in &const poll.async_drop_flags) {
+        make.put(&*factory, b, Place.of(pointer).deref().field(*field.get(p.value as usize).unwrap()), make.flag(p.key > 0 && p.key <= argc));
+    }
+    uint raw_bytes = make.local(&*factory, raw, "");
+    var cast = Rvalue.new(RvalueKind.Cast); cast.a = Operand.copy_of(Place.of(pointer)); cast.type = raw;
+    make.assign(&*factory, b, Place.of(raw_bytes), cast);
+    *handle.elems.get_mut(0).unwrap() = Operand.copy_of(Place.of(raw_bytes)); handle.captures = Vec.new();
+    make.assign(&*factory, b, Place.of(0), handle); make.ret(&*factory, b);
+
+    poll.ret = poll_type; poll.arg_count = 2;
+    poll.locals.push(Local.new(poll_type, "return", false, span));
+    poll.locals.push(Local.new(frame_pointer, "frame", true, span));
+    poll.locals.push(Local.new(wake_type, "wake", true, span));
+    for (i in 0..old_blocks.len() + 1) { poll.blocks.push(BasicBlock.new()); }
+    var fr = Frame { field: field, wake: old_wake, make: make };
+    for (index in 0..old_blocks.len()) {
+        uint block = index as uint + 1;
+        for (st in &const old_blocks.get(index).unwrap().stmts) {
+            bool skip = false;
+            match st.kind { StatementKind.StorageDead => { skip = true; }, StatementKind.Nop => { skip = true; }, _ => {} }
+            if (skip) { continue; }
+            Vec<Statement> before = Vec.new();
+            var statement = st.copy();
+            statement.place = fr.place(&*poll, &const old_locals, &const st.place, &before);
+            fr.operand(&*poll, &const old_locals, &statement.rvalue.a, &before);
+            fr.operand(&*poll, &const old_locals, &statement.rvalue.b, &before);
+            for (i in 0..statement.rvalue.elems.len()) { fr.operand(&*poll, &const old_locals, statement.rvalue.elems.get_mut(i).unwrap(), &before); }
+            statement.rvalue.captures = Vec.new();
+            bool remap = false;
+            match statement.rvalue.kind { RvalueKind.Ref => { remap = true; }, RvalueKind.Len => { remap = true; }, RvalueKind.Discriminant => { remap = true; }, _ => {} }
+            if (remap) { statement.rvalue.place = fr.place(&*poll, &const old_locals, &const st.rvalue.place, &before); }
+            var statement_kind = statement.kind;
+            match statement_kind { StatementKind.DropIf => { statement.flag_local = fr.load(&*poll, &const old_locals, st.flag_local, &before); }, _ => {} }
+            var dest = &poll.blocks.get_mut(block as usize).unwrap().stmts;
+            for (s in &const before) { dest.push(s.copy()); }
+            dest.push(statement);
+        }
+        uint number = pair_get(states, index as uint);
+        if (number != NONE) { fr.finish(&*ck, &*poll, block, false, number as ulong, poll_type, output); continue; }
+        var term = old_blocks.get(index).unwrap().term.copy();
+        bool returns = false;
+        match term.kind { TerminatorKind.Return => { returns = true; }, _ => {} }
+        if (returns) { fr.finish(&*ck, &*poll, block, true, COMPLETE, poll_type, output); continue; }
+        Vec<Statement> before = Vec.new();
+        fr.operand(&*poll, &const old_locals, &term.discr, &before);
+        fr.operand(&*poll, &const old_locals, &term.cond, &before);
+        fr.operand(&*poll, &const old_locals, &term.callee.fn_operand, &before);
+        for (i in 0..term.args.len()) { fr.operand(&*poll, &const old_locals, term.args.get_mut(i).unwrap(), &before); }
+        var term_kind = term.kind;
+        match term_kind {
+            TerminatorKind.Call => { var original = term.dest.copy(); term.dest = fr.place(&*poll, &const old_locals, &const original, &before); term.target += 1; }
+            TerminatorKind.Goto => { term.target += 1; }
+            TerminatorKind.Assert => { term.target += 1; }
+            TerminatorKind.Switch => { term.otherwise += 1; for (i in 0..term.cases.len()) { term.cases.get_mut(i).unwrap().block += 1; } }
+            _ => {}
+        }
+        var target = poll.blocks.get_mut(block as usize).unwrap();
+        for (s in &const before) { target.stmts.push(s.copy()); }
+        target.term = term;
+    }
+    uint invalid = fr.make.block(&*poll); fr.make.panic_at(&*poll, invalid, "async task polled after completion");
+    var dispatch = Terminator.new(TerminatorKind.Switch); dispatch.discr = Operand.copy_of(fr.state());
+    dispatch.cases.push(Case { value: 0, block: 1 }); dispatch.otherwise = invalid; dispatch.span = span;
+    for (p in &const poll.async_suspends) { dispatch.cases.push(Case { value: pair_get(states, p.key) as ulong, block: p.value + 1 }); }
+    poll.blocks.get_mut(0).unwrap().term = dispatch.copy();
+
+    cancel.locals = Vec.new();
+    cancel.locals.push(Local.new(ck.void_t(), "return", false, span));
+    cancel.locals.push(Local.new(frame_pointer, "frame", true, span));
+    cancel.blocks = Vec.new();
+    uint entry = fr.make.block(&*cancel);
+    dispatch.cases = Vec.new();
+    for (o in &const orders) {
+        uint block = fr.make.block(&*cancel); dispatch.cases.push(Case { value: o.number, block: block });
+        for (local in &const o.locals) {
+            uint flag = fr.make.local(&*cancel, ck.bool_t(), "");
+            fr.make.put(&*cancel, block, Place.of(flag), Operand.copy_of(fr.at(pair_get(poll.async_drop_flags, *local))));
+            var drop = Statement.new(StatementKind.DropIf, fr.at(*local), span); drop.flag_local = flag;
+            cancel.blocks.get_mut(block as usize).unwrap().stmts.push(drop);
+        }
+        Vec<Operand> free_args = Vec.new(); free_args.push(Operand.copy_of(Place.of(1)));
+        block = fr.make.call(&*cancel, block, "synx_rt_free", free_args, Place.none(), Vec.new()); fr.make.ret(&*cancel, block);
+    }
+    uint done = fr.make.block(&*cancel); dispatch.cases.push(Case { value: COMPLETE, block: done });
+    Vec<Operand> free_args = Vec.new(); free_args.push(Operand.copy_of(Place.of(1)));
+    done = fr.make.call(&*cancel, done, "synx_rt_free", free_args, Place.none(), Vec.new()); fr.make.ret(&*cancel, done);
+    invalid = fr.make.block(&*cancel); fr.make.panic_at(&*cancel, invalid, "invalid async cancellation state");
+    dispatch.otherwise = invalid; cancel.blocks.get_mut(entry as usize).unwrap().term = dispatch;
+    return true;
+}
+
+bool is_send(&const Checker ck, &const Vec<ast.Ast> t, DefId def) {
+    var d = ck.r.program.def(def);
+    return t.get(d.ast_file as usize).unwrap().function(d.ast_index).async_send;
+}
+
+/// lower_async in async.cpp. A send task may not keep a non-Send value live
+/// across a suspension (SNX0420); references count as Send for the frame when
+/// their referent is live too. Returns false at the first error.
+pub bool convert(&Checker ck, &const Vec<ast.Ast> t, &Module m) {
+    for (i in 0..m.functions.len()) {
+        uint poll_index = m.functions.get(i).unwrap().async_poll;
+        if (poll_index == NONE) { continue; }
+        uint cancel_index = m.functions.get(i).unwrap().async_cancel;
+        if (is_send(&const *ck, t, m.functions.get(i).unwrap().def)) {
+            var body = m.functions.get_mut(poll_index as usize).unwrap();
+            for (li in 0..body.async_live.len()) {
+                uint block = body.async_live.get(li).unwrap().block;
+                var live = set_copy(&const body.async_live.get(li).unwrap().locals);
+                usize bi = borrow_entry(&body.async_borrows, block);
+                bool changed = true;
+                while (changed) {
+                    changed = false;
+                    for (p in &const body.async_borrows.get(bi).unwrap().pairs) { if (set_has(live, p.key) && set_add(&live, p.value)) { changed = true; } }
+                }
+                for (local in &const live) {
+                    if (*local == body.async_waker) { continue; }
+                    var ty = body.locals.get(*local as usize).unwrap().type;
+                    bool strict = ck.has_marker(ty, "Send", false);
+                    bool borrowed = false;
+                    for (p in &const body.async_borrows.get(bi).unwrap().pairs) { if (p.key == *local && set_has(live, p.value)) { borrowed = true; } }
+                    if (!strict && !(borrowed && ck.has_marker(ty, "Send", true))) {
+                        var name = String.from(body.locals.get(*local as usize).unwrap().name);
+                        var who = if (name.is_empty()) { String.from("a temporary") } else { "`{name}`" };
+                        var shown = ck.show(ty);
+                        ck.r.sink.error(body.blocks.get(block as usize).unwrap().term.span,
+                            "cannot suspend a send task while {who} of type '{shown}' is retained; it does not implement Send", "SNX0420");
+                        return false;
+                    }
+                }
+            }
+        }
+        var factory = mem.replace(m.functions.get_mut(i).unwrap(), Function.new(String.new()));
+        var poll = mem.replace(m.functions.get_mut(poll_index as usize).unwrap(), Function.new(String.new()));
+        var cancel = mem.replace(m.functions.get_mut(cancel_index as usize).unwrap(), Function.new(String.new()));
+        bool ok = transform(&*ck, &factory, &poll, &cancel);
+        *m.functions.get_mut(i).unwrap() = factory;
+        *m.functions.get_mut(poll_index as usize).unwrap() = poll;
+        *m.functions.get_mut(cancel_index as usize).unwrap() = cancel;
+        if (!ok) { return false; }
+    }
+    return true;
+}

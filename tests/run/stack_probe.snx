@@ -1,0 +1,9 @@
+/// Purpose: frames larger than one stack page grow the stack in order.
+/// Windows commits stack pages through a guard page; the prologue must touch
+/// each page of a large frame before the body writes below it.
+int fill(int depth) {
+    int[4096] page = [depth; 4096];
+    if (depth == 0) { return page[4095]; }
+    return fill(depth - 1) + page[0] - depth;
+}
+main() { print("deep {fill(40)}"); }

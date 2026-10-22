@@ -1,0 +1,117 @@
+/// Command-line compiler driver. Source: compiler/src/main.cpp.
+/// Passes own their inputs through Compilation; inspection commands retain
+/// partial results on errors. Native builds use build.snx.
+import driver_io;
+import driver_options;
+import driver_paths;
+import build;
+import compile.Compilation;
+import prelude_source;
+import source.SourceFile;
+import diagnostics.DiagnosticSink;
+import lexer;
+import token;
+import parser.Parser;
+import ast_dump;
+import ast_print;
+import ir_print;
+import module_dump;
+import bytes;
+
+void usage() {
+    driver_io.text(1, "usage: synx <command> [options]\ncommands:\n  version            print the compiler version and host platform\n  about              describe this build of the compiler\n  lex <file.snx>     print the token stream of a file\n  parse <file.snx>   print the syntax tree (--strict adds spans and every field)\n  modules <file.snx> print declarations and bound module namespaces (--signatures, --check, --lower, --borrow, --async stop after that stage; --machine adds layouts and registers)\n  check <file.snx>   check names, types, and ownership without building\n  ir <file.snx>      print the Dendrite IR of a program\n  build <file.snx>   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, -v)\n  run <file.snx>     build and run\n");
+}
+int about() {
+    var version = driver_io.VERSION; var host = driver_io.host_name();
+    driver_io.text(1, "  o--o--o   Synx {version}\n            Created by Edward Ware\n\n  This build\n    Target      {host} / x86-64\n");
+    driver_io.text(1, "    Compiler    Synx compiler port\n    Library     Synx\n    Runtime     C platform adapters\n\n  Origins and direction\n    Started with C and C++.\n    Compiler port written in Synx; bootstrap validation pending.\n    C remains for startup, allocation, I/O, number conversion/formatting,\n    threads, synchronization, clocks, and host services.\n\n  Toolchain\n    Front end   lexer, parser, modules, and type checking\n    Dendrite    typed IR, borrow and move checks\n    Axon        x86-64 code generation and register allocation\n    Objects     ELF / COFF / Mach-O\n    Linker      built-in (--linker=system uses the host toolchain)\n\n  Planned\n    Myelin package manager; ARM64 targets\n\n  This is not an Arasaka product choom\n");
+    return 0;
+}
+Vec<byte> token_text(&const token.Token item) {
+    Vec<byte> out = Vec.new(); bytes.text(&out, "{item.span.start}-{item.span.end} ");
+    match item.kind {
+        Ident => { bytes.text(&out, "Ident "); bytes.append(&out, item.text); },
+        IntLit => bytes.text(&out, "IntLit {item.int_value}"), LongLit => bytes.text(&out, "LongLit {item.int_value}"),
+        FloatLit => { bytes.text(&out, "FloatLit "); bytes.append(&out, driver_io.float_text(item.float_value)); },
+        DoubleLit => { bytes.text(&out, "DoubleLit "); bytes.append(&out, driver_io.float_text(item.float_value)); },
+        CharLit => { var value = driver_io.hex(item.int_value); bytes.text(&out, "CharLit U+{value}"); },
+        StringLit => { bytes.text(&out, "StringLit \""); bytes.append(&out, item.text); out.push(34); },
+        StringText => { bytes.text(&out, "StringText \""); bytes.append(&out, item.text); out.push(34); },
+        DocComment => { bytes.text(&out, "DocComment \""); bytes.append(&out, item.text); out.push(34); },
+        Error => { bytes.text(&out, "Error "); bytes.append(&out, item.text); },
+        _ => { if (token.is_keyword(item.kind)) { bytes.text(&out, "Kw "); } bytes.text(&out, token.name(item.kind)); },
+    }
+    return out;
+}
+int lex_file(&const SourceFile file) {
+    var sink = DiagnosticSink.new(); var tokens = lexer.tokenize(file, &sink);
+    for (item in &const tokens) { driver_io.cstring(1, token_text(item)); driver_io.text(1, "\n"); }
+    if (sink.has_errors()) { Vec<SourceFile> sources = Vec.new(); driver_io.cstring(2, sink.render(file, sources)); return 1; }
+    return 0;
+}
+int parse_file(&const SourceFile file, bool strict) {
+    var sink = DiagnosticSink.new(); var tokens = lexer.tokenize(file, &sink);
+    var parser = Parser.new(file, tokens, sink); parser.parse_module();
+    var text = if (strict) { ast_dump.module(parser.ast) } else { ast_print.module(parser.ast) };
+    driver_io.cstring(1, text); driver_io.text(1, "\n");
+    if (parser.sink.has_errors()) { Vec<SourceFile> sources = Vec.new(); driver_io.cstring(2, parser.sink.render(file, sources)); return 1; }
+    return 0;
+}
+int build_file(&const Vec<String> args, bool run) {
+    match driver_options.parse(args, driver_io.host_target()) {
+        Err(message) => { driver_io.text(2, message); return 1; },
+        Ok(options) => {
+            var result = build.program(options); if (!result.ok) { return 1; }
+            if (run) { return driver_paths.run_executable(result.executable); }
+            driver_io.text(1, "Built {result.executable}\n"); return 0;
+        }
+    }
+}
+int inspect(&const str command, &const str input, &const str option) {
+    uint stage = 5;
+    bool modules = command == "modules";
+    if (modules) {
+        stage = 0;
+        if (option == "--signatures") { stage = 1; }
+        if (option == "--check") { stage = 2; }
+        if (option == "--lower") { stage = 3; }
+        if (option == "--borrow") { stage = 4; }
+        if (option == "--async" || option == "--machine") { stage = 5; }
+    }
+    match Compilation.load(input, prelude_source.source(), "", stage, false) {
+        Err(_) => { driver_io.text(2, "cannot read file: {input}\n"); return 1; },
+        Ok(compilation) => {
+            if (modules) {
+                driver_io.cstring(1, module_dump.dump(compilation.lowerer.ck.r));
+                if (stage == 2) { driver_io.cstring(1, module_dump.dump_check(compilation.lowerer.ck, compilation.trees)); }
+                if (stage >= 3) { driver_io.cstring(1, module_dump.dump_ir(compilation.lowerer.ck.r, compilation.trees, compilation.lowerer.module)); }
+                if (option == "--machine" && compilation.ok) { driver_io.cstring(1, module_dump.dump_machine(&compilation.lowerer.ck, &const compilation.lowerer.module)); }
+                return if (compilation.ok) { 0 } else { 1 };
+            }
+            if (build.prelude_error(compilation)) { return 2; }
+            if (command == "ir") { driver_io.cstring(1, ir_print.module(compilation.lowerer.ck.r, compilation.lowerer.module)); }
+            if (!compilation.ok) { build.report(compilation); return 1; }
+            if (command == "check") { driver_io.text(1, "{input}: ok\n"); }
+            return 0;
+        }
+    }
+}
+pub int run(&const Vec<String> args) {
+    driver_io.init();
+    if (args.len() < 2) { usage(); return 1; }
+    var command = args.get(1).unwrap().as_str();
+    if (command == "version" || command == "--version") { var version = driver_io.VERSION; var host = driver_io.host_name(); driver_io.text(1, "Synx {version} ({host})\n"); return 0; }
+    if (command == "about") { return about(); }
+    if (command == "build") { return build_file(args, false); } if (command == "run") { return build_file(args, true); }
+    bool known = command == "lex" || command == "parse" || command == "modules" || command == "check" || command == "ir";
+    if (!known) { driver_io.text(2, "unknown command: {command}\n"); usage(); return 1; }
+    if (args.len() < 3) { driver_io.text(2, "{command} needs a file argument\n"); return 1; }
+    var input = args.get(2).unwrap().as_str(); var option = if (args.len() > 3) { args.get(3).unwrap().as_str() } else { "" };
+    if (command == "lex" || command == "parse") {
+        match SourceFile.load(input, 0) {
+            Err(_) => { driver_io.text(2, "cannot read file: {input}\n"); return 1; },
+            Ok(file) => { if (command == "lex") { return lex_file(file); } return parse_file(file, option == "--strict"); }
+        }
+    }
+    return inspect(command, input, option);
+}

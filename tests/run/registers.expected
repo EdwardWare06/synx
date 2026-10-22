@@ -1,0 +1,17 @@
+cleanup 8
+loop 31 8 pressure 109 recursion 16
+narrow 0 -32768 -2147483648 0
+ops 11 9 1 -11 -12 44
+memory 40 19
+returns 255 -1 4294967295
+bool true char A
+cleanup 11
+cleanup 12
+cleanup 13
+cleanup 21
+cleanup 22
+cleanup 31
+cleanup 32
+cleanup 33
+nested 3 17
+deep 1

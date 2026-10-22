@@ -1,0 +1,772 @@
+/// Strict AST serialization. Source: compiler/src/ast_strict.cpp.
+/// Parity: tests/selfhost_parser_test.cpp.
+import ast;
+import bytes;
+import source.Span;
+
+&const str call_name(ast.CallMode mode) {
+    match mode {
+        ast.CallMode.Writable => return "writable",
+        ast.CallMode.Shared => return "shared",
+        ast.CallMode.Once => return "once",
+    }
+}
+&const str capture_name(ast.CaptureMode mode) {
+    match mode {
+        ast.CaptureMode.Move => return "move",
+        ast.CaptureMode.Shared => return "shared",
+        ast.CaptureMode.Writable => return "writable",
+    }
+}
+&const str self_name(ast.SelfKind kind) {
+    match kind {
+        ast.SelfKind.None => return "none",
+        ast.SelfKind.Value => return "value",
+        ast.SelfKind.Ref => return "ref",
+        ast.SelfKind.ConstRef => return "constref",
+    }
+}
+&const str variant_name(ast.VariantKind kind) {
+    match kind {
+        ast.VariantKind.Unit => return "unit",
+        ast.VariantKind.Tuple => return "tuple",
+        ast.VariantKind.Struct => return "struct",
+    }
+}
+&const str prim_name(ast.PrimKind kind) {
+    match kind {
+        ast.PrimKind.Bool => return "bool",
+        ast.PrimKind.Byte => return "byte",
+        ast.PrimKind.Short => return "short",
+        ast.PrimKind.Int => return "int",
+        ast.PrimKind.Long => return "long",
+        ast.PrimKind.Uint => return "uint",
+        ast.PrimKind.Ulong => return "ulong",
+        ast.PrimKind.Usize => return "usize",
+        ast.PrimKind.Float => return "float",
+        ast.PrimKind.Double => return "double",
+        ast.PrimKind.Char => return "char",
+        ast.PrimKind.Void => return "void",
+    }
+}
+&const str unary_name(ast.UnaryOp op) {
+    match op {
+        ast.UnaryOp.Neg => return "-",
+        ast.UnaryOp.Not => return "!",
+        ast.UnaryOp.BitNot => return "~",
+        ast.UnaryOp.Deref => return "*",
+    }
+}
+&const str binary_name(ast.BinaryOp op) {
+    match op {
+        ast.BinaryOp.Add => return "+",
+        ast.BinaryOp.Sub => return "-",
+        ast.BinaryOp.Mul => return "*",
+        ast.BinaryOp.Div => return "/",
+        ast.BinaryOp.Rem => return "%",
+        ast.BinaryOp.Eq => return "==",
+        ast.BinaryOp.Ne => return "!=",
+        ast.BinaryOp.Lt => return "<",
+        ast.BinaryOp.Gt => return ">",
+        ast.BinaryOp.Le => return "<=",
+        ast.BinaryOp.Ge => return ">=",
+        ast.BinaryOp.And => return "&&",
+        ast.BinaryOp.Or => return "||",
+        ast.BinaryOp.BitAnd => return "&",
+        ast.BinaryOp.BitOr => return "|",
+        ast.BinaryOp.BitXor => return "^",
+        ast.BinaryOp.Shl => return "<<",
+        ast.BinaryOp.Shr => return ">>",
+    }
+}
+&const str assign_name(ast.AssignOp op) {
+    match op {
+        ast.AssignOp.Assign => return "=",
+        ast.AssignOp.Add => return "+=",
+        ast.AssignOp.Sub => return "-=",
+        ast.AssignOp.Mul => return "*=",
+        ast.AssignOp.Div => return "/=",
+        ast.AssignOp.Rem => return "%=",
+        ast.AssignOp.BitAnd => return "&=",
+        ast.AssignOp.BitOr => return "|=",
+        ast.AssignOp.BitXor => return "^=",
+        ast.AssignOp.Shl => return "<<=",
+        ast.AssignOp.Shr => return ">>=",
+    }
+}
+&const str type_name(ast.TypeKind kind) {
+    match kind {
+        ast.TypeKind.Primitive => return "PrimitiveType",
+        ast.TypeKind.Path => return "PathType",
+        ast.TypeKind.Ref => return "RefType",
+        ast.TypeKind.Ptr => return "PtrType",
+        ast.TypeKind.Array => return "ArrayType",
+        ast.TypeKind.Slice => return "SliceType",
+        ast.TypeKind.Optional => return "OptionalType",
+        ast.TypeKind.Tuple => return "TupleType",
+        ast.TypeKind.Fn => return "FnType",
+        ast.TypeKind.Dyn => return "DynType",
+        ast.TypeKind.SelfType => return "SelfType",
+    }
+}
+&const str expr_name(ast.ExprKind kind) {
+    match kind {
+        ast.ExprKind.IntLit => return "IntLit",
+        ast.ExprKind.FloatLit => return "FloatLit",
+        ast.ExprKind.CharLit => return "CharLit",
+        ast.ExprKind.StringLit => return "StringLit",
+        ast.ExprKind.BoolLit => return "BoolLit",
+        ast.ExprKind.Interp => return "Interp",
+        ast.ExprKind.Name => return "Name",
+        ast.ExprKind.Field => return "Field",
+        ast.ExprKind.Call => return "Call",
+        ast.ExprKind.Index => return "Index",
+        ast.ExprKind.Unary => return "Unary",
+        ast.ExprKind.Binary => return "Binary",
+        ast.ExprKind.Cast => return "Cast",
+        ast.ExprKind.Try => return "Try",
+        ast.ExprKind.OptChain => return "OptChain",
+        ast.ExprKind.Coalesce => return "Coalesce",
+        ast.ExprKind.Range => return "Range",
+        ast.ExprKind.Ref => return "Ref",
+        ast.ExprKind.StructLit => return "StructLit",
+        ast.ExprKind.Tuple => return "Tuple",
+        ast.ExprKind.Array => return "Array",
+        ast.ExprKind.ArrayRepeat => return "ArrayRepeat",
+        ast.ExprKind.Block => return "BlockExpr",
+        ast.ExprKind.If => return "If",
+        ast.ExprKind.Match => return "Match",
+        ast.ExprKind.Closure => return "Closure",
+        ast.ExprKind.Unsafe => return "Unsafe",
+        ast.ExprKind.Await => return "Await",
+        ast.ExprKind.Return => return "Return",
+        ast.ExprKind.Break => return "Break",
+        ast.ExprKind.Continue => return "Continue",
+    }
+}
+&const str pattern_name(ast.PatternKind kind) {
+    match kind {
+        ast.PatternKind.Wildcard => return "Wildcard",
+        ast.PatternKind.Literal => return "LiteralPattern",
+        ast.PatternKind.Binding => return "Binding",
+        ast.PatternKind.Path => return "PathPattern",
+        ast.PatternKind.TupleStruct => return "TupleStructPattern",
+        ast.PatternKind.Struct => return "StructPattern",
+        ast.PatternKind.Tuple => return "TuplePattern",
+        ast.PatternKind.Or => return "OrPattern",
+        ast.PatternKind.Range => return "RangePattern",
+    }
+}
+&const str stmt_name(ast.StmtKind kind) {
+    match kind {
+        ast.StmtKind.VarDecl => return "VarDecl",
+        ast.StmtKind.Expr => return "ExprStmt",
+        ast.StmtKind.Assign => return "Assign",
+        ast.StmtKind.While => return "While",
+        ast.StmtKind.Loop => return "Loop",
+        ast.StmtKind.For => return "For",
+    }
+}
+&const str item_name(ast.ItemKind kind) {
+    match kind {
+        ast.ItemKind.Import => return "Import",
+        ast.ItemKind.Const => return "Const",
+        ast.ItemKind.Function => return "FunctionItem",
+        ast.ItemKind.Struct => return "Struct",
+        ast.ItemKind.Enum => return "Enum",
+        ast.ItemKind.Trait => return "Trait",
+        ast.ItemKind.Impl => return "Impl",
+        ast.ItemKind.Extern => return "Extern",
+    }
+}
+
+/// Input must be a nibble.
+byte hex_digit(uint value) {
+    if (value < 10) { return (48 + value) as byte; }
+    return (87 + value) as byte;
+}
+
+// The writer owns only its output. Returning output moves its sole field.
+struct Writer {
+    Vec<byte> output;
+
+    Writer new() { return Writer { output: Vec.new() }; }
+    void text(&self, &const str value) { bytes.text(&self.output, value); }
+    void sp(&self) { self.output.push(32); }
+    void end(&self) { self.output.push(41); }
+    void sep(&self, usize index) { if (index != 0) { self.sp(); } }
+    void flag(&self, bool value) {
+        self.output.push(if (value) { 116 } else { 102 });
+    }
+    void number(&self, ulong value) { self.text("{value}"); }
+    void span(&self, Span value) {
+        self.text("@{value.start}-{value.end}:{value.file}");
+    }
+    void begin(&self, &const str name, Span value) {
+        self.output.push(40); self.text(name); self.sp(); self.span(value);
+    }
+    void quoted(&self, &const Vec<byte> value) {
+        self.output.push(34);
+        for (part in value) {
+            byte c = *part;
+            if (c < 32 || c > 126 || c == 34 || c == 92) {
+                self.output.push(92); self.output.push(120);
+                self.output.push(hex_digit((c as uint) >> 4));
+                self.output.push(hex_digit((c as uint) & 15));
+            } else { self.output.push(c); }
+        }
+        self.output.push(34);
+    }
+    void real_bits(&self, double value) {
+        ulong raw = unsafe {
+            *((&const value as *const double) as *const ulong)
+        };
+        self.output.push(35);
+        for (i in 0..16) {
+            usize shift = ((15 - i) as usize) * 4;
+            self.output.push(hex_digit(((raw >> shift) & 15) as uint));
+        }
+    }
+
+    void segment(&self, &const ast.PathSegment value) {
+        self.begin("Segment", value.span); self.sp();
+        self.quoted(value.name); self.end();
+    }
+    void segments(&self, &const Vec<ast.PathSegment> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.segment(values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void path(&self, &const ast.Path value) {
+        self.begin("Path", value.span); self.sp();
+        self.segments(value.segments); self.end();
+    }
+    void bound(&self, &const ast.Ast tree, &const ast.Bound value) {
+        self.begin("Bound", value.span); self.sp();
+        self.path(value.path); self.sp();
+        self.types(tree, value.args); self.end();
+    }
+    void bounds(&self, &const ast.Ast tree, &const Vec<ast.Bound> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.bound(tree, values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void generics(&self, &const ast.Ast tree, &const Vec<ast.GenericParam> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("Generic", value.span); self.sp();
+            self.quoted(value.name); self.sp();
+            self.bounds(tree, value.bounds); self.end();
+        }
+        self.output.push(93);
+    }
+
+    void types(&self, &const ast.Ast tree, &const Vec<uint> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.emit_type(tree, *values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void emit_type(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("nil"); return; }
+        var value = tree.type(id);
+        self.begin(type_name(value.kind), value.span);
+        match value.kind {
+            ast.TypeKind.Primitive => {
+                self.sp(); self.text(prim_name(value.prim));
+            }
+            ast.TypeKind.Path => {
+                self.sp(); self.path(value.path);
+                self.sp(); self.types(tree, value.items);
+            }
+            ast.TypeKind.Ref => {
+                self.sp(); self.flag(value.flag);
+                self.sp(); self.emit_type(tree, value.a);
+            }
+            ast.TypeKind.Ptr => {
+                self.sp(); self.flag(value.flag);
+                self.sp(); self.emit_type(tree, value.a);
+            }
+            ast.TypeKind.Array => {
+                self.sp(); self.emit_type(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.TypeKind.Slice => {
+                self.sp(); self.emit_type(tree, value.a);
+            }
+            ast.TypeKind.Optional => {
+                self.sp(); self.emit_type(tree, value.a);
+            }
+            ast.TypeKind.Tuple => {
+                self.sp(); self.types(tree, value.items);
+            }
+            ast.TypeKind.Fn => {
+                self.sp(); self.text(call_name(value.mode));
+                self.sp(); self.flag(value.flag);
+                self.sp(); self.types(tree, value.items);
+                self.sp(); self.emit_type(tree, value.a);
+            }
+            ast.TypeKind.Dyn => {
+                self.sp(); self.bound(tree, value.bound);
+            }
+            ast.TypeKind.SelfType => {}
+        }
+        self.end();
+    }
+
+    void exprs(&self, &const ast.Ast tree, &const Vec<uint> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.emit_expr(tree, *values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void parts(&self, &const ast.Ast tree, &const Vec<ast.InterpPart> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.text("(Part "); self.quoted(value.text); self.sp();
+            self.emit_expr(tree, value.expr); self.end();
+        }
+        self.output.push(93);
+    }
+    void inits(&self, &const ast.Ast tree, &const Vec<ast.FieldInit> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("Init", value.span); self.sp();
+            self.quoted(value.name); self.sp();
+            self.emit_expr(tree, value.value); self.end();
+        }
+        self.output.push(93);
+    }
+    void arms(&self, &const ast.Ast tree, &const Vec<ast.MatchArm> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("Arm", value.span); self.sp();
+            self.emit_pattern(tree, value.pattern); self.sp();
+            self.emit_expr(tree, value.guard); self.sp();
+            self.emit_expr(tree, value.body); self.end();
+        }
+        self.output.push(93);
+    }
+    void captures(&self, &const Vec<ast.Capture> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("Capture", value.span); self.sp();
+            self.quoted(value.name); self.sp();
+            self.text(capture_name(value.mode)); self.end();
+        }
+        self.output.push(93);
+    }
+    void closure_params(&self, &const ast.Ast tree, &const Vec<ast.ClosureParam> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("ClosureParam", value.span); self.sp();
+            self.emit_type(tree, value.type); self.sp();
+            self.quoted(value.name); self.end();
+        }
+        self.output.push(93);
+    }
+    void emit_closure(&self, &const ast.Ast tree, &const ast.Expr value) {
+        self.sp(); self.text(call_name(value.mode));
+        self.sp(); self.flag(value.is_send);
+        self.sp(); self.flag(value.explicit_captures);
+        self.sp(); self.captures(value.captures);
+        self.sp(); self.closure_params(tree, value.params);
+        self.sp(); self.emit_type(tree, value.a);
+        self.sp(); self.emit_expr(tree, value.b);
+    }
+    void emit_expr(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("nil"); return; }
+        var value = tree.expr(id);
+        self.begin(expr_name(value.kind), value.span);
+        match value.kind {
+            ast.ExprKind.IntLit => {
+                self.sp(); self.number(value.number);
+                self.sp(); self.flag(value.flag);
+            }
+            ast.ExprKind.FloatLit => {
+                self.sp(); self.real_bits(value.real);
+                self.sp(); self.flag(value.flag);
+            }
+            ast.ExprKind.CharLit => {
+                self.sp(); self.number(value.number);
+            }
+            ast.ExprKind.StringLit => {
+                self.sp(); self.quoted(value.text);
+            }
+            ast.ExprKind.BoolLit => {
+                self.sp(); self.flag(value.flag);
+            }
+            ast.ExprKind.Interp => {
+                self.sp(); self.parts(tree, value.parts);
+            }
+            ast.ExprKind.Name => {
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.types(tree, value.type_args);
+            }
+            ast.ExprKind.Field => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.span(value.name_span);
+                self.sp(); self.types(tree, value.type_args);
+            }
+            ast.ExprKind.Call => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.exprs(tree, value.items);
+            }
+            ast.ExprKind.Index => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.ExprKind.Unary => {
+                self.sp(); self.text(unary_name(value.unary_op));
+                self.sp(); self.emit_expr(tree, value.a);
+            }
+            ast.ExprKind.Binary => {
+                self.sp(); self.text(binary_name(value.binary_op));
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.ExprKind.Cast => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_type(tree, value.b);
+            }
+            ast.ExprKind.Try => {
+                self.sp(); self.emit_expr(tree, value.a);
+            }
+            ast.ExprKind.OptChain => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.quoted(value.text);
+            }
+            ast.ExprKind.Coalesce => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.ExprKind.Range => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+                self.sp(); self.flag(value.flag);
+            }
+            ast.ExprKind.Ref => {
+                self.sp(); self.flag(value.flag);
+                self.sp(); self.emit_expr(tree, value.a);
+            }
+            ast.ExprKind.StructLit => {
+                self.sp(); self.path(value.path);
+                self.sp(); self.inits(tree, value.fields);
+            }
+            ast.ExprKind.Tuple => {
+                self.sp(); self.exprs(tree, value.items);
+            }
+            ast.ExprKind.Array => {
+                self.sp(); self.exprs(tree, value.items);
+            }
+            ast.ExprKind.ArrayRepeat => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.ExprKind.Block => {
+                self.sp(); self.emit_block(tree, value.a);
+            }
+            ast.ExprKind.If => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_block(tree, value.b);
+                self.sp(); self.emit_expr(tree, value.c);
+            }
+            ast.ExprKind.Match => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.arms(tree, value.arms);
+            }
+            ast.ExprKind.Closure => self.emit_closure(tree, value),
+            ast.ExprKind.Unsafe => {
+                self.sp(); self.emit_block(tree, value.a);
+            }
+            ast.ExprKind.Await => {
+                self.sp(); self.emit_expr(tree, value.a);
+            }
+            ast.ExprKind.Return => {
+                self.sp(); self.emit_expr(tree, value.a);
+            }
+            ast.ExprKind.Break => {}
+            ast.ExprKind.Continue => {}
+        }
+        self.end();
+    }
+
+    void patterns(&self, &const ast.Ast tree, &const Vec<uint> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.emit_pattern(tree, *values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void pattern_fields(&self, &const ast.Ast tree, &const Vec<ast.FieldPattern> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("FieldPattern", value.span); self.sp();
+            self.quoted(value.name); self.sp();
+            self.emit_pattern(tree, value.pattern); self.end();
+        }
+        self.output.push(93);
+    }
+    void emit_pattern(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("nil"); return; }
+        var value = tree.pattern(id);
+        self.begin(pattern_name(value.kind), value.span);
+        match value.kind {
+            ast.PatternKind.Wildcard => {}
+            ast.PatternKind.Literal => {
+                self.sp(); self.emit_expr(tree, value.a);
+            }
+            ast.PatternKind.Binding => {
+                self.sp(); self.quoted(value.text);
+            }
+            ast.PatternKind.Path => {
+                self.sp(); self.path(value.path);
+            }
+            ast.PatternKind.TupleStruct => {
+                self.sp(); self.path(value.path);
+                self.sp(); self.patterns(tree, value.items);
+            }
+            ast.PatternKind.Struct => {
+                self.sp(); self.path(value.path);
+                self.sp(); self.pattern_fields(tree, value.fields);
+            }
+            ast.PatternKind.Tuple => {
+                self.sp(); self.patterns(tree, value.items);
+            }
+            ast.PatternKind.Or => {
+                self.sp(); self.patterns(tree, value.items);
+            }
+            ast.PatternKind.Range => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+                self.sp(); self.flag(value.flag);
+            }
+        }
+        self.end();
+    }
+
+    void stmts(&self, &const ast.Ast tree, &const Vec<uint> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.emit_stmt(tree, *values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void emit_stmt(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("nil"); return; }
+        var value = tree.stmt(id);
+        self.begin(stmt_name(value.kind), value.span);
+        match value.kind {
+            ast.StmtKind.VarDecl => {
+                self.sp(); self.emit_type(tree, value.a);
+                self.sp(); self.flag(value.flag);
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.span(value.name_span);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.StmtKind.Expr => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.flag(value.flag);
+            }
+            ast.StmtKind.Assign => {
+                self.sp(); self.text(assign_name(value.assign_op));
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.StmtKind.While => {
+                self.sp(); self.emit_expr(tree, value.a);
+                self.sp(); self.emit_block(tree, value.b);
+            }
+            ast.StmtKind.Loop => {
+                self.sp(); self.emit_block(tree, value.a);
+            }
+            ast.StmtKind.For => {
+                self.sp(); self.emit_pattern(tree, value.a);
+                self.sp(); self.emit_expr(tree, value.b);
+                self.sp(); self.emit_block(tree, value.c);
+            }
+        }
+        self.end();
+    }
+    void emit_block(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("nil"); return; }
+        var value = tree.block(id);
+        self.begin("Block", value.span); self.sp();
+        self.stmts(tree, value.stmts); self.sp();
+        self.emit_expr(tree, value.tail); self.end();
+    }
+
+    void params(&self, &const ast.Ast tree, &const Vec<ast.Param> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("Param", value.span); self.sp();
+            self.text(self_name(value.self_kind)); self.sp();
+            self.emit_type(tree, value.type); self.sp();
+            self.quoted(value.name); self.end();
+        }
+        self.output.push(93);
+    }
+    void emit_function(&self, &const ast.Ast tree, uint id) {
+        if (id == ast.NONE) { self.text("nil"); return; }
+        var value = tree.function(id);
+        self.begin("Function", value.span);
+        self.sp(); self.quoted(value.doc);
+        self.sp(); self.flag(value.is_pub);
+        self.sp(); self.flag(value.is_async);
+        self.sp(); self.flag(value.async_send);
+        self.sp(); self.emit_type(tree, value.ret);
+        self.sp(); self.quoted(value.name);
+        self.sp(); self.span(value.name_span);
+        self.sp(); self.generics(tree, value.generics);
+        self.sp(); self.params(tree, value.params);
+        self.sp(); self.emit_block(tree, value.body);
+        self.end();
+    }
+    void functions(&self, &const ast.Ast tree, &const Vec<uint> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.emit_function(tree, *values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void field(&self, &const ast.Ast tree, &const ast.Field value) {
+        self.begin("FieldDecl", value.span);
+        self.sp(); self.quoted(value.doc);
+        self.sp(); self.flag(value.is_pub);
+        self.sp(); self.emit_type(tree, value.type);
+        self.sp(); self.quoted(value.name);
+        self.end();
+    }
+    void fields(&self, &const ast.Ast tree, &const Vec<ast.Field> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i); self.field(tree, values.get(i).unwrap());
+        }
+        self.output.push(93);
+    }
+    void variants(&self, &const ast.Ast tree, &const Vec<ast.Variant> values) {
+        self.output.push(91);
+        for (i in 0..values.len()) {
+            self.sep(i);
+            var value = values.get(i).unwrap();
+            self.begin("Variant", value.span);
+            self.sp(); self.quoted(value.doc);
+            self.sp(); self.quoted(value.name);
+            self.sp(); self.text(variant_name(value.kind));
+            self.sp(); self.types(tree, value.tuple_types);
+            self.sp(); self.fields(tree, value.fields);
+            self.end();
+        }
+        self.output.push(93);
+    }
+    void emit_item(&self, &const ast.Ast tree, &const ast.Item value) {
+        self.begin(item_name(value.kind), value.span);
+        self.sp(); self.quoted(value.doc);
+        self.sp(); self.flag(value.is_pub);
+        match value.kind {
+            ast.ItemKind.Import => {
+                self.sp(); self.path(value.path);
+                self.sp(); self.segments(value.names);
+            }
+            ast.ItemKind.Const => {
+                self.sp(); self.emit_type(tree, value.a);
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.emit_expr(tree, value.b);
+            }
+            ast.ItemKind.Function => {
+                self.sp(); self.emit_function(tree, value.function);
+            }
+            ast.ItemKind.Struct => {
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.generics(tree, value.generics);
+                self.sp(); self.fields(tree, value.fields);
+                self.sp(); self.functions(tree, value.methods);
+            }
+            ast.ItemKind.Enum => {
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.generics(tree, value.generics);
+                self.sp(); self.variants(tree, value.variants);
+                self.sp(); self.functions(tree, value.methods);
+            }
+            ast.ItemKind.Trait => {
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.generics(tree, value.generics);
+                self.sp(); self.functions(tree, value.methods);
+            }
+            ast.ItemKind.Impl => {
+                self.sp(); self.flag(value.is_unsafe);
+                self.sp(); self.generics(tree, value.generics);
+                self.sp(); self.bound(tree, value.bound);
+                self.sp(); self.emit_type(tree, value.a);
+                self.sp(); self.functions(tree, value.methods);
+            }
+            ast.ItemKind.Extern => {
+                self.sp(); self.quoted(value.text);
+                self.sp(); self.functions(tree, value.methods);
+            }
+        }
+        self.end();
+    }
+    void emit_module(&self, &const ast.Ast tree) {
+        self.text("(Module [");
+        for (i in 0..tree.items.len()) {
+            self.sep(i); self.emit_item(tree, tree.items.get(i).unwrap());
+        }
+        self.output.push(93); self.end();
+    }
+}
+
+/// Returns owned strict-dump bytes. Borrows tree only for this call.
+pub Vec<byte> module(&const ast.Ast tree) {
+    var writer = Writer.new();
+    writer.emit_module(tree);
+    return writer.output;
+}
+/// NONE at a root returns an empty buffer. Nested absent children print nil.
+pub Vec<byte> expr(&const ast.Ast tree, uint id) {
+    if (id == ast.NONE) { return Vec.new(); }
+    var writer = Writer.new();
+    writer.emit_expr(tree, id);
+    return writer.output;
+}
+pub Vec<byte> type_node(&const ast.Ast tree, uint id) {
+    if (id == ast.NONE) { return Vec.new(); }
+    var writer = Writer.new();
+    writer.emit_type(tree, id);
+    return writer.output;
+}
+pub Vec<byte> pattern(&const ast.Ast tree, uint id) {
+    if (id == ast.NONE) { return Vec.new(); }
+    var writer = Writer.new();
+    writer.emit_pattern(tree, id);
+    return writer.output;
+}
+pub Vec<byte> stmt(&const ast.Ast tree, uint id) {
+    if (id == ast.NONE) { return Vec.new(); }
+    var writer = Writer.new();
+    writer.emit_stmt(tree, id);
+    return writer.output;
+}

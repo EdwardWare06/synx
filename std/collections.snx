@@ -1,0 +1,212 @@
+pub import std.prelude.Vec;
+pub import std.hash.Hash;
+
+bool sort_less<T: Ord>(&const Vec<T> values, usize left, usize right) {
+    match values.get(left) {
+        Some(a) => {
+            match values.get(right) {
+                Some(b) => return a < b,
+                None => panic("sort index out of bounds"),
+            }
+        }
+        None => panic("sort index out of bounds"),
+    }
+}
+
+void sift_down<T: Ord>(&Vec<T> values, usize root, usize end) {
+    while (root < end / 2) {
+        usize child = root * 2 + 1;
+        if (child + 1 < end && sort_less(&const *values, child, child + 1)) { child += 1; }
+        if (!sort_less(&const *values, root, child)) { return; }
+        values.swap(root, child);
+        root = child;
+    }
+}
+
+/// Sort a vector in ascending Ord order without allocating. Equal elements
+/// can change order. The worst-case number of comparisons is O(n log n).
+pub void sort<T: Ord>(&Vec<T> values) {
+    usize end = values.len();
+    if (end < 2) { return; }
+    usize parent = end / 2;
+    while (parent > 0) { parent -= 1; sift_down(&*values, parent, end); }
+    while (end > 1) {
+        end -= 1;
+        values.swap(0, end);
+        sift_down(&*values, 0, end);
+    }
+}
+
+extern "C" {
+    *byte synx_rt_alloc(usize size);
+    void synx_rt_free(*byte data);
+}
+
+/// An owning hash table. Equal keys must have equal, stable hashes while
+/// stored. Keys can be read through get; only values have writable access.
+pub struct HashMap<K: Hash + Eq, V> {
+    *byte states;  // 0 empty, 1 occupied, 2 removed
+    *K keys;
+    *V values;
+    usize len;
+    usize cap;
+    usize used;    // occupied plus removed slots
+
+    pub HashMap<K, V> new() {
+        return HashMap { states: 0 as *byte, keys: 0 as *K,
+                         values: 0 as *V, len: 0, cap: 0, used: 0 };
+    }
+
+    pub usize len(&const self) { return self.len; }
+    /// Number of allocated slots. Insertion keeps at least 25% empty.
+    pub usize capacity(&const self) { return self.cap; }
+    pub bool is_empty(&const self) { return self.len == 0; }
+
+    *byte state_ptr(&const self, usize index) { return (self.states as usize + index) as *byte; }
+    *K key_ptr(&const self, usize index) { return (self.keys as usize + index * size_of<K>()) as *K; }
+    *V value_ptr(&const self, usize index) { return (self.values as usize + index * size_of<V>()) as *V; }
+
+    // cap is a power of two, with at least one empty slot. An empty table
+    // returns index zero; callers check cap before reading a slot.
+    usize find(&const self, &const K key) {
+        if (self.cap == 0) { return 0; }
+        usize index = (key.hash() as usize) & (self.cap - 1);
+        usize removed = self.cap;
+        for (step in 0..self.cap) {
+            byte state = unsafe { *self.state_ptr(index) };
+            if (state == 0) { return if (removed < self.cap) { removed } else { index }; }
+            if (state == 2) {
+                if (removed == self.cap) { removed = index; }
+            } else {
+                if (unsafe { &const *self.key_ptr(index) == key }) { return index; }
+            }
+            index = (index + 1) & (self.cap - 1);
+        }
+        if (removed == self.cap) { panic("HashMap has no available slot"); }
+        return removed;
+    }
+
+    pub bool contains_key(&const self, &const K key) {
+        if (self.cap == 0) { return false; }
+        usize index = self.find(key);
+        return unsafe { *self.state_ptr(index) == 1 };
+    }
+
+    pub (&const V)? get(&const self, &const K key) {
+        if (self.cap == 0) { return None; }
+        usize index = self.find(key);
+        if (unsafe { *self.state_ptr(index) != 1 }) { return None; }
+        return unsafe { Some(&const *self.value_ptr(index)) };
+    }
+
+    pub (&V)? get_mut(&self, &const K key) {
+        if (self.cap == 0) { return None; }
+        usize index = self.find(key);
+        if (unsafe { *self.state_ptr(index) != 1 }) { return None; }
+        return unsafe { Some(&*self.value_ptr(index)) };
+    }
+
+    void rehash(&self, usize capacity) {
+        usize limit = ~(0 as usize);
+        if ((size_of<K>() != 0 && capacity > limit / size_of<K>()) ||
+            (size_of<V>() != 0 && capacity > limit / size_of<V>())) {
+            panic("HashMap capacity is too large");
+        }
+        var states = unsafe { synx_rt_alloc(capacity) };
+        var keys = unsafe { synx_rt_alloc(capacity * size_of<K>()) as *K };
+        var values = unsafe { synx_rt_alloc(capacity * size_of<V>()) as *V };
+        for (i in 0..capacity) { unsafe { *((states as usize + i) as *byte) = 0 as byte; } }
+        for (i in 0..self.cap) {
+            if (unsafe { *self.state_ptr(i) != 1 }) { continue; }
+            usize index = unsafe { ((*self.key_ptr(i)).hash() as usize) & (capacity - 1) };
+            while (unsafe { *((states as usize + index) as *byte) != 0 }) { index = (index + 1) & (capacity - 1); }
+            // These raw writes move each live key/value into fresh storage.
+            // The old allocation is freed without dropping the moved bytes.
+            unsafe {
+                *((keys as usize + index * size_of<K>()) as *K) = *self.key_ptr(i);
+                *((values as usize + index * size_of<V>()) as *V) = *self.value_ptr(i);
+                *((states as usize + index) as *byte) = 1 as byte;
+            }
+        }
+        unsafe {
+            synx_rt_free(self.states);
+            synx_rt_free(self.keys as *byte);
+            synx_rt_free(self.values as *byte);
+        }
+        self.states = states; self.keys = keys; self.values = values;
+        self.cap = capacity; self.used = self.len;
+    }
+
+    /// Insert an owned key/value and return the previous value, if present.
+    /// Replacing a value keeps the stored key and drops the supplied key.
+    pub V? insert(&self, K key, V value) {
+        if (self.cap != 0) {
+            usize index = self.find(&const key);
+            if (unsafe { *self.state_ptr(index) == 1 }) {
+                V previous = unsafe { *self.value_ptr(index) };
+                unsafe { *self.value_ptr(index) = value; }
+                return Some(previous);
+            }
+        }
+        if (self.cap == 0) { self.rehash(8); }
+        // Keep at most 75% of slots used; rebuild tombstones without growth
+        // when the live entries still fit at half capacity.
+        if (self.used >= self.cap - self.cap / 4) {
+            if (self.len < self.cap / 2) { self.rehash(self.cap); }
+            else {
+                if (self.cap > (~(0 as usize)) / 2) { panic("HashMap capacity is too large"); }
+                self.rehash(self.cap * 2);
+            }
+        }
+        usize index = self.find(&const key);
+        if (unsafe { *self.state_ptr(index) == 1 }) {
+            panic("HashMap key hash or equality changed during insertion");
+        }
+        if (unsafe { *self.state_ptr(index) == 0 }) { self.used += 1; }
+        unsafe {
+            *self.key_ptr(index) = key;
+            *self.value_ptr(index) = value;
+            *self.state_ptr(index) = 1 as byte;
+        }
+        self.len += 1;
+        return None;
+    }
+
+    /// Remove a key and return its value. The stored key is dropped.
+    pub V? remove(&self, &const K key) {
+        if (self.cap == 0) { return None; }
+        usize index = self.find(key);
+        if (unsafe { *self.state_ptr(index) != 1 }) { return None; }
+        unsafe { *self.state_ptr(index) = 2 as byte; }
+        self.len -= 1;
+        K removed_key = unsafe { *self.key_ptr(index) };
+        return unsafe { Some(*self.value_ptr(index)) };
+    }
+
+    /// Drop all keys and values while retaining the allocations.
+    pub void clear(&self) {
+        for (i in 0..self.cap) {
+            if (unsafe { *self.state_ptr(i) == 1 }) {
+                unsafe { *self.state_ptr(i) = 0 as byte; }
+                K removed_key = unsafe { *self.key_ptr(i) };
+                V removed_value = unsafe { *self.value_ptr(i) };
+            } else { unsafe { *self.state_ptr(i) = 0 as byte; } }
+        }
+        self.len = 0; self.used = 0;
+    }
+}
+
+impl<K: Hash + Eq, V> Drop for HashMap<K, V> {
+    void drop(&self) {
+        self.clear();
+        unsafe {
+            synx_rt_free(self.states);
+            synx_rt_free(self.keys as *byte);
+            synx_rt_free(self.values as *byte);
+        }
+    }
+}
+
+unsafe impl<K: Hash + Eq + Send, V: Send> Send for HashMap<K, V> {}
+unsafe impl<K: Hash + Eq + Sync, V: Sync> Sync for HashMap<K, V> {}
+unsafe impl<K: Hash + Eq + Owned, V: Owned> Owned for HashMap<K, V> {}

@@ -1,0 +1,36 @@
+import std.task.{block_on,yield_now,LocalExecutor};
+async void worker(int id) {
+    print("start {id}");
+    await yield_now();
+    print("middle {id}");
+    await yield_now();
+    print("end {id}");
+}
+async int pinned() {
+    var value=String.from("pinned");
+    var view=&const value;
+    usize address=unsafe { (&const value as *const String) as usize };
+    await yield_now();
+    usize current=unsafe { (&const value as *const String) as usize };
+    if (address != current) { panic("async frame moved"); }
+    return view.len() as int;
+}
+async int unused(int value) { return value; }
+main() {
+    var executor=LocalExecutor.new();
+    executor.spawn(worker(1)); executor.spawn(worker(2)); executor.run();
+    executor.spawn(worker(3)); executor.run();
+    var task=pinned(); var wake=Waker.new();
+    match task.poll(wake.clone()) { Poll.Pending => {}, Poll.Ready(_) => panic("expected pending") }
+    var tasks=Vec<Task<int>>.new(); tasks.push(task);
+    for (i in 0..20) { tasks.push(unused(i)); }
+    tasks.swap(0,tasks.len()-1);
+    var moved=tasks.pop().unwrap();
+    print("pinned {block_on(moved)}");
+    // Wake state remains owned when the original handle leaves its scope.
+    Waker retained;
+    { var original=Waker.new(); retained=original.clone(); }
+    retained.wake();
+    if (!retained.take_ready()) { panic("lost wake"); }
+    print("retained wake");
+}

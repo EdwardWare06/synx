@@ -1,0 +1,40 @@
+import holder_type_user;
+import holder_module_user;
+import measure_a;
+import measure_b;
+import constants;
+import left;
+import right;
+import tokens;
+import tokens.Token.{Number, End};
+import cycle_a;
+import utils.id;
+import facade;
+import std.io;
+import std.math.{sqrt, Vec3};
+struct Gauge { int value; }
+impl measure_a.Measure for Gauge { int read(&const self) { return self.value + 1; } }
+impl measure_b.Measure for Gauge { int read(&const self) { return self.value + 2; } }
+int inspect(&const left.Same a) { return a.read(); }
+int run(tokens.Token t) {
+    return match t { tokens.Token.Number(n) => n, tokens.Token.Record { n } => n + 1, tokens.Token.End => 0 };
+}
+main() {
+    print("kinds {holder_type_user.read()} {holder_module_user.read()}");
+    var gauge = Gauge { value: 10 };
+    &const dyn measure_a.Measure ma = gauge;
+    &const dyn measure_b.Measure mb = gauge;
+    print("traits {ma.read()} {mb.read()}");
+    var a = left.make(); var b = right.make();
+    io.print("same names {inspect(a)} {b.read()} {left.OFFSET}");
+    var explicit = left.Same { n: 30 };
+    var make = right.make;
+    var c = make();
+    print("values {id(explicit).read()} {c.read()} reexport {facade.make().read()}");
+    print("enum {run(tokens.Token.Number(4))} {run(tokens.Token.Record { n: 5 })} {run(End)} {tokens.read(Number(8))}");
+    print("cycle {cycle_a.first()}");
+    var v = Vec3 { x: 3.0, y: 4.0, z: 0.0 };
+    print("math {sqrt(81.0)} {v.length()}");
+    print("constants {constants.BLOCK} {constants.CLOSURE(3)} {constants.TEXT}");
+    { int io = 2; print("shadow {io}"); }
+}

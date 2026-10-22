@@ -1,0 +1,6 @@
+import std.task.pool.Executor;
+import std.task.block_on;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("pool error") } }
+async int local() { return 1; }
+async send int bad() { return block_on(local()); }
+main() { var executor=ok(Executor.new(1)); var job=ok(executor.spawn(bad())); job.join(); }

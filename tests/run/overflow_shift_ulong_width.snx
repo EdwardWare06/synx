@@ -1,0 +1,1 @@
+main() { ulong value=4; ulong count=65; ulong result=value >> count; if (result != 2) { panic("wrong release shift"); } }

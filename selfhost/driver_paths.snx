@@ -1,0 +1,114 @@
+/// Executable, runtime and linker paths. Source: compiler/src/build.cpp.
+/// Link arguments remain separate through std.process.Command.
+import target.{Target, TargetOs};
+import driver_options.BuildOptions;
+import std.path.{Path, Style, host_style};
+import std.fs;
+import std.env;
+import std.text;
+import std.process.{Command, ExitStatus};
+
+pub String display(&const str value) {
+    match host_style() { Windows => return text.replace(value, "\\", "/"), Unix => return String.from(value) }
+}
+pub bool exists(&const str value) { match fs.exists(value) { Ok(found) => return found, Err(_) => return false } }
+pub int selected_linker(&const BuildOptions options) {
+    if (options.linker >= 0) { return options.linker; }
+    match env.get("SYNX_LINKER") { Ok(value) => match value {
+        Some(name) => { if (name == String.from("builtin")) { return 0; } if (name == String.from("system")) { return 1; } }, None => {}
+    }, Err(_) => {} }
+    // An explicit static runtime override retains the developer/test baseline.
+    match env.get("SYNX_RUNTIME_LIB") { Ok(value) => match value { Some(_) => return 1, None => {} }, Err(_) => {} }
+    return 0;
+}
+pub String runtime_capsule(Target target) {
+    match env.get("SYNX_RUNTIME_SHARED") { Ok(value) => match value { Some(path) => { if (exists(path)) { return display(path); } }, None => {} }, Err(_) => {} }
+    var executable = match env.exe_path() { Ok(value) => value, Err(_) => return String.new() };
+    var dir = Path.from(executable).parent().unwrap_or(Path.from("."));
+    var name = match target.os { Windows => "synx_rt.dll", MacOs => "libsynx_rt.dylib", Linux => "libsynx_rt.so" };
+    for (up in 0..4) {
+        var local = dir.join(name); if (exists(local.as_str())) { return display(local.as_str()); }
+        var library = dir.join("lib").join(name); if (exists(library.as_str())) { return display(library.as_str()); }
+        var runtime = dir.join("runtime").join(name); if (exists(runtime.as_str())) { return display(runtime.as_str()); }
+        match dir.parent() { Some(parent) => { dir = parent; }, None => {} }
+    }
+    return String.new();
+}
+pub String runtime_library(Target target) {
+    match env.get("SYNX_RUNTIME_LIB") {
+        Ok(value) => { match value { Some(path) => { if (exists(path)) { return display(path); } }, None => {} } }, Err(_) => {}
+    }
+    String exe = match env.exe_path() { Ok(value) => value, Err(_) => return String.new() };
+    return runtime_near(exe, target);
+}
+/// Three parent levels match build trees and installed bin/lib trees.
+pub String runtime_near(&const str executable, Target target) {
+    var dir = match Path.from(executable).parent() { Some(value) => value, None => return String.new() };
+    var name = match target.os { Windows => "synx_rt.lib", _ => "libsynx_rt.a" };
+    for (up in 0..3) {
+        var runtime = dir.join("runtime").join(name); if (exists(runtime.as_str())) { return display(runtime.as_str()); }
+        var lib = dir.join("lib").join(name); if (exists(lib.as_str())) { return display(lib.as_str()); }
+        match dir.parent() { Some(parent) => { dir = parent; }, None => {} }
+    }
+    return String.new();
+}
+pub String output_path(&const BuildOptions options) {
+    if (!options.output.is_empty()) { return display(options.output); }
+    var input = Path.from(options.input);
+    String name = input.file_name().unwrap_or(String.new());
+    match input.extension() { Some(extension) => {
+        usize length = name.len() - extension.len() - 1;
+        name = String.from(unsafe { str_from_raw(name.as_str().as_ptr(), length) });
+    }, None => {} }
+    match options.target.os { Windows => name.push_str(".exe"), _ => {} }
+    var parent = input.parent().unwrap_or(Path.from(""));
+    return display(parent.join(name).as_str());
+}
+pub String object_path(&const str executable, Target target) {
+    return match target.os { Windows => "{executable}.obj", _ => "{executable}.o" };
+}
+pub struct LinkCommand {
+    pub String program;
+    pub Vec<String> arguments;
+    pub Result<ExitStatus, fs.IoError> status(&const self) {
+        var command = Command.new(self.program); for (arg in &const self.arguments) { command.arg(arg); } return command.status();
+    }
+}
+pub LinkCommand link_command(Target target, &const str object, &const str runtime, &const str executable) {
+    Vec<String> args = Vec.new();
+    match target.os {
+        Windows => {
+            args.push(String.from("/nologo")); args.push(String.from("/subsystem:console")); args.push(String.from("/stack:8388608"));
+            args.push(String.from("/entry:wmainCRTStartup")); args.push(String.from("/include:wmain"));
+            args.push(String.from(object)); args.push(String.from(runtime)); args.push(String.from("legacy_stdio_definitions.lib"));
+            args.push("/out:{executable}"); return LinkCommand { program: String.from("link"), arguments: args };
+        }
+        _ => {
+            args.push(String.from(object)); args.push(String.from(runtime)); args.push(String.from("-pthread"));
+            args.push(String.from("-o")); args.push(String.from(executable));
+            match target.os { Linux => args.push(String.from("-no-pie")), MacOs => { args.push(String.from("-arch")); args.push(String.from("x86_64")); }, _ => {} }
+            return LinkCommand { program: String.from("cc"), arguments: args };
+        }
+    }
+}
+pub int exit_code(&const ExitStatus status) {
+    match status.code { Some(code) => return code as int, None => {} }
+    match status.signal { Some(signal) => return 128 + signal, None => return 1 }
+}
+pub int run_executable(&const str executable) {
+    String absolute = match fs.absolute(executable) { Ok(value) => value, Err(_) => return 1 };
+    var command = Command.new(absolute);
+    match command.status() { Ok(status) => return exit_code(status), Err(_) => return 1 }
+}
+/// Rendering is for verbose output only; it is never executed as shell text.
+pub String quoted(&const str value, bool windows) {
+    if (windows) { return "\"{value}\""; }
+    String escaped = text.replace(value, "'", "'\\''"); return "'{escaped}'";
+}
+pub String link_text(Target target, &const str object, &const str runtime, &const str executable) {
+    bool windows = target.win64_abi(); var o = quoted(object, windows); var r = quoted(runtime, windows); var e = quoted(executable, windows);
+    if (windows) { return "link /nologo /subsystem:console /stack:8388608 /entry:wmainCRTStartup /include:wmain {o} {r} legacy_stdio_definitions.lib /out:{e}"; }
+    String result = "cc {o} {r} -pthread -o {e}";
+    match target.os { Linux => result.push_str(" -no-pie"), MacOs => result.push_str(" -arch x86_64"), _ => {} }
+    return result;
+}

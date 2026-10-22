@@ -1,0 +1,68 @@
+import std.math;
+import std.math.Vec3;
+import std.text;
+import std.utf8;
+void require(bool value) { if (!value) { panic("math or text test failed"); } }
+void equals(&const str got, &const str want) { require(String.from(got) == String.from(want)); }
+main() {
+    require(math.abs(-2.0) == 2.0 && math.min(1.0, 2.0) == 1.0 && math.max(1.0, 2.0) == 2.0);
+    require(math.floor(-1.2) == -2.0 && math.ceil(-1.2) == -1.0 && math.trunc(-1.2) == -1.0);
+    require(math.round(-1.5) == -2.0 && math.round(1.5) == 2.0 && math.round(4503599627370495.0) == 4503599627370495.0);
+    require(math.floor(1e100) == 1e100 && math.ceil(-1e100) == -1e100);
+    double infinity = 1.0 / 0.0; double nan = infinity - infinity;
+    require(!math.is_finite(infinity) && math.is_nan(nan));
+    require(math.is_nan(math.min(1.0, nan)) && math.is_nan(math.max(nan, 1.0)));
+    require(math.floor(infinity) == infinity && math.is_nan(math.round(nan)));
+    require(math.clamp(5.0, 1.0, 3.0) == 3.0 && math.lerp(2.0, 4.0, 0.5) == 3.0);
+    require(math.approx_eq(math.radians(180.0), math.PI, 1e-15, 0.0));
+    require(math.degrees(math.PI) == 180.0);
+    require(math.powi(2.0, -3) == 0.125 && math.powi(1.0, -2147483647 - 1) == 1.0);
+    require(math.gcd(48, 18) == 6 && math.gcd(0, 0) == 0);
+    match math.lcm(12, 18) { Some(n) => require(n == 36), None => panic("lcm failed") }
+    require(math.lcm(18446744073709551615, 2).is_none());
+    require(math.approx_eq(math.sqrt(1e-300), 1e-150, 1e-14, 0.0));
+    require(math.approx_eq(math.sqrt(1e300), 1e150, 1e-14, 0.0));
+    var a = Vec3 { x: 1.0, y: 0.0, z: 0.0 }; var b = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+    require(a.cross(b).z == 1.0 && a.add(b).length() > 1.4 && a.scale(2.0).x == 2.0);
+    require(math.approx_eq(a.distance(b), math.sqrt(2.0), 1e-15, 0.0));
+    var huge = Vec3 { x: 1e300, y: 1e300, z: 0.0 }; require(math.is_finite(huge.length()));
+    var tiny = Vec3 { x: 1e-300, y: 0.0, z: 0.0 }; require(tiny.length() == 1e-300);
+    match huge.normalized() { Some(unit) => require(math.approx_eq(unit.length(), 1.0, 1e-14, 0.0)), None => panic("normalization failed") }
+    var enormous = Vec3 { x: 1.7e308, y: 1.7e308, z: 1.7e308 };
+    match enormous.normalized() { Some(unit) => require(math.approx_eq(unit.length(), 1.0, 1e-14, 0.0)), None => panic("large normalization failed") }
+    double smallest = 1e-300 / 2e23;
+    var subnormal = Vec3 { x: smallest, y: smallest, z: 0.0 };
+    match subnormal.normalized() { Some(unit) => require(math.approx_eq(unit.length(), 1.0, 1e-14, 0.0)), None => panic("small normalization failed") }
+    require(Vec3 { x: 0.0, y: 0.0, z: 0.0 }.normalized().is_none());
+    require(text.is_boundary("aé🧠z", 1) && !text.is_boundary("aé🧠z", 2));
+    match text.slice("aé🧠z", 1, 7) { Some(s) => equals(s, "é🧠"), None => panic("slice failed") }
+    require(text.slice("aé🧠z", 2, 7).is_none() && text.slice("", 1, 1).is_none());
+    require(text.slice("a", 1, 0).is_none());
+    match text.find("café café", "é") { Some(i) => require(i == 3), None => panic("find failed") }
+    match text.rfind("café café", "é") { Some(i) => require(i == 9), None => panic("rfind failed") }
+    require(text.find("a", "long").is_none() && text.starts_with("é", "é") && text.ends_with("café", "fé"));
+    equals(text.replace("ééé", "éé", "x"), "xé");
+    equals(text.replace("abc", "long", "x"), "abc");
+    equals(text.to_ascii_uppercase("café Straße"), "CAFé STRAßE");
+    equals(text.to_ascii_lowercase("CAFÉ"), "cafÉ");
+    var lines = text.lines("a\r\n\nend\r"); require(lines.len() == 3);
+    equals(text.join(lines, "|"), "a||end\r");
+    require(text.lines("").len() == 1 && text.lines("\n").len() == 2);
+    var points = text.code_points("aé🧠"); require(points.len() == 3);
+    match points.get(2) { Some(n) => require(*n == 129504), None => panic("no code point") }
+    uint[7] boundaries = [0, 127, 128, 2047, 65535, 65536, 1114111];
+    for (point in &const boundaries) {
+        match text.from_code_point(*point) {
+            Some(s) => { var decoded = text.code_points(s); require(decoded.len() == 1); match decoded.get(0) { Some(n) => require(*n == *point), None => panic("decode failed") } }
+            None => panic("valid point rejected"),
+        }
+    }
+    require(text.from_code_point(55296).is_none() && text.from_code_point(1114112).is_none());
+    match text.parse_ulong("+18446744073709551615") { Some(n) => require(n == 18446744073709551615), None => panic("ulong parse failed") }
+    match text.parse_long("-9223372036854775808") { Some(n) => require(n == -9223372036854775807 - 1), None => panic("long parse failed") }
+    match text.parse_long("+9223372036854775807") { Some(n) => require(n == 9223372036854775807), None => panic("long parse failed") }
+    require(text.parse_ulong("18446744073709551616").is_none() && text.parse_long("9223372036854775808").is_none());
+    require(text.parse_long("-9223372036854775809").is_none() && text.parse_long("-+1").is_none());
+    require(text.parse_long("").is_none() && text.parse_ulong("+").is_none() && text.parse_long(" 1").is_none() && text.parse_long("1x").is_none());
+    print("math and text ok");
+}

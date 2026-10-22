@@ -1,0 +1,307 @@
+pub import std.prelude.SendTask;
+import std.sync.{Arc, Mutex, Condvar};
+import std.thread;
+import std.mem;
+extern "C" {
+    void synx_rt_pool_enter(*byte pool, int blocking);
+    void synx_rt_pool_leave();
+    void synx_rt_blocking_check(*byte pool);
+}
+
+pub enum JoinError { Cancelled }
+pub enum SpawnError { Closed }
+pub enum ExecutorError { InvalidWorkers, Thread(thread.ThreadError) }
+
+struct ResultSlot<T: Send + Owned> { T? value; bool ready; bool taken; Waker? wake; }
+struct ResultState<T: Send + Owned> { Mutex<ResultSlot<T>> slot; Condvar changed; }
+struct Completion<T: Send + Owned> {
+    Arc<ResultState<T>> state;
+    bool done;
+    void publish(&self, T value) {
+        var state = self.state.get();
+        Waker? wake = None;
+        {
+            var guard = state.slot.lock();
+            var slot = guard.get_mut();
+            slot.value = Some(value);
+            slot.ready = true;
+            wake = slot.wake.take();
+        }
+        self.done = true;
+        state.changed.notify_all();
+        match wake { Some(waker) => waker.wake(), None => {} }
+    }
+}
+impl<T: Send + Owned> Drop for Completion<T> {
+    void drop(&self) {
+        if (!self.done) {
+            var state = self.state.get();
+            Waker? wake = None;
+            {
+                var guard = state.slot.lock();
+                var slot = guard.get_mut();
+                slot.ready = true;
+                wake = slot.wake.take();
+            }
+            state.changed.notify_all();
+            match wake { Some(waker) => waker.wake(), None => {} }
+        }
+    }
+}
+// Cancellation drops the child before publishing cancellation from Completion.
+async send void complete<T: Send + Owned>(Completion<T> completion, SendTask<T> task) {
+    T value = await task;
+    completion.publish(value);
+}
+
+struct TaskSlot { Waker? wake; SendTask<void>? future; int state; bool cancelled; usize index; }
+struct TaskCell { Mutex<TaskSlot> slot; Arc<PoolState> pool; }
+struct Queue { Vec<Arc<TaskCell>?> ready; usize head; Vec<Arc<TaskCell>?> tasks; Vec<usize> free; usize active; bool closed; }
+struct PoolState {
+    Mutex<Queue> queue;
+    Condvar changed;
+    Condvar idle;
+    bool blocking;
+    void enqueue(&const self, Arc<TaskCell> task) {
+        { var guard = self.queue.lock(); guard.get_mut().ready.push(Some(task)); }
+        self.changed.notify_one();
+    }
+}
+struct TaskWake {
+    Arc<TaskCell> cell;
+    void cancel(&const self) {
+        { var guard = self.cell.get().slot.lock(); guard.get_mut().cancelled = true; }
+        self.wake();
+    }
+}
+impl Wake for TaskWake {
+    void wake(&const self) {
+        var cell = self.cell.get();
+        bool enqueue = false;
+        {
+            var guard = cell.slot.lock();
+            var slot = guard.get_mut();
+            if (slot.state == 0) { slot.state = 1; enqueue = true; }
+            else if (slot.state == 2) { slot.state = 3; }
+        }
+        if (enqueue) { cell.pool.get().enqueue(self.cell.clone()); }
+    }
+}
+
+void finish(Arc<TaskCell> cell) {
+    usize index = 0;
+    Waker? cached = None;
+    {
+        var guard = cell.get().slot.lock();
+        var slot = guard.get_mut();
+        if (slot.state == 4) { return; }
+        slot.state = 4;
+        index = slot.index;
+        cached = slot.wake.take();
+    }
+    var pool = cell.get().pool.get();
+    (Arc<TaskCell>)? removed = None;
+    {
+        var guard = pool.queue.lock();
+        var queue = guard.get_mut();
+        removed = queue.tasks[index].take();
+        queue.active -= 1;
+        if (queue.active == 0) { queue.tasks.clear(); queue.free.clear(); }
+        else { queue.free.push(index); }
+    }
+    pool.idle.notify_all();
+    pool.changed.notify_all();
+}
+void run_cell(Arc<TaskCell> cell) {
+    SendTask<void>? future = None;
+    Waker? wake = None;
+    bool cancelled = false;
+    {
+        var guard = cell.get().slot.lock();
+        var slot = guard.get_mut();
+        if (slot.state != 1) { return; }
+        slot.state = 2;
+        cancelled = slot.cancelled;
+        future = slot.future.take();
+        match slot.wake.as_ref() { Some(cached) => { wake = Some(cached.clone()); }, None => panic("executor lost its waker") }
+    }
+    if (cancelled) { mem.drop(future); finish(cell); return; }
+    bool ready = false;
+    match future.as_mut() {
+        Some(task) => match task.poll(wake.unwrap()) {
+            Poll.Ready(_) => { ready = true; }, Poll.Pending => {}
+        },
+        None => panic("executor lost its task")
+    }
+    if (ready) { mem.drop(future); finish(cell); return; }
+    bool enqueue = false;
+    {
+        var guard = cell.get().slot.lock();
+        var slot = guard.get_mut();
+        cancelled = slot.cancelled;
+        if (!cancelled) {
+            slot.future = future.take();
+            if (slot.state == 3) { slot.state = 1; enqueue = true; }
+            else { slot.state = 0; }
+        }
+    }
+    if (cancelled) { mem.drop(future); finish(cell); return; }
+    if (enqueue) { cell.get().pool.get().enqueue(cell.clone()); }
+}
+void worker(Arc<PoolState> state) {
+    var pool = state.get();
+    unsafe { synx_rt_pool_enter(pool as *const PoolState as *byte, pool.blocking as int); }
+    loop {
+        (Arc<TaskCell>)? task = None;
+        bool stop = false;
+        {
+            var guard = pool.queue.lock();
+            loop {
+                {
+                    var queue = guard.get_mut();
+                    if (queue.head < queue.ready.len()) {
+                        task = queue.ready[queue.head].take();
+                        queue.head += 1;
+                        if (queue.head == queue.ready.len()) { queue.ready.clear(); queue.head = 0; }
+                        else if (queue.head >= 64 && queue.head >= queue.ready.len() / 2) {
+                            usize remaining = queue.ready.len() - queue.head;
+                            for (i in 0..remaining) { queue.ready.swap(i, queue.head + i); }
+                            while (queue.ready.len() > remaining) { var empty = queue.ready.pop(); }
+                            queue.head = 0;
+                        }
+                        break;
+                    }
+                    if (queue.closed && queue.active == 0) { stop = true; break; }
+                }
+                pool.changed.wait(&guard);
+            }
+        }
+        if (stop) { break; }
+        match task { Some(cell) => run_cell(cell), None => {} }
+    }
+    unsafe { synx_rt_pool_leave(); }
+}
+
+pub struct Join<T: Send + Owned> {
+    Arc<ResultState<T>> result;
+    Arc<TaskCell> cell;
+    pub void cancel(&const self) { TaskWake { cell: self.cell.clone() }.cancel(); }
+    pub Result<T, JoinError> join(self) {
+        unsafe { synx_rt_blocking_check(self.cell.get().pool.get() as *const PoolState as *byte); }
+        var state = self.result.get();
+        var guard = state.slot.lock();
+        while (!guard.get().ready) { state.changed.wait(&guard); }
+        var slot = guard.get_mut();
+        if (slot.taken) { panic("async join result already consumed"); }
+        slot.taken = true;
+        match slot.value.take() { Some(value) => return Ok(value), None => return Err(JoinError.Cancelled) }
+    }
+}
+impl<T: Send + Owned> Future<Result<T, JoinError>> for Join<T> {
+    Poll<Result<T, JoinError>> poll(&self, Waker wake) {
+        Waker? previous = None;
+        {
+            var guard = self.result.get().slot.lock();
+            var slot = guard.get_mut();
+            if (slot.taken) { panic("async join result already consumed"); }
+            if (slot.ready) {
+                slot.taken = true;
+                match slot.value.take() { Some(value) => return Poll.Ready(Ok(value)), None => return Poll.Ready(Err(JoinError.Cancelled)) }
+            }
+            previous = slot.wake.replace(wake);
+        }
+        return Poll.Pending;
+    }
+}
+impl<T: Send + Owned> Drop for Join<T> { void drop(&self) { self.cancel(); } }
+
+pub struct Spawner {
+    Arc<PoolState> pool;
+    pub Spawner clone(&const self) { return Spawner { pool: self.pool.clone() }; }
+    pub Result<Join<T>, SpawnError> spawn<T: Send + Owned>(&const self, SendTask<T> task) {
+        var result = Arc.new(ResultState { slot: Mutex.new(ResultSlot { value: None, ready: false, taken: false, wake: None }), changed: Condvar.new() });
+        var completion = Completion { state: result.clone(), done: false };
+        var cell = Arc.new(TaskCell { slot: Mutex.new(TaskSlot { wake: None, future: Some(complete(completion, task)), state: 1, cancelled: false, index: 0 }), pool: self.pool.clone() });
+        {
+            var guard = self.pool.get().queue.lock();
+            var queue = guard.get_mut();
+            if (queue.closed) { return Err(SpawnError.Closed); }
+            usize index = queue.tasks.len();
+            match queue.free.pop() { Some(free) => { index = free; }, None => queue.tasks.push(None) }
+            {
+                var inner = cell.get().slot.lock();
+                inner.get_mut().index = index;
+                inner.get_mut().wake = Some(Waker.from(TaskWake { cell: cell.clone() }));
+            }
+            queue.tasks[index] = Some(cell.clone());
+            queue.ready.push(Some(cell.clone()));
+            queue.active += 1;
+        }
+        self.pool.get().changed.notify_one();
+        return Ok(Join { result: result, cell: cell });
+    }
+}
+
+pub struct Executor {
+    Arc<PoolState> pool;
+    Vec<thread.JoinHandle<void>> workers;
+    Result<Executor, ExecutorError> create(usize count, bool blocking) {
+        if (count == 0) { return Err(ExecutorError.InvalidWorkers); }
+        var pool = Arc.new(PoolState { queue: Mutex.new(Queue { ready: Vec.new(), head: 0, tasks: Vec.new(), free: Vec.new(), active: 0, closed: false }), changed: Condvar.new(), idle: Condvar.new(), blocking: blocking });
+        var workers = Vec<thread.JoinHandle<void>>.new();
+        for (i in 0..count) {
+            var shared = pool.clone();
+            match thread.spawn(send once || worker(shared)) {
+                Ok(handle) => workers.push(handle),
+                Err(error) => {
+                    { var guard = pool.get().queue.lock(); guard.get_mut().closed = true; }
+                    pool.get().changed.notify_all();
+                    return Err(ExecutorError.Thread(error));
+                }
+            }
+        }
+        return Ok(Executor { pool: pool, workers: workers });
+    }
+    pub Result<Executor, ExecutorError> new(usize count) { return Executor.create(count, false); }
+    pub Spawner spawner(&const self) { return Spawner { pool: self.pool.clone() }; }
+    pub Result<Join<T>, SpawnError> spawn<T: Send + Owned>(&const self, SendTask<T> task) { return self.spawner().spawn(task); }
+    pub void wait(&const self) {
+        var pool = self.pool.get();
+        unsafe { synx_rt_blocking_check(pool as *const PoolState as *byte); }
+        var guard = pool.queue.lock();
+        while (guard.get().active != 0) { pool.idle.wait(&guard); }
+    }
+    pub void shutdown(&self) {
+        if (self.workers.is_empty()) { return; }
+        var pool = self.pool.get();
+        unsafe { synx_rt_blocking_check(pool as *const PoolState as *byte); }
+        var tasks = Vec<Arc<TaskCell>>.new();
+        {
+            var guard = pool.queue.lock();
+            var queue = guard.get_mut();
+            queue.closed = true;
+            for (i in 0..queue.tasks.len()) { match queue.tasks[i].as_ref() { Some(cell) => tasks.push(cell.clone()), None => {} } }
+        }
+        for (i in 0..tasks.len()) { TaskWake { cell: tasks[i].clone() }.cancel(); }
+        pool.changed.notify_all();
+        while (!self.workers.is_empty()) { self.workers.pop().unwrap().join(); }
+    }
+}
+impl Drop for Executor { void drop(&self) { self.shutdown(); } }
+
+async send T blocking_call<T: Send + Owned>(fn once send() -> T job) { return job(); }
+pub struct BlockingSpawner {
+    Spawner spawner;
+    pub BlockingSpawner clone(&const self) { return BlockingSpawner { spawner: self.spawner.clone() }; }
+    pub Result<Join<T>, SpawnError> spawn<T: Send + Owned>(&const self, fn once send() -> T job) { return self.spawner.spawn(blocking_call(job)); }
+}
+pub struct BlockingPool {
+    Executor executor;
+    pub Result<BlockingPool, ExecutorError> new(usize count) {
+        match Executor.create(count, true) { Ok(executor) => return Ok(BlockingPool { executor: executor }), Err(error) => return Err(error) }
+    }
+    pub BlockingSpawner spawner(&const self) { return BlockingSpawner { spawner: self.executor.spawner() }; }
+    pub Result<Join<T>, SpawnError> spawn<T: Send + Owned>(&const self, fn once send() -> T job) { return self.spawner().spawn(job); }
+    pub void wait(&const self) { self.executor.wait(); }
+    pub void shutdown(&self) { self.executor.shutdown(); }
+}

@@ -1,0 +1,87 @@
+import std.sync.{Arc, Mutex, Condvar};
+import std.mem;
+
+struct Queue<T: Owned> { Vec<T?> values; usize head; usize senders; bool connected; }
+struct Channel<T: Owned> { Mutex<Queue<T>> queue; Condvar ready; }
+
+/// An unbounded queue. The last sender wakes receivers so recv can return None.
+pub struct Sender<T: Owned> {
+    Arc<Channel<T>> channel;
+    pub Sender<T> clone(&const self) {
+        {
+            var guard = self.channel.get().queue.lock();
+            var queue = guard.get_mut();
+            if (queue.senders == 9223372036854775807 as usize) { panic("channel sender count overflow"); }
+            queue.senders += 1;
+        }
+        return Sender { channel: self.channel.clone() };
+    }
+    /// An error returns the input value when the receiver has been dropped.
+    pub Result<void, T> send(&const self, T value) {
+        var state = self.channel.get();
+        var guard = state.queue.lock();
+        var queue = guard.get_mut();
+        if (!queue.connected) { return Err(value); }
+        queue.values.push(Some(value));
+        state.ready.notify_one();
+        return Ok(());
+    }
+}
+impl<T: Owned> Drop for Sender<T> {
+    void drop(&self) {
+        var state = self.channel.get();
+        var guard = state.queue.lock();
+        guard.get_mut().senders -= 1;
+        state.ready.notify_all();
+    }
+}
+
+pub struct Receiver<T: Owned> {
+    Arc<Channel<T>> channel;
+    /// Wait for a value. None means all senders have been dropped.
+    pub T? recv(&const self) {
+        var state = self.channel.get();
+        var guard = state.queue.lock();
+        loop {
+            {
+                var queue = guard.get_mut();
+                if (queue.head < queue.values.len()) {
+                    var value = queue.values[queue.head].take();
+                    queue.head += 1;
+                    if (queue.head == queue.values.len()) { queue.values.clear(); queue.head = 0; }
+                    return value;
+                }
+                if (queue.senders == 0) { return None; }
+            }
+            state.ready.wait(&guard);
+        }
+        return None;
+    }
+}
+impl<T: Owned> Drop for Receiver<T> {
+    void drop(&self) {
+        var state = self.channel.get();
+        var abandoned = Vec<T?>.new();
+        {
+            var guard = state.queue.lock();
+            var queue = guard.get_mut();
+            queue.connected = false;
+            mem.swap(&abandoned, &queue.values);
+        }
+        state.ready.notify_all();
+        // User destructors can send or drop a sender of this same channel.
+        mem.drop(abandoned);
+    }
+}
+
+pub struct ChannelPair<T: Owned> {
+    Sender<T>? sender;
+    Receiver<T>? receiver;
+    pub Sender<T> sender(&self) { return self.sender.take().expect("channel sender already taken"); }
+    pub Receiver<T> receiver(&self) { return self.receiver.take().expect("channel receiver already taken"); }
+}
+
+pub ChannelPair<T> channel<T: Owned>() {
+    var state = Arc.new(Channel { queue: Mutex.new(Queue { values: Vec.new(), head: 0, senders: 1, connected: true }), ready: Condvar.new() });
+    return ChannelPair { sender: Some(Sender { channel: state.clone() }), receiver: Some(Receiver { channel: state }) };
+}

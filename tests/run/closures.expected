@@ -1,0 +1,67 @@
+empty 5 8
+apply 15
+named 12
+named returned 14 16
+counter 12 15 outer 10
+nested call 32
+constant 9
+constant users 11 12 12
+returned 22 24
+temporary 35
+generic 42
+generic long 403
+nested 55
+nested returned 11
+shorthand 64
+string 6 7
+owned
+owned
+float 4.0
+void argument
+array 141 152
+drop 140
+drop 150
+option 163
+drop 160
+ticket 71 72
+drop 70
+drop 80
+temporary ticket 83
+drop 90
+applied ticket 94
+moved 105
+drop 100
+drop 110
+replaced 126
+drop 120
+branch 137
+drop 130
+nested owned 179
+drop 170
+field 211
+tuple 222
+vector 243
+drop 240
+drop 230
+drop 220
+drop 210
+drop 180
+early 9
+drop 190
+try true
+drop 270
+temporary field 274
+drop 200
+drop 201
+drop 202
+drop 203
+captures 510
+drop 260
+drop 250
+drop 283
+branches false true true true
+drop 285
+drop 281
+owner 292
+drop 290
+drop 291

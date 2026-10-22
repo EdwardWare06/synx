@@ -1,0 +1,54 @@
+/// Equal values must return equal hashes. Hashes are not a stored data format.
+pub trait Hash {
+    ulong hash(&const self);
+}
+
+// Multiply modulo 2^64 using bounded limbs. This also works with checked
+// integer arithmetic because each intermediate fits in an unsigned long.
+ulong multiply(ulong a, ulong b) {
+    ulong mask = 4294967295 as ulong;
+    ulong low = (a & mask) * (b & mask);
+    ulong high = ((low >> 32) + (((a >> 32) * (b & mask)) & mask)
+                 + (((b >> 32) * (a & mask)) & mask)) & mask;
+    return (high << 32) | (low & mask);
+}
+
+/// Hash UTF-8 bytes with a deterministic, unkeyed 64-bit hash.
+pub ulong hash_str(&const str text) {
+    ulong result = 14695981039346656037 as ulong;
+    for (i in 0..text.len()) {
+        byte value = unsafe { *((text.as_ptr() as usize + i) as *const byte) };
+        result = multiply(result ^ (value as ulong), 1099511628211 as ulong);
+    }
+    return result ^ (result >> 32);
+}
+
+/// Combine field hashes in a fixed order when hashing a composite key.
+pub ulong combine(ulong seed, ulong field_hash) {
+    ulong rotated = (seed << 13) | (seed >> 51);
+    ulong result = multiply(rotated ^ field_hash, 1099511628211 as ulong);
+    return result ^ (result >> 32);
+}
+
+ulong hash_integer(ulong value) {
+    ulong result = 14695981039346656037 as ulong;
+    for (i in 0..8) {
+        result = multiply(result ^ (value & 255), 1099511628211 as ulong);
+        value >>= 8;
+    }
+    return result ^ (result >> 32);
+}
+
+impl Hash for byte { ulong hash(&const self) { return hash_integer(*self as ulong); } }
+impl Hash for short { ulong hash(&const self) { return hash_integer(*self as ulong); } }
+impl Hash for int { ulong hash(&const self) { return hash_integer(*self as ulong); } }
+impl Hash for long { ulong hash(&const self) { return hash_integer(*self as ulong); } }
+impl Hash for uint { ulong hash(&const self) { return hash_integer(*self as ulong); } }
+impl Hash for ulong { ulong hash(&const self) { return hash_integer(*self); } }
+impl Hash for usize { ulong hash(&const self) { return hash_integer(*self as ulong); } }
+impl Hash for bool { ulong hash(&const self) { return hash_integer(if (*self) { 1 } else { 0 }); } }
+impl Hash for char { ulong hash(&const self) { return hash_integer(*self as ulong); } }
+impl Hash for String { ulong hash(&const self) { return hash_str(self.as_str()); } }
+impl Hash for str { ulong hash(&const self) { return hash_str(self); } }
+impl Hash for &const str { ulong hash(&const self) { return hash_str(*self); } }
+impl<T: Hash> Hash for &const T { ulong hash(&const self) { return (*self).hash(); } }

@@ -1,0 +1,31 @@
+import std.thread;
+import std.sync.{Arc, AtomicUsize};
+import std.mem;
+struct Token { Arc<AtomicUsize> count; String text; }
+impl Drop for Token { void drop(&self) { self.count.get().fetch_add(1); } }
+thread.JoinHandle<T> started<T: Send + Owned>(Result<thread.JoinHandle<T>, thread.ThreadError> result) {
+    match result { Ok(handle) => return handle, Err(_) => panic("spawn failed") }
+}
+main() {
+    var count = Arc.new(AtomicUsize.new(0));
+    {
+        var token = Token { count: count.clone(), text: String.from("returned") };
+        var output = started(thread.spawn(send once || token)).join();
+        print(output.text);
+        print("{count.get().load()}");
+    }
+    print("{count.get().load()}");
+    {
+        var token = Token { count: count.clone(), text: String.from("discarded") };
+        var handle = started(thread.spawn(send once || token));
+        mem.drop(handle);
+    }
+    print("{count.get().load()}");
+    {
+        var token = Token { count: count.clone(), text: String.from("capture") };
+        var unused = send once || { print(token.text); };
+        mem.drop(unused);
+    }
+    print("{count.get().load()}");
+    print("{count.strong_count()}");
+}

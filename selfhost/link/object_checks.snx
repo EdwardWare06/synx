@@ -1,0 +1,199 @@
+/// Valid and malformed object-reader fixtures. Generate bytes through the Axon
+/// object writer, then check parsed ownership, symbols, and normalized addends.
+/// Prefix truncations and table mutations must return Failure without a panic.
+import objfile.{ObjectFile, ObjectFormat, ObjSymbol, ObjReloc};
+import objfile;
+import x64;
+import bytes;
+import link.model.{Object, Failure, RelocKind, SectionKind};
+import link.model;
+import link.coff;
+import link.macho_object;
+import link.macho_sha256;
+import std.binary;
+import std.utf8;
+
+void require(bool value, &const str message) { if (!value) { panic(message); } }
+T expect<T>(Result<T, Failure> result) { match result { Ok(value) => return value, Err(error) => panic("valid object rejected at input {error.input}, record {error.record}") } }
+ulong word(&const Vec<byte> data, usize at, usize width) { return binary.read_uint(data, at, width, true).unwrap(); }
+void patch(&Vec<byte> data, usize at, ulong value, usize width) {
+    require(at <= data.len() && width <= data.len() - at, "object reader assertion 20");
+    for (i in 0..width) { *data.get_mut(at + i).unwrap() = ((value >> (i as ulong * 8)) & 255) as byte; }
+}
+Result<Object, Failure> read(&const Vec<byte> data, bool mac) {
+    if (mac) { return macho_object.read(data, "fixture.o", true); }
+    return coff.read(data, "fixture.obj", true);
+}
+usize reject(&const Vec<byte> data, bool mac) {
+    match read(data, mac) { Err(_) => return 1, Ok(_) => panic("malformed object accepted ({data.len()} bytes, mac {mac})") }
+}
+usize bad(&const Vec<byte> source, bool mac, usize at, ulong value, usize width) {
+    var changed = bytes.copy(source, 0, source.len()); patch(&changed, at, value, width);
+    match read(changed, mac) { Err(_) => return 1, Ok(_) => panic("malformed object accepted (field {at}, value {value}, mac {mac})") }
+}
+ObjectFile fixture() {
+    var file = ObjectFile.new();
+    for (i in 0..32) { file.text.push(0); }
+    for (i in 0..24) { file.rodata.push(0); }
+    file.symbols.push(ObjSymbol { name: String.from("entry_long_symbol"), offset: 0, is_text: true, global: true, defined: true });
+    file.symbols.push(ObjSymbol { name: String.from("data_long_symbol"), offset: 8, is_text: false, global: false, defined: true });
+    file.symbols.push(ObjSymbol { name: String.from("external_long_symbol"), offset: 0, is_text: true, global: true, defined: false });
+    file.relocs.push(ObjReloc { offset: 4, symbol: String.from("data_long_symbol"), kind: x64.RelocKind.Pc32, addend: -12, is_text: true });
+    file.relocs.push(ObjReloc { offset: 16, symbol: String.from("external_long_symbol"), kind: x64.RelocKind.Abs64, addend: -8, is_text: true });
+    file.relocs.push(ObjReloc { offset: 0, symbol: String.from("entry_long_symbol"), kind: x64.RelocKind.Abs64, addend: 3, is_text: false });
+    file.relocs.push(ObjReloc { offset: 16, symbol: String.from("external_long_symbol"), kind: x64.RelocKind.Pc32, addend: -4, is_text: false });
+    return file;
+}
+bool equal(&const Vec<byte> left, &const Vec<byte> right) {
+    if (left.len() != right.len()) { return false; }
+    for (i in 0..left.len()) { if (*left.get(i).unwrap() != *right.get(i).unwrap()) { return false; } } return true;
+}
+void definition(&const Object object, &const str wanted, usize section, ulong offset) {
+    for (symbol in &const object.symbols) {
+        if (bytes.equals(symbol.name, wanted)) {
+            match symbol.definition { Section(s, o) => { require(s == section && o == offset, "object reader assertion 53"); return; }, _ => panic("wrong definition") }
+        }
+    }
+    panic("missing object symbol");
+}
+usize valid(&const Vec<byte> data, bool mac) {
+    var snapshot = bytes.copy(data, 0, data.len()); var object = expect(read(data, mac));
+    require(equal(snapshot, data), "object reader assertion 60"); require(object.archive_member, "object reader assertion 60"); require(object.sections.len() == 2, "object reader assertion 60");
+    require(object.sections.get(0).unwrap().size == 32 && object.sections.get(1).unwrap().size == 24, "object reader assertion 61");
+    require(object.sections.get(0).unwrap().alignment == 16 && object.sections.get(1).unwrap().alignment == 16, "object reader assertion 62");
+    require(match object.sections.get(0).unwrap().kind { Text => true, _ => false }, "object reader assertion 63");
+    require(match object.sections.get(1).unwrap().kind { ReadOnly => true, _ => false }, "object reader assertion 64");
+    definition(object, if (mac) { "_entry_long_symbol" } else { "entry_long_symbol" }, 0, 0);
+    definition(object, if (mac) { "_data_long_symbol" } else { "data_long_symbol" }, 1, 8);
+    require(object.relocations.len() == 4, "object reader assertion 67");
+    for (i in 0..4) {
+        long expected = if (i == 0) { -12 } else { if (i == 1) { -8 } else { if (i == 2) { 3 } else { -4 } } };
+        var relocation = object.relocations.get(i).unwrap(); require(relocation.addend == expected, "object reader assertion 70");
+        require(relocation.section == if (i < 2) { 0 } else { 1 }, "object reader assertion 71");
+        require(match relocation.kind { Abs64 => i == 1 || i == 2, Pc32 => i == 0 || i == 3, _ => false }, "object reader assertion 72");
+        var target = if (i == 0) { if (mac) { "_data_long_symbol" } else { "data_long_symbol" } }
+            else { if (i == 2) { if (mac) { "_entry_long_symbol" } else { "entry_long_symbol" } }
+            else { if (mac) { "_external_long_symbol" } else { "external_long_symbol" } } };
+        require(bytes.equals(object.symbols.get(relocation.symbol).unwrap().name, target), "object reader assertion 76");
+    }
+    usize text_at = word(data, if (mac) { 152 } else { 40 }, 4) as usize;
+    usize ro_at = word(data, if (mac) { 232 } else { 80 }, 4) as usize;
+    require(equal(object.sections.get(0).unwrap().data, bytes.copy(data, text_at, text_at + 32)), "object reader assertion 80");
+    require(equal(object.sections.get(1).unwrap().data, bytes.copy(data, ro_at, ro_at + 24)), "object reader assertion 81");
+    return 1;
+}
+usize coff_checks(&const Vec<byte> source) {
+    usize count = 0; usize syms = word(source, 8, 4) as usize; usize nsyms = word(source, 12, 4) as usize;
+    usize strings = syms + nsyms * 18; usize string_size = word(source, strings, 4) as usize;
+    usize relocs = word(source, 44, 4) as usize; usize raw = word(source, 40, 4) as usize;
+    count += bad(source, false, 0, 0x14c, 2); count += bad(source, false, 2, 65535, 2);
+    count += bad(source, false, 8, 0xffffffff, 4); count += bad(source, false, 12, 0xffffffff, 4);
+    count += bad(source, false, 16, 1, 2); count += bad(source, false, 36, 0xffffffff, 4);
+    count += bad(source, false, 40, source.len() as ulong + 1, 4); count += bad(source, false, 44, source.len() as ulong - 1, 4);
+    count += bad(source, false, 52, 65535, 2); count += bad(source, false, 56, 0x60e00020, 4);
+    count += bad(source, false, 56, 0x60501020, 4); count += bad(source, false, 56, 0xe0500020, 4);
+    count += bad(source, false, 56, 0xc0500080, 4); count += bad(source, false, 28, 1, 4);
+    count += bad(source, false, syms + 2 * 18 + 4, 0, 4); count += bad(source, false, strings, 3, 4);
+    count += bad(source, false, syms + 2 * 18 + 4, string_size as ulong, 4);
+    count += bad(source, false, strings + string_size - 1, 1, 1);
+    count += bad(source, false, relocs, 31, 4); count += bad(source, false, relocs + 4, nsyms as ulong, 4);
+    count += bad(source, false, relocs + 8, 0xb, 2);
+    count += bad(source, false, syms + 4 * 18 + 16, 105, 1);
+    count += bad(source, false, syms + 4 * 18 + 8, 8, 4);
+    count += bad(source, false, syms + 4 * 18 + 16, 3, 1);
+    count += bad(source, false, syms + 2 * 18 + 8, 1000, 4);
+    count += bad(source, false, syms + 17, 255, 1);
+    for (kind in 5..10) {
+        var changed = bytes.copy(source, 0, source.len()); patch(&changed, relocs + 8, kind as ulong, 2);
+        var object = expect(read(changed, false)); require(object.relocations.get(0).unwrap().addend == -8 - kind as long, "object reader assertion 107"); count += 1;
+    }
+    var signed = bytes.copy(source, 0, source.len()); patch(&signed, raw + 4, 0x80000000, 4);
+    var signed_object = expect(read(signed, false)); require(signed_object.relocations.get(0).unwrap().addend == -2147483652, "object reader assertion 110"); count += 1;
+    var rva = bytes.copy(source, 0, source.len()); patch(&rva, relocs + 8, 3, 2);
+    var rva_object = expect(read(rva, false)); require(rva_object.relocations.get(0).unwrap().addend == 4294967288, "object reader assertion 112");
+    require(match rva_object.relocations.get(0).unwrap().kind { Rva32 => true, _ => false }, "object reader assertion 113"); count += 1;
+    var auxiliary = bytes.copy(source, 0, source.len()); patch(&auxiliary, syms + 17, 1, 1);
+    var aux_object = expect(read(auxiliary, false)); require(aux_object.symbols.len() == 4, "object reader assertion 115"); count += 1;
+    require(bytes.equals(aux_object.symbols.get(aux_object.relocations.get(0).unwrap().symbol).unwrap().name, "data_long_symbol"), "object reader assertion 116");
+    patch(&auxiliary, relocs + 4, 1, 4); count += reject(auxiliary, false);
+    var null_symbol = bytes.copy(source, 0, source.len()); for (i in 0..18) { *null_symbol.get_mut(syms + i).unwrap() = 0; }
+    var null_object = expect(read(null_symbol, false)); require(null_object.symbols.len() == 4, "object reader assertion 119"); count += 1;
+    patch(&null_symbol, relocs + 4, 0, 4); count += reject(null_symbol, false);
+    var long_section = bytes.copy(source, 0, source.len()); var extra = utf8.encode(".custom_rodata");
+    bytes.append(&long_section, extra); long_section.push(0); patch(&long_section, strings, (string_size + extra.len() + 1) as ulong, 4);
+    var reference = utf8.encode("/{string_size}"); require(reference.len() <= 8, "object reader assertion 123");
+    for (i in 0..8) { *long_section.get_mut(60 + i).unwrap() = if (i < reference.len()) { *reference.get(i).unwrap() } else { 0 }; }
+    var long_object = expect(read(long_section, false)); require(long_object.sections.len() == 2, "object reader assertion 125"); count += 1;
+    var binary_name = bytes.copy(source, 0, source.len()); usize entry_string = word(source, syms + 2 * 18 + 4, 4) as usize;
+    patch(&binary_name, strings + entry_string, 255, 1); var binary_object = expect(read(binary_name, false));
+    require(*binary_object.symbols.get(2).unwrap().name.get(0).unwrap() == 255, "object reader assertion 128"); count += 1;
+    var bss = bytes.copy(source, 0, source.len()); patch(&bss, 80, 0, 4); patch(&bss, 92, 0, 2); patch(&bss, 96, 0xc0500080, 4);
+    var bss_object = expect(read(bss, false)); require(bss_object.sections.get(1).unwrap().data.is_empty(), "object reader assertion 130");
+    require(match bss_object.sections.get(1).unwrap().kind { Bss => true, _ => false }, "object reader assertion 131"); count += 1;
+    var debug = bytes.copy(source, 0, source.len()); var debug_name = utf8.encode(".debug$S");
+    for (i in 0..8) { *debug.get_mut(60 + i).unwrap() = *debug_name.get(i).unwrap(); }
+    patch(&debug, relocs + 8, 0, 2); var debug_object = expect(read(debug, false)); require(debug_object.sections.len() == 1, "object reader assertion 134"); count += 1;
+    for (section_index in 0..4) {
+        var section = match section_index { 0 => ".pdata", 1 => ".xdata", 2 => ".CRT$X", _ => ".tls" };
+        var changed = bytes.copy(source, 0, source.len()); var section_name = utf8.encode(section);
+        for (i in 0..8) { *changed.get_mut(20 + i).unwrap() = if (i < section_name.len()) { *section_name.get(i).unwrap() } else { 0 }; }
+        count += reject(changed, false);
+    }
+    // The overflow count includes its sentinel record. Absolute/no-op records
+    // keep this boundary fixture small while checking the full table extent.
+    var overflow = bytes.copy(source, 0, source.len()); usize overflow_at = overflow.len();
+    for (i in 0..(65536 as usize * 10)) { overflow.push(0); }
+    patch(&overflow, overflow_at, 65536, 4); patch(&overflow, 44, overflow_at as ulong, 4);
+    patch(&overflow, 52, 65535, 2); patch(&overflow, 56, 0x61500020, 4);
+    var overflow_object = expect(read(overflow, false));
+    require(overflow_object.relocations.len() == 2, "COFF overflow relocation count"); count += 1;
+    patch(&overflow, overflow_at, 65535, 4); count += reject(overflow, false);
+    patch(&overflow, overflow_at, 65537, 4); count += reject(overflow, false);
+    return count;
+}
+usize macho_checks(&const Vec<byte> source) {
+    usize count = 0; usize symcmd = 32 + 232; usize syms = word(source, symcmd + 8, 4) as usize;
+    usize nsyms = word(source, symcmd + 12, 4) as usize; usize strings = word(source, symcmd + 16, 4) as usize;
+    usize string_size = word(source, symcmd + 20, 4) as usize; usize relocs = word(source, 160, 4) as usize;
+    count += bad(source, true, 0, 0, 4); count += bad(source, true, 4, 7, 4); count += bad(source, true, 8, 4, 4);
+    count += bad(source, true, 12, 2, 4); count += bad(source, true, 16, 0xffffffff, 4); count += bad(source, true, 20, 0xffffffff, 4);
+    count += bad(source, true, 36, 0, 4); count += bad(source, true, 36, 7, 4); count += bad(source, true, 96, 3, 4);
+    count += bad(source, true, 144, 18446744073709551615, 8); count += bad(source, true, 136, 18446744073709551615, 8);
+    count += bad(source, true, 156, 13, 4); count += bad(source, true, 152, 0xffffffff, 4);
+    count += bad(source, true, 160, 0xffffffff, 4); count += bad(source, true, 164, 0xffffffff, 4);
+    count += bad(source, true, 168, 0x80000411, 4);
+    count += bad(source, true, syms + 16 + 6, 0x40, 2); count += bad(source, true, syms + 16, string_size as ulong, 4);
+    count += bad(source, true, syms + 16 + 5, 0, 1); count += bad(source, true, syms + 16 + 8, 33, 8);
+    count += bad(source, true, symcmd + 12, 0xffffffff, 4); count += bad(source, true, symcmd + 20, 0xffffffff, 4);
+    count += bad(source, true, syms + 2 * 16 + 8, 1, 8); count += bad(source, true, relocs, 0x80000000, 4);
+    ulong info = word(source, relocs + 4, 4);
+    count += bad(source, true, relocs + 4, (info & 0x0fffffff) | 0x30000000, 4);
+    count += bad(source, true, relocs + 4, info | 0x06000000, 4);
+    count += bad(source, true, relocs, 31, 4);
+    count += bad(source, true, relocs + 4, (info & 0xff000000) | nsyms as ulong, 4);
+    count += bad(source, true, relocs + 4, info & 0xf7000000, 4);
+    for (kind in 6..9) {
+        var changed = bytes.copy(source, 0, source.len()); patch(&changed, relocs + 4, (info & 0x0fffffff) | (kind as ulong << 28), 4);
+        var object = expect(read(changed, true));
+        require(object.relocations.get(0).unwrap().addend == -12, "object reader assertion 167"); count += 1;
+    }
+    var local = bytes.copy(source, 0, source.len()); patch(&local, relocs + 4, (info & 0xf7000000) | 2, 4);
+    var local_object = expect(read(local, true)); require(local_object.relocations.get(0).unwrap().addend == -36, "object reader assertion 170"); count += 1;
+    var binary_name = bytes.copy(source, 0, source.len()); usize entry_string = word(source, syms + 16, 4) as usize;
+    patch(&binary_name, strings + entry_string, 255, 1); var binary_object = expect(read(binary_name, true));
+    require(*binary_object.symbols.get(1).unwrap().name.get(0).unwrap() == 255, "object reader assertion 173"); count += 1;
+    return count;
+}
+pub usize run() {
+    var file = fixture(); var coff_bytes = objfile.write_object(file, ObjectFormat.Coff); var macho_bytes = objfile.write_object(file, ObjectFormat.MachO);
+    usize count = valid(coff_bytes, false) + valid(macho_bytes, true);
+    for (size in 0..coff_bytes.len()) { count += reject(bytes.copy(coff_bytes, 0, size), false); }
+    for (size in 0..macho_bytes.len()) { count += reject(bytes.copy(macho_bytes, 0, size), true); }
+    count += coff_checks(coff_bytes); count += macho_checks(macho_bytes);
+    var empty = utf8.encode(""); var abc = utf8.encode("abc");
+    var empty_hash = macho_sha256.digest(empty, 0, 0); var abc_hash = macho_sha256.digest(abc, 0, 3);
+    var expected_empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    var expected_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    require(model.key(empty_hash).as_str() == expected_empty, "object reader assertion 186"); require(model.key(abc_hash).as_str() == expected_abc, "object reader assertion 186"); count += 2;
+    return count;
+}

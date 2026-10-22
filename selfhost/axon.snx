@@ -1,0 +1,1367 @@
+/// Axon: x86-64 instruction selection. Source: compiler/src/axon.cpp, a
+/// function-by-function port.
+/// Parity: tests/selfhost_modules_test.cpp (all stage, object section).
+/// Synx to Synx calls copy arguments into an outgoing area at the bottom of
+/// the caller's frame, each rounded up to 8 bytes; the callee reads them at
+/// [rbp + 16 + offset]. Results up to 8 bytes return in rax, up to 16 in
+/// rax:rdx, larger ones through a hidden pointer in the first argument word.
+/// Runtime and extern C calls use the platform C ABI for scalars; fat pointers
+/// pass as two scalars and struct results go through an out pointer.
+/// Each module function, each drop helper, the thread bridge, and the entry
+/// stub become one text symbol; vtables and constants live in read-only data.
+import ast;
+import ast.{PrimKind, BinaryOp, UnaryOp};
+import ids.{TypeId, DefId, NONE};
+import types.TypeKind;
+import check.{Checker, same_def};
+import check_data;
+import ir.{Place, ProjKind, Constant, ConstantKind, Operand, OperandKind, Rvalue, RvalueKind, AggregateKind, Statement, StatementKind,
+    CalleeKind, Terminator, TerminatorKind, BasicBlock, Local, Function, Module};
+import ir;
+import layout.{Layout, LayoutTable, align_up, struct_field_types, variant_field_types};
+import regalloc.{RegisterAllocation, allocate_registers};
+import x64.{Assembler, Reloc, RelocKind, RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, XMM0, XMM1,
+    COND_O, COND_B, COND_AE, COND_E, COND_NE, COND_BE, COND_A, COND_P, COND_NP, COND_L, COND_GE, COND_LE, COND_G,
+    ALU_ADD, ALU_OR, ALU_AND, ALU_SUB, ALU_XOR, ALU_CMP};
+import objfile.{ObjectFile, ObjSymbol, ObjReloc, write_object};
+import target.{Target, symbol_for};
+import source.Span;
+import bytes;
+import std.collections.HashMap;
+import std.mem;
+
+/// Slot offset of a local that has no stack slot.
+const int NO_SLOT = -2147483648;
+
+Span no_span() { return Span { start: 0, end: 0, file: 0 }; }
+ulong round8(ulong v) { return (v + 7) / 8 * 8; }
+
+/// runtime_table in axon.cpp. Every entry's C symbol is synx_rt_<name>.
+bool is_runtime(&const str name) {
+    return name == "print" || name == "panic" || name == "string_new" || name == "string_push_str" || name == "string_drop"
+        || name == "vec_drop" || name == "fmt_int" || name == "fmt_uint" || name == "fmt_double" || name == "fmt_bool"
+        || name == "fmt_char" || name == "str_cmp" || name == "str_len" || name == "str_parse_int" || name == "alloc"
+        || name == "realloc" || name == "free" || name == "memcpy" || name == "exit";
+}
+/// Runtime functions whose result is written through an out pointer.
+bool runtime_returns_struct(&const str name) { return name == "string_new" || name == "str_parse_int"; }
+
+/// Code generator state shared by every function: layouts, drop helpers,
+/// module tables copied before generation, and the object being built.
+/// Gen owns this state while it generates one function.
+pub struct Axon {
+    pub Target target;
+    LayoutTable lay;
+    Vec<TypeId> drop_worklist;
+    HashMap<ulong, usize> drop_index;
+    HashMap<ulong, bool> drop_types;
+    HashMap<ulong, uint> drop_impls;
+    Vec<String> fn_symbols;
+    Vec<String> vtable_symbols;
+    pub ObjectFile obj;
+    pub Axon new(Target target) {
+        return Axon { target: target, lay: LayoutTable.new(), drop_worklist: Vec.new(), drop_index: HashMap.new(), drop_types: HashMap.new(),
+            drop_impls: HashMap.new(), fn_symbols: Vec.new(), vtable_symbols: Vec.new(), obj: ObjectFile.new() };
+    }
+
+    /// Registers the helper before its body exists: recursive owners refer back here.
+    String drop_symbol(&self, TypeId t) {
+        ulong key = t.index as ulong;
+        match self.drop_index.get(&key) { Some(i) => { usize at = *i; return "synx_drop_{at}"; }, None => {} }
+        usize n = self.drop_worklist.len();
+        self.drop_index.insert(key, n); self.drop_worklist.push(t);
+        return "synx_drop_{n}";
+    }
+    bool needs_drop(&const self, TypeId t) { ulong key = t.index as ulong; return self.drop_types.contains_key(&key); }
+    uint drop_impl_of(&const self, TypeId t) {
+        ulong key = t.index as ulong;
+        match self.drop_impls.get(&key) { Some(f) => return *f, None => return NONE }
+    }
+
+    /// Generates code for every lowered function plus the bridges into obj.
+    /// Each function moves out of the module while it is generated. Returns
+    /// false after an SNX0601 error.
+    pub bool generate(&self, &Checker ck, &const Vec<ast.Ast> trees, &Module m) {
+        for (f in &const m.functions) { self.fn_symbols.push(symbol_for(f.name.as_str())); }
+        for (v in &const m.vtables) { self.vtable_symbols.push(symbol_for(v.name.as_str())); }
+        for (t in &const m.drop_types) { self.drop_types.insert(t.index as ulong, true); }
+        for (d in &const m.drop_impls) { self.drop_impls.insert(d.type.index as ulong, d.fn_index); }
+        // Local symbol for the read-only data section.
+        self.obj.symbols.push(ObjSymbol { name: String.from("synx_rodata"), offset: 0, is_text: false, global: false, defined: true });
+        // Vtable header: size, alignment, optional complete cleanup; then methods in
+        // declaration order. Absolute relocations are applied in read-only data.
+        for (vi in 0..m.vtables.len()) {
+            var concrete = m.vtables.get(vi).unwrap().concrete;
+            while (self.obj.rodata.len() % 8 != 0) { self.obj.rodata.push(0); }
+            var vname = String.from(self.vtable_symbols.get(vi).unwrap());
+            self.obj.symbols.push(ObjSymbol { name: vname, offset: self.obj.rodata.len() as ulong, is_text: false, global: false, defined: true });
+            var l = self.lay.of(&*ck, concrete);
+            word(&self.obj, l.size); word(&self.obj, l.align);
+            if (self.needs_drop(concrete)) {
+                var name = self.drop_symbol(concrete);
+                self.obj.relocs.push(ObjReloc { offset: self.obj.rodata.len(), symbol: name, kind: RelocKind.Abs64, addend: 0, is_text: false });
+            }
+            word(&self.obj, 0);
+            usize count = m.vtables.get(vi).unwrap().methods.len();
+            for (mi in 0..count) {
+                uint method = *m.vtables.get(vi).unwrap().methods.get(mi).unwrap();
+                var name = String.from(self.fn_symbols.get(method as usize).unwrap());
+                self.obj.relocs.push(ObjReloc { offset: self.obj.rodata.len(), symbol: name, kind: RelocKind.Abs64, addend: 0, is_text: false });
+                word(&self.obj, 0);
+            }
+        }
+
+        bool ok = true;
+        for (fi in 0..m.functions.len()) {
+            if (!m.functions.get(fi).unwrap().lowered) { continue; }
+            var def = m.functions.get(fi).unwrap().def;
+            if (def.index != NONE) {
+                var d = ck.r.program.def(def);
+                if (d.is_builtin || d.ast_file == NONE) { continue; }
+                if (trees.get(d.ast_file as usize).unwrap().function(d.ast_index).body == ast.NONE) { continue; }
+            }
+            var f = mem.replace(m.functions.get_mut(fi).unwrap(), Function.new(String.new()));
+            var tgt = self.target; var g = Gen.new(mem.replace(&*self, Axon.new(tgt)), f);
+            bool done = g.generate(&*ck, TypeId.none());
+            var state = mem.replace(&g.ax, Axon.new(self.target)); *self = state;
+            var func = mem.replace(&g.f, Function.new(String.new())); var slot = m.functions.get_mut(fi).unwrap(); *slot = func;
+            if (!done) { ok = false; continue; }
+            var name = String.from(self.fn_symbols.get(fi).unwrap());
+            append(&self.obj, name, &const g.a);
+        }
+        if (!ok) { return false; }
+
+        usize i = 0;
+        while (i < self.drop_worklist.len()) {
+            var t = *self.drop_worklist.get(i).unwrap();
+            var shown = ck.show(t);
+            var helper = Function.new("@drop.{shown}");
+            helper.ret = ck.void_t(); helper.arg_count = 1;
+            helper.locals.push(Local.new(ck.void_t(), "", false, no_span()));
+            helper.locals.push(Local.new(ck.r.types.ptr(t, false), "value", true, no_span()));
+            var tgt = self.target; var g = Gen.new(mem.replace(&*self, Axon.new(tgt)), helper);
+            g.scratch_slots = 3;
+            bool done = g.generate(&*ck, t);
+            var state = mem.replace(&g.ax, Axon.new(self.target)); *self = state;
+            i += 1;
+            if (!done) { ok = false; continue; }
+            var name = self.drop_symbol(t);
+            append(&self.obj, name, &const g.a);
+        }
+        if (!ok) { return false; }
+
+        // C ABI bridge for a heap-owned, zero-argument consuming closure.
+        // The closure cleans its environment; the C boot function frees the pair.
+        bool win = self.target.win64_abi();
+        {
+            var a = Assembler.new();
+            a.push(RBP); a.mov_rr(RBP, RSP);
+            a.alu_ri(ALU_SUB, RSP, if (win) { 48 } else { 16 });
+            if (win) { a.store(RBP, -8, RSI, 8); a.store(RBP, -16, RDI, 8); }
+            a.mov_rr(RAX, if (win) { RCX } else { RDI });
+            a.load(R10, RAX, 8, 8, false);
+            a.load(RAX, RAX, 0, 8, false);
+            a.call_reg(RAX);
+            if (win) { a.load(RSI, RBP, -8, 8, false); a.load(RDI, RBP, -16, 8, false); }
+            a.mov_rr(RSP, RBP); a.pop(RBP); a.ret(); a.finish();
+            self.obj.symbols.push(ObjSymbol { name: String.from("synx_thread_entry"), offset: self.obj.text.len() as ulong, is_text: true, global: true, defined: true });
+            bytes.append(&self.obj.text, &const a.code);
+        }
+
+        // Entry stub: int synx_entry(void) calls main and returns its exit code.
+        if (m.entry != NONE) {
+            var ret = m.functions.get(m.entry as usize).unwrap().ret;
+            var a = Assembler.new();
+            a.push(RBP); a.mov_rr(RBP, RSP);
+            a.alu_ri(ALU_SUB, RSP, if (win) { 48 } else { 32 });
+            // Synx uses rsi/rdi as scratch registers. Preserve the nonvolatile
+            // registers of the C caller at the Windows entry boundary.
+            if (win) { a.store(RBP, -8, RSI, 8); a.store(RBP, -16, RDI, 8); }
+            a.call_sym(self.fn_symbols.get(m.entry as usize).unwrap().as_str());
+            if (ret.index == NONE || ck.is_void(ret)) { a.mov_ri(RAX, 0); } else { a.movsx32(RAX, RAX); }
+            if (win) { a.load(RSI, RBP, -8, 8, false); a.load(RDI, RBP, -16, 8, false); }
+            a.mov_rr(RSP, RBP); a.pop(RBP); a.ret(); a.finish();
+            self.obj.symbols.push(ObjSymbol { name: String.from("synx_entry"), offset: self.obj.text.len() as ulong, is_text: true, global: true, defined: true });
+            for (r in &const a.relocs) {
+                self.obj.relocs.push(ObjReloc { offset: self.obj.text.len() + r.offset, symbol: String.from(r.symbol), kind: r.kind, addend: r.addend, is_text: true });
+            }
+            bytes.append(&self.obj.text, &const a.code);
+        }
+        if (self.obj.rodata.is_empty()) { self.obj.rodata.push(0); }
+        return true;
+    }
+}
+
+void word(&ObjectFile out, ulong value) {
+    for (i in 0..8) { out.rodata.push(((value >> ((i * 8) as ulong)) & 255) as byte); }
+}
+/// Appends one function's code at a 16-byte boundary with its relocations.
+void append(&ObjectFile out, String name, &const Assembler a) {
+    out.symbols.push(ObjSymbol { name: name, offset: out.text.len() as ulong, is_text: true, global: true, defined: true });
+    for (r in &const a.relocs) {
+        out.relocs.push(ObjReloc { offset: out.text.len() + r.offset, symbol: String.from(r.symbol), kind: r.kind, addend: r.addend, is_text: true });
+    }
+    bytes.append(&out.text, &const a.code);
+    while (out.text.len() % 16 != 0) { out.text.push(204); }
+}
+
+/// The type of the value at an address, and whether a fat pointer left its
+/// length in rdx.
+struct PlaceInfo { TypeId type; bool fat_len_in_rdx; }
+/// One C argument piece: scratch slot and float class.
+struct Piece { int slot; bool is_float; }
+
+/// FunctionGen in axon.cpp: one function's frame and code. Owns the shared
+/// Axon state and the function while it runs; methods take the checker.
+struct Gen {
+    Axon ax;
+    Function f;
+    Target target;
+    Assembler a;
+    bool ok;
+    /// rbp-relative offset of each local.
+    Vec<int> slot_off;
+    RegisterAllocation allocation;
+    Vec<int> saved_off;
+    Vec<int> block_labels;
+    /// Outgoing argument area size.
+    uint max_out;
+    /// Result through a hidden pointer.
+    bool big_ret;
+    int scratch_off;
+    /// C ABI: six integer and eight SSE pieces.
+    uint scratch_slots;
+    int epilogue_label;
+    uint frame_size;
+
+    Gen new(Axon ax, Function f) {
+        var target = ax.target;
+        return Gen { ax: ax, f: f, target: target, a: Assembler.new(), ok: true, slot_off: Vec.new(),
+            allocation: RegisterAllocation { registers: Vec.new(), saved: Vec.new() }, saved_off: Vec.new(), block_labels: Vec.new(),
+            max_out: 0, big_ret: false, scratch_off: 0, scratch_slots: 14, epilogue_label: 0, frame_size: 0 };
+    }
+
+    void error(&self, &Checker ck, Span span, &const str message) { ck.r.sink.error(span, message, "SNX0601"); self.ok = false; }
+
+    // ----- type queries -----
+    TypeKind kind(&const self, &Checker ck, TypeId t) { return ck.r.types.get(t).kind; }
+    TypeId inner(&const self, &Checker ck, TypeId t) { return ck.r.types.get(t).inner; }
+    TypeId elem(&const self, &Checker ck, TypeId t, usize i) { return *ck.r.types.get(t).elems.get(i).unwrap(); }
+    bool is_signed(&const self, &Checker ck, TypeId t) { return ck.r.types.get(t).is_signed_integer(); }
+    bool is_float(&const self, &Checker ck, TypeId t) { match self.kind(&*ck, t) { TypeKind.Prim => return ck.r.types.get(t).is_float(), _ => return false } }
+    bool is_f32(&const self, &Checker ck, TypeId t) { return ck.is_prim(t, PrimKind.Float); }
+    bool is_unsized(&const self, &Checker ck, TypeId t) { return ck.r.types.get(t).is_unsized(); }
+    bool is_kind(&const self, &Checker ck, TypeId t, TypeKind k) { return types_kind_index(self.kind(&*ck, t)) == types_kind_index(k); }
+    ulong size_of(&self, &Checker ck, TypeId t) { return self.ax.lay.size_of(&*ck, t); }
+    Layout lay_of(&self, &Checker ck, TypeId t) { return self.ax.lay.of(&*ck, t); }
+    ulong field_offset(&self, &Checker ck, TypeId t, uint i) { var l = self.lay_of(&*ck, t); return *l.field_offsets.get(i as usize).unwrap(); }
+    TypeId local_type(&const self, uint local) { return self.f.locals.get(local as usize).unwrap().type; }
+    int reg(&const self, uint local) { return *self.allocation.registers.get(local as usize).unwrap(); }
+    int slot(&const self, uint local) { return *self.slot_off.get(local as usize).unwrap(); }
+    String fn_symbol(&const self, &Checker ck, uint index) { return String.from(self.ax.fn_symbols.get(index as usize).unwrap()); }
+
+    // ----- types of places -----
+    TypeId place_type(&self, &Checker ck, &const Place p) {
+        var t = self.local_type(p.local); uint variant = 0;
+        for (pr in &const p.proj) {
+            match pr.kind {
+                ProjKind.Deref => { t = self.inner(&*ck, t); }
+                ProjKind.Index => { t = self.inner(&*ck, t); }
+                ProjKind.Downcast => { variant = pr.index; }
+                ProjKind.Field => {
+                    match self.kind(&*ck, t) {
+                        TypeKind.Tuple => { t = self.elem(&*ck, t, pr.index as usize); }
+                        TypeKind.Struct => { var fs = struct_field_types(&*ck, t); t = *fs.get(pr.index as usize).unwrap(); }
+                        TypeKind.Enum => { var fs = variant_field_types(&*ck, t, variant); t = *fs.get(pr.index as usize).unwrap(); }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        return t;
+    }
+    TypeId operand_type(&self, &Checker ck, &const Operand o) { if (o.is_const()) { return o.constant.type; } return self.place_type(&*ck, &const o.place); }
+
+    /// Computes the address of a place into out, using r10 and r11. For a value
+    /// reached through a fat pointer, its length is left in rdx.
+    PlaceInfo addr(&self, &Checker ck, &const Place p, byte out) {
+        var info = PlaceInfo { type: TypeId.none(), fat_len_in_rdx: false };
+        var t = self.local_type(p.local);
+        if (self.reg(p.local) >= 0) {
+            var span = self.f.locals.get(p.local as usize).unwrap().span;
+            self.error(&*ck, span, "internal code generation error: register local has no address");
+            info.type = self.place_type(&*ck, p);
+            self.a.mov_ri(out, 0);
+            return info;
+        }
+        uint variant = 0;
+        if (p.local == 0 && self.big_ret) { self.a.load(out, RBP, 16, 8, false); }
+        else { self.a.lea(out, RBP, self.slot(p.local)); }
+        for (pr in &const p.proj) {
+            match pr.kind {
+                ProjKind.Deref => {
+                    var pointee = self.inner(&*ck, t); bool fat = self.is_unsized(&*ck, pointee);
+                    if (fat) { self.a.load(RDX, out, 8, 8, false); info.fat_len_in_rdx = true; } else { info.fat_len_in_rdx = false; }
+                    self.a.load(out, out, 0, 8, false);
+                    t = self.inner(&*ck, t);
+                }
+                ProjKind.Index => {
+                    // Indexing a raw pointer steps through the elements it points
+                    // to, as in C. Arrays and slices index in place.
+                    if (self.is_kind(&*ck, t, TypeKind.Ptr)) { self.a.load(out, out, 0, 8, false); }
+                    var elem = self.inner(&*ck, t);
+                    ulong esz = self.size_of(&*ck, elem);
+                    if (self.reg(pr.index) >= 0) { self.a.mov_rr(R10, self.reg(pr.index) as byte); }
+                    else { self.a.load(R10, RBP, self.slot(pr.index), 8, false); }
+                    if (esz != 1) { self.a.mov_ri(R11, esz as long); self.a.imul_rr(R10, R11); }
+                    self.a.alu_rr(ALU_ADD, out, R10);
+                    t = elem; info.fat_len_in_rdx = false;
+                }
+                ProjKind.Downcast => { variant = pr.index; }
+                ProjKind.Field => {
+                    ulong off = 0; var ft = TypeId.none();
+                    match self.kind(&*ck, t) {
+                        TypeKind.Tuple => { off = self.field_offset(&*ck, t, pr.index); ft = self.elem(&*ck, t, pr.index as usize); }
+                        TypeKind.Struct => { off = self.field_offset(&*ck, t, pr.index); var fs = struct_field_types(&*ck, t); ft = *fs.get(pr.index as usize).unwrap(); }
+                        TypeKind.Enum => {
+                            var pl = self.ax.lay.variant_payload(&*ck, t, variant);
+                            off = self.lay_of(&*ck, t).payload_offset + *pl.field_offsets.get(pr.index as usize).unwrap();
+                            var fs = variant_field_types(&*ck, t, variant); ft = *fs.get(pr.index as usize).unwrap();
+                        }
+                        _ => {
+                            var shown = ck.show(t);
+                            self.error(&*ck, no_span(), "field projection on a value of type '{shown}'");
+                            return info;
+                        }
+                    }
+                    if (off != 0) { self.a.alu_ri(ALU_ADD, out, off as int); }
+                    t = ft; info.fat_len_in_rdx = false;
+                }
+            }
+        }
+        info.type = t;
+        return info;
+    }
+
+    // ----- loads and stores of scalars -----
+
+    /// Loads a scalar of type t from [base+disp] into rax, extended to 64 bits.
+    void load_scalar(&self, &Checker ck, TypeId t, byte base, int disp) {
+        ulong size = self.size_of(&*ck, t);
+        if (size == 0) { self.a.mov_ri(RAX, 0); return; }
+        if (size == 1 || size == 2 || size == 4 || size == 8) {
+            self.a.load(RAX, base, disp, size as byte, self.is_signed(&*ck, t) && !self.is_float(&*ck, t));
+            return;
+        }
+        // Odd sizes (3, 5, 6, 7): assemble from bytes.
+        self.a.mov_ri(RAX, 0);
+        int i = size as int - 1;
+        while (i >= 0) {
+            self.a.load(R10, base, disp + i, 1, false);
+            if (i != size as int - 1) { self.a.mov_ri(RCX, 8); self.a.shl_cl(RAX); }
+            self.a.alu_rr(ALU_OR, RAX, R10);
+            i -= 1;
+        }
+    }
+    /// Stores the low size bytes of rax to [base+disp].
+    void store_scalar(&self, &Checker ck, ulong size, byte base, int disp) {
+        if (size == 0) { return; }
+        if (size == 1 || size == 2 || size == 4 || size == 8) { self.a.store(base, disp, RAX, size as byte); return; }
+        for (i in 0..size) {
+            self.a.store(base, disp + i as int, RAX, 1);
+            if (i + 1 < size) { self.a.mov_ri(RCX, 8); self.a.shr_cl(RAX); }
+        }
+    }
+    /// Registers use the same extension as a stack store followed by load_scalar.
+    void write_scalar(&self, &Checker ck, &const Place p) {
+        var t = self.place_type(&*ck, p);
+        int r = self.reg(p.local);
+        if (p.is_local() && r >= 0) {
+            byte dest = r as byte; bool signed = self.is_signed(&*ck, t);
+            ulong size = self.size_of(&*ck, t);
+            if (size == 1) { if (signed) { self.a.movsx8(dest, RAX); } else { self.a.movzx8(dest, RAX); } }
+            else if (size == 2) { if (signed) { self.a.movsx16(dest, RAX); } else { self.a.movzx16(dest, RAX); } }
+            else if (size == 4) { if (signed) { self.a.movsx32(dest, RAX); } else { self.a.mov32(dest, RAX); } }
+            else { self.a.mov_rr(dest, RAX); }
+        } else {
+            self.addr(&*ck, p, RDI);
+            ulong size = self.size_of(&*ck, t); self.store_scalar(&*ck, size, RDI, 0);
+        }
+    }
+    /// Copies size bytes from [rsi] to [rdi]. Clobbers rax, rcx, rsi, rdi.
+    void copy_mem(&self, &Checker ck, ulong size) {
+        if (size == 0) { return; }
+        if (size <= 64) {
+            ulong off = 0;
+            while (size - off >= 8) { self.a.load(RAX, RSI, off as int, 8, false); self.a.store(RDI, off as int, RAX, 8); off += 8; }
+            if (size - off >= 4) { self.a.load(RAX, RSI, off as int, 4, false); self.a.store(RDI, off as int, RAX, 4); off += 4; }
+            if (size - off >= 2) { self.a.load(RAX, RSI, off as int, 2, false); self.a.store(RDI, off as int, RAX, 2); off += 2; }
+            if (size - off >= 1) { self.a.load(RAX, RSI, off as int, 1, false); self.a.store(RDI, off as int, RAX, 1); }
+            return;
+        }
+        self.a.mov_ri(RCX, size as long);
+        self.a.rep_movsb();
+    }
+
+    // ----- constants -----
+
+    ulong add_rodata(&self, &Checker ck, &const Vec<byte> data) {
+        ulong off = self.ax.obj.rodata.len() as ulong;
+        bytes.append(&self.ax.obj.rodata, data);
+        self.ax.obj.rodata.push(0);
+        while (self.ax.obj.rodata.len() % 8 != 0) { self.ax.obj.rodata.push(0); }
+        return off;
+    }
+    /// Materializes a constant: scalars in rax, fat pointers in rax:rdx,
+    /// floating point values as bits in rax.
+    void load_const(&self, &Checker ck, &const Constant k) {
+        match k.kind {
+            ConstantKind.Int => { self.a.mov_ri(RAX, k.int_value as long); }
+            ConstantKind.Bool => { self.a.mov_ri(RAX, k.int_value as long); }
+            ConstantKind.Char => { self.a.mov_ri(RAX, k.int_value as long); }
+            ConstantKind.Float => {
+                if (self.is_f32(&*ck, k.type)) {
+                    float narrow = k.float_value as float;
+                    uint bits = unsafe { *(((&const narrow) as *const float) as *const uint) };
+                    self.a.mov_ri(RAX, bits as long);
+                } else {
+                    double value = k.float_value;
+                    ulong bits = unsafe { *(((&const value) as *const double) as *const ulong) };
+                    self.a.mov_ri(RAX, bits as long);
+                }
+            }
+            ConstantKind.Str => {
+                ulong off = self.add_rodata(&*ck, &const k.str_value);
+                self.a.lea_rip(RAX, "synx_rodata", off as long);
+                self.a.mov_ri(RDX, k.str_value.len() as long);
+            }
+            ConstantKind.Unit => {}
+            ConstantKind.Fn => {
+                var name = self.fn_symbol(&*ck, k.fn_index);
+                self.a.lea_rip(RAX, name.as_str(), 0);
+                if (self.is_kind(&*ck, k.type, TypeKind.Fn)) { self.a.mov_ri(RDX, 0); }
+            }
+        }
+    }
+    /// Writes an operand into [rdi]. Clobbers rax, rcx, rdx, rsi, r10, r11; keeps rdi.
+    void store_operand_to_rdi(&self, &Checker ck, &const Operand o) {
+        var t = self.operand_type(&*ck, o);
+        ulong size = self.size_of(&*ck, t);
+        if (!o.is_const() && o.place.is_local() && self.reg(o.place.local) >= 0) {
+            self.a.mov_rr(RAX, self.reg(o.place.local) as byte);
+            self.store_scalar(&*ck, size, RDI, 0);
+            return;
+        }
+        if (o.is_const()) {
+            match o.constant.kind { ConstantKind.Unit => { return; }, _ => {} }
+            self.load_const(&*ck, &const o.constant);
+            bool pair = false;
+            match o.constant.kind { ConstantKind.Str => { pair = true; }, _ => {} }
+            if (pair || self.is_kind(&*ck, t, TypeKind.Fn)) { self.a.store(RDI, 0, RAX, 8); self.a.store(RDI, 8, RDX, 8); }
+            else { self.store_scalar(&*ck, size, RDI, 0); }
+            return;
+        }
+        // Place: compute its address into rsi (preserving rdi), then copy.
+        self.addr(&*ck, &const o.place, RSI);
+        self.copy_mem(&*ck, size);
+    }
+    /// Loads a scalar operand (size <= 8, not fat) into rax.
+    void load_operand_rax(&self, &Checker ck, &const Operand o) {
+        if (o.is_const()) { self.load_const(&*ck, &const o.constant); return; }
+        if (o.place.is_local() && self.reg(o.place.local) >= 0) { self.a.mov_rr(RAX, self.reg(o.place.local) as byte); return; }
+        var pi = self.addr(&*ck, &const o.place, RSI);
+        self.load_scalar(&*ck, pi.type, RSI, 0);
+    }
+    /// Loads a floating point operand into xmm0 as a double.
+    void load_operand_xmm0(&self, &Checker ck, &const Operand o) {
+        var t = self.operand_type(&*ck, o);
+        if (o.is_const()) {
+            double value = o.constant.float_value;
+            ulong bits = unsafe { *(((&const value) as *const double) as *const ulong) };
+            self.a.mov_ri(RAX, bits as long);
+            self.a.movq_xr(XMM0, RAX);
+            return;
+        }
+        self.addr(&*ck, &const o.place, RSI);
+        if (self.is_f32(&*ck, t)) { self.a.movss_load(XMM0, RSI, 0); self.a.cvtss2sd(XMM0, XMM0); }
+        else { self.a.movsd_load(XMM0, RSI, 0); }
+    }
+    /// Stores the double in xmm0 to [rdi] with the type's precision.
+    void store_xmm0_to_rdi(&self, &Checker ck, TypeId t) {
+        if (self.is_f32(&*ck, t)) { self.a.cvtsd2ss(XMM0, XMM0); self.a.movss_store(RDI, 0, XMM0); }
+        else { self.a.movsd_store(RDI, 0, XMM0); }
+    }
+    /// Stores xmm0 to a place through the rax scratch slot.
+    void store_xmm0_to_place(&self, &Checker ck, &const Place p, TypeId t) {
+        self.a.movq_rx(RAX, XMM0);
+        self.save_rax(&*ck, 0);
+        self.addr(&*ck, p, RDI);
+        self.load_rax(&*ck, 0);
+        self.a.movq_xr(XMM0, RAX);
+        self.store_xmm0_to_rdi(&*ck, t);
+    }
+
+    // ----- statements -----
+
+    void gen_assign(&self, &Checker ck, &const Statement s) {
+        var r = &const s.rvalue;
+        var dest_t = self.place_type(&*ck, &const s.place);
+        ulong dest_size = self.size_of(&*ck, dest_t);
+        match r.kind {
+            RvalueKind.Use => {
+                if (dest_size == 0) { return; }
+                if (s.place.is_local() && self.reg(s.place.local) >= 0) {
+                    self.load_operand_rax(&*ck, &const r.a); self.write_scalar(&*ck, &const s.place); return;
+                }
+                self.addr(&*ck, &const s.place, RDI);
+                self.store_operand_to_rdi(&*ck, &const r.a);
+            }
+            RvalueKind.Ref => {
+                var pi = self.addr(&*ck, &const r.place, RAX);
+                bool fat = pi.type.index != NONE && self.is_unsized(&*ck, pi.type);
+                if (fat && !pi.fat_len_in_rdx) { self.error(&*ck, s.span, "cannot take a reference to an unsized value here"); return; }
+                // Keep the address.
+                self.a.mov_rr(RSI, RAX);
+                self.addr(&*ck, &const s.place, RDI);
+                self.a.store(RDI, 0, RSI, 8);
+                if (fat) { self.a.store(RDI, 8, RDX, 8); }
+            }
+            RvalueKind.StrFromString => { self.gen_buffer_slice(&*ck, s); }
+            RvalueKind.VecToSlice => { self.gen_buffer_slice(&*ck, s); }
+            RvalueKind.ToDyn => {
+                if (r.vtable == NONE) { self.error(&*ck, s.span, "missing trait object vtable"); return; }
+                self.load_operand_rax(&*ck, &const r.a);
+                self.a.mov_rr(RSI, RAX);
+                var name = String.from(self.ax.vtable_symbols.get(r.vtable as usize).unwrap());
+                self.a.lea_rip(RAX, name.as_str(), 0);
+                self.a.mov_rr(RCX, RAX);
+                self.addr(&*ck, &const s.place, RDI);
+                self.a.store(RDI, 0, RSI, 8);
+                self.a.store(RDI, 8, RCX, 8);
+            }
+            RvalueKind.ArrayToSlice => {
+                // &T[N]
+                var rt = self.operand_type(&*ck, &const r.a);
+                ulong n = ck.r.types.get(self.inner(&*ck, rt)).length;
+                self.load_operand_rax(&*ck, &const r.a);
+                self.a.mov_rr(RSI, RAX);
+                self.addr(&*ck, &const s.place, RDI);
+                self.a.store(RDI, 0, RSI, 8);
+                self.a.mov_ri(RAX, n as long);
+                self.a.store(RDI, 8, RAX, 8);
+            }
+            RvalueKind.Binary => { self.gen_binary(&*ck, s); }
+            RvalueKind.Unary => { self.gen_unary(&*ck, s); }
+            RvalueKind.Cast => { self.gen_cast(&*ck, s); }
+            RvalueKind.Aggregate => { self.gen_aggregate(&*ck, s); }
+            RvalueKind.Discriminant => {
+                self.addr(&*ck, &const r.place, RSI);
+                self.a.load(RAX, RSI, 0, 8, false);
+                self.addr(&*ck, &const s.place, RDI);
+                self.a.store(RDI, 0, RAX, 8);
+            }
+            RvalueKind.Len => {
+                var pi = self.addr(&*ck, &const r.place, RSI);
+                match self.kind(&*ck, pi.type) {
+                    TypeKind.Array => { self.a.mov_ri(RAX, ck.r.types.get(pi.type).length as long); }
+                    // Vec len
+                    TypeKind.Struct => { self.a.load(RAX, RSI, 8, 8, false); }
+                    _ => {
+                        if (pi.fat_len_in_rdx) { self.a.mov_rr(RAX, RDX); }
+                        else { var shown = ck.show(pi.type); self.error(&*ck, s.span, "cannot take the length of '{shown}'"); return; }
+                    }
+                }
+                self.addr(&*ck, &const s.place, RDI);
+                self.a.store(RDI, 0, RAX, 8);
+            }
+        }
+    }
+    /// Operand is a reference to String or Vec: {data, len, cap}.
+    void gen_buffer_slice(&self, &Checker ck, &const Statement s) {
+        // rax = pointer to the struct
+        self.load_operand_rax(&*ck, &const s.rvalue.a);
+        self.a.load(RDX, RAX, 8, 8, false);
+        self.a.load(RAX, RAX, 0, 8, false);
+        self.a.mov_rr(RSI, RAX);
+        self.addr(&*ck, &const s.place, RDI);
+        self.a.store(RDI, 0, RSI, 8);
+        self.a.store(RDI, 8, RDX, 8);
+    }
+
+    int scratch_disp(&self, &Checker ck, int slot) {
+        if (slot < 0 || slot as uint >= self.scratch_slots) {
+            self.error(&*ck, no_span(), "internal code generation error: scratch slot is outside the frame");
+            return self.scratch_off;
+        }
+        return self.scratch_off + 8 * slot;
+    }
+    void save_rax(&self, &Checker ck, int slot) { int d = self.scratch_disp(&*ck, slot); self.a.store(RBP, d, RAX, 8); }
+    void load_rax(&self, &Checker ck, int slot) { int d = self.scratch_disp(&*ck, slot); self.a.load(RAX, RBP, d, 8, false); }
+    void save_reg(&self, &Checker ck, byte r, int slot) { int d = self.scratch_disp(&*ck, slot); self.a.store(RBP, d, r, 8); }
+    void load_reg(&self, &Checker ck, byte r, int slot) { int d = self.scratch_disp(&*ck, slot); self.a.load(r, RBP, d, 8, false); }
+
+    /// The failure path exits the process; it cannot clobber values on the
+    /// successful path, including scalar locals in caller-save registers.
+    void arithmetic_guard(&self, &Checker ck, byte failure, &const str message) {
+        int good = self.a.new_label();
+        self.a.jcc(failure ^ 1, good);
+        self.emit_panic(&*ck, message);
+        self.a.bind(good);
+    }
+    void check_narrow_result(&self, &Checker ck, TypeId t) {
+        ulong size = self.size_of(&*ck, t); bool signed = self.is_signed(&*ck, t);
+        if (size == 1) { if (signed) { self.a.movsx8(RDX, RAX); } else { self.a.movzx8(RDX, RAX); } }
+        else if (size == 2) { if (signed) { self.a.movsx16(RDX, RAX); } else { self.a.movzx16(RDX, RAX); } }
+        else if (size == 4) { if (signed) { self.a.movsx32(RDX, RAX); } else { self.a.mov32(RDX, RAX); } }
+        else { return; }
+        self.a.alu_rr(ALU_CMP, RAX, RDX);
+        self.arithmetic_guard(&*ck, COND_NE, "integer overflow");
+    }
+
+    void gen_binary(&self, &Checker ck, &const Statement s) {
+        var r = &const s.rvalue;
+        var lt = self.operand_type(&*ck, &const r.a);
+        var dest_t = self.place_type(&*ck, &const s.place);
+        uint op = ir.binary_index(r.bop);
+        // Eq Ne Lt Gt Le Ge
+        bool is_cmp = op >= 5 && op <= 10;
+        if (self.is_float(&*ck, lt)) {
+            self.load_operand_xmm0(&*ck, &const r.b);
+            self.a.movq_rx(RAX, XMM0);
+            self.save_rax(&*ck, 0);
+            self.load_operand_xmm0(&*ck, &const r.a);
+            self.load_rax(&*ck, 0);
+            self.a.movq_xr(XMM1, RAX);
+            if (is_cmp) {
+                // Compare so that the "above" conditions give the right answer.
+                match r.bop {
+                    BinaryOp.Lt => { self.a.ucomisd(XMM1, XMM0); self.a.setcc(COND_A, RAX); }
+                    BinaryOp.Le => { self.a.ucomisd(XMM1, XMM0); self.a.setcc(COND_AE, RAX); }
+                    BinaryOp.Gt => { self.a.ucomisd(XMM0, XMM1); self.a.setcc(COND_A, RAX); }
+                    BinaryOp.Ge => { self.a.ucomisd(XMM0, XMM1); self.a.setcc(COND_AE, RAX); }
+                    BinaryOp.Eq => { self.a.ucomisd(XMM0, XMM1); self.a.setcc(COND_E, RAX); self.a.setcc(COND_NP, RCX); self.a.alu_rr(ALU_AND, RAX, RCX); }
+                    _ => { self.a.ucomisd(XMM0, XMM1); self.a.setcc(COND_NE, RAX); self.a.setcc(COND_P, RCX); self.a.alu_rr(ALU_OR, RAX, RCX); }
+                }
+                self.write_scalar(&*ck, &const s.place);
+                return;
+            }
+            match r.bop {
+                BinaryOp.Add => { self.a.addsd(XMM0, XMM1); }
+                BinaryOp.Sub => { self.a.subsd(XMM0, XMM1); }
+                BinaryOp.Mul => { self.a.mulsd(XMM0, XMM1); }
+                BinaryOp.Div => { self.a.divsd(XMM0, XMM1); }
+                _ => { self.error(&*ck, s.span, "unsupported float operator"); return; }
+            }
+            self.store_xmm0_to_place(&*ck, &const s.place, dest_t);
+            return;
+        }
+
+        bool signed = self.is_signed(&*ck, lt);
+        bool checked = self.target.checked_arithmetic && ck.r.types.get(lt).is_integer();
+        // Keep rhs in rcx while the scalar lhs is loaded into rax.
+        self.load_operand_rax(&*ck, &const r.b);
+        self.a.mov_rr(RCX, RAX);
+        self.load_operand_rax(&*ck, &const r.a);
+        match r.bop {
+            BinaryOp.Add => { self.a.alu_rr(ALU_ADD, RAX, RCX); if (checked) { self.arithmetic_guard(&*ck, if (signed) { COND_O } else { COND_B }, "integer overflow"); self.check_narrow_result(&*ck, lt); } }
+            BinaryOp.Sub => { self.a.alu_rr(ALU_SUB, RAX, RCX); if (checked) { self.arithmetic_guard(&*ck, if (signed) { COND_O } else { COND_B }, "integer overflow"); self.check_narrow_result(&*ck, lt); } }
+            BinaryOp.Mul => {
+                if (checked && !signed) { self.a.mul(RCX); self.a.test_rr(RDX, RDX); self.arithmetic_guard(&*ck, COND_NE, "integer overflow"); }
+                else { self.a.imul_rr(RAX, RCX); if (checked) { self.arithmetic_guard(&*ck, COND_O, "integer overflow"); } }
+                if (checked) { self.check_narrow_result(&*ck, lt); }
+            }
+            BinaryOp.Div => { self.gen_divide(&*ck, r, lt, signed, checked, false); }
+            BinaryOp.Rem => { self.gen_divide(&*ck, r, lt, signed, checked, true); }
+            BinaryOp.BitAnd => { self.a.alu_rr(ALU_AND, RAX, RCX); }
+            BinaryOp.BitOr => { self.a.alu_rr(ALU_OR, RAX, RCX); }
+            BinaryOp.BitXor => { self.a.alu_rr(ALU_XOR, RAX, RCX); }
+            BinaryOp.Shl => { self.gen_shift(&*ck, lt, signed, checked, true); }
+            BinaryOp.Shr => { self.gen_shift(&*ck, lt, signed, checked, false); }
+            BinaryOp.Eq => { self.a.alu_rr(ALU_CMP, RAX, RCX); self.a.setcc(COND_E, RAX); }
+            BinaryOp.Ne => { self.a.alu_rr(ALU_CMP, RAX, RCX); self.a.setcc(COND_NE, RAX); }
+            BinaryOp.Lt => { self.a.alu_rr(ALU_CMP, RAX, RCX); self.a.setcc(if (signed) { COND_L } else { COND_B }, RAX); }
+            BinaryOp.Le => { self.a.alu_rr(ALU_CMP, RAX, RCX); self.a.setcc(if (signed) { COND_LE } else { COND_BE }, RAX); }
+            BinaryOp.Gt => { self.a.alu_rr(ALU_CMP, RAX, RCX); self.a.setcc(if (signed) { COND_G } else { COND_A }, RAX); }
+            BinaryOp.Ge => { self.a.alu_rr(ALU_CMP, RAX, RCX); self.a.setcc(if (signed) { COND_GE } else { COND_AE }, RAX); }
+            BinaryOp.And => { self.a.alu_rr(ALU_AND, RAX, RCX); }
+            BinaryOp.Or => { self.a.alu_rr(ALU_OR, RAX, RCX); }
+        }
+        self.write_scalar(&*ck, &const s.place);
+    }
+    void gen_divide(&self, &Checker ck, &const Rvalue r, TypeId lt, bool signed, bool checked, bool rem) {
+        // Division by zero panics.
+        int nonzero = self.a.new_label();
+        self.a.test_rr(RCX, RCX);
+        self.a.jcc(COND_NE, nonzero);
+        self.emit_panic(&*ck, "division by zero");
+        self.a.bind(nonzero);
+        int done = self.a.new_label();
+        if (signed) {
+            // Avoid the hardware exception for MIN / -1. Release wraps the
+            // quotient and returns zero for the remainder at every width.
+            int normal = self.a.new_label();
+            ulong bits = self.size_of(&*ck, lt) * 8;
+            long minimum = -9223372036854775808;
+            if (bits != 64) { minimum = -((1 as long) << ((bits - 1) as long)); }
+            self.a.mov_ri(RDX, minimum); self.a.alu_rr(ALU_CMP, RAX, RDX); self.a.jcc(COND_NE, normal);
+            self.a.alu_ri(ALU_CMP, RCX, -1); self.a.jcc(COND_NE, normal);
+            if (checked) { self.emit_panic(&*ck, "integer overflow"); }
+            else { if (rem) { self.a.mov_ri(RAX, 0); } self.a.jmp(done); }
+            self.a.bind(normal);
+            self.a.cqo(); self.a.idiv(RCX);
+        } else { self.a.mov_ri(RDX, 0); self.a.div(RCX); }
+        if (rem) { self.a.mov_rr(RAX, RDX); }
+        self.a.bind(done);
+    }
+    void gen_shift(&self, &Checker ck, TypeId lt, bool signed, bool checked, bool left) {
+        int bits = (self.size_of(&*ck, lt) * 8) as int;
+        if (checked) { self.a.alu_ri(ALU_CMP, RCX, bits); self.arithmetic_guard(&*ck, COND_AE, "shift count out of bounds"); }
+        else { self.a.alu_ri(ALU_AND, RCX, bits - 1); }
+        if (left) { self.a.shl_cl(RAX); } else if (signed) { self.a.sar_cl(RAX); } else { self.a.shr_cl(RAX); }
+    }
+
+    void gen_unary(&self, &Checker ck, &const Statement s) {
+        var r = &const s.rvalue;
+        var t = self.operand_type(&*ck, &const r.a);
+        var dest_t = self.place_type(&*ck, &const s.place);
+        if (self.is_float(&*ck, t)) {
+            self.load_operand_xmm0(&*ck, &const r.a);
+            self.a.xorpd(XMM1, XMM1);
+            self.a.subsd(XMM1, XMM0);
+            self.a.movq_rx(RAX, XMM1);
+            self.save_rax(&*ck, 0);
+            self.addr(&*ck, &const s.place, RDI);
+            self.load_rax(&*ck, 0);
+            self.a.movq_xr(XMM0, RAX);
+            self.store_xmm0_to_rdi(&*ck, dest_t);
+            return;
+        }
+        self.load_operand_rax(&*ck, &const r.a);
+        match r.uop {
+            UnaryOp.Neg => {
+                self.a.neg(RAX);
+                if (self.target.checked_arithmetic && ck.r.types.get(t).is_integer()) { self.arithmetic_guard(&*ck, COND_O, "integer overflow"); self.check_narrow_result(&*ck, t); }
+            }
+            UnaryOp.Not => { if (ck.r.types.get(t).is_bool()) { self.a.alu_ri(ALU_XOR, RAX, 1); } else { self.a.not_(RAX); } }
+            UnaryOp.BitNot => { self.a.not_(RAX); }
+            UnaryOp.Deref => { self.error(&*ck, s.span, "deref as rvalue"); return; }
+        }
+        self.write_scalar(&*ck, &const s.place);
+    }
+
+    void gen_cast(&self, &Checker ck, &const Statement s) {
+        var r = &const s.rvalue;
+        var from = self.operand_type(&*ck, &const r.a);
+        var to = r.type;
+        bool from_f = self.is_float(&*ck, from); bool to_f = self.is_float(&*ck, to);
+        if (from_f && to_f) {
+            self.load_operand_xmm0(&*ck, &const r.a);
+            self.store_xmm0_to_place(&*ck, &const s.place, to);
+            return;
+        }
+        if (from_f) {
+            self.load_operand_xmm0(&*ck, &const r.a);
+            self.a.cvttsd2si(RAX, XMM0);
+            self.write_scalar(&*ck, &const s.place);
+            return;
+        }
+        if (to_f) {
+            // Sign or zero extended per source type.
+            self.load_operand_rax(&*ck, &const r.a);
+            self.a.cvtsi2sd(XMM0, RAX);
+            self.store_xmm0_to_place(&*ck, &const s.place, to);
+            return;
+        }
+        self.load_operand_rax(&*ck, &const r.a);
+        self.write_scalar(&*ck, &const s.place);
+    }
+
+    void gen_aggregate(&self, &Checker ck, &const Statement s) {
+        var r = &const s.rvalue;
+        var t = r.type;
+        Vec<ulong> offsets = Vec.new();
+        ulong base_off = 0;
+        match r.agg {
+            AggregateKind.Struct => { offsets = self.lay_of(&*ck, t).field_offsets; }
+            AggregateKind.Tuple => { offsets = self.lay_of(&*ck, t).field_offsets; }
+            AggregateKind.Array => {
+                var element = self.inner(&*ck, t); ulong esz = self.size_of(&*ck, element);
+                for (i in 0..r.elems.len()) { offsets.push(i as ulong * esz); }
+            }
+            AggregateKind.Variant => {
+                var pl = self.ax.lay.variant_payload(&*ck, t, r.variant);
+                base_off = self.lay_of(&*ck, t).payload_offset;
+                offsets = pl.field_offsets;
+                // Tag.
+                self.addr(&*ck, &const s.place, RDI);
+                self.a.mov_ri(RAX, r.variant as long);
+                self.a.store(RDI, 0, RAX, 8);
+            }
+        }
+        usize i = 0;
+        while (i < r.elems.len() && i < offsets.len()) {
+            var e = r.elems.get(i).unwrap();
+            var et = self.operand_type(&*ck, e); if (self.size_of(&*ck, et) != 0) {
+                self.addr(&*ck, &const s.place, RDI);
+                self.a.alu_ri(ALU_ADD, RDI, (base_off + *offsets.get(i).unwrap()) as int);
+                self.store_operand_to_rdi(&*ck, e);
+            }
+            i += 1;
+        }
+    }
+
+    // ----- drops -----
+
+    uint drop_impl_for(&const self, &Checker ck, TypeId t) {
+        return self.ax.drop_impl_of(t);
+    }
+    bool type_needs_drop(&const self, &Checker ck, TypeId t) { return self.ax.needs_drop(t); }
+
+    /// Calls one complete cleanup function. Its frame owns all child state.
+    void drop_at_slot(&self, &Checker ck, TypeId t, int slot) {
+        if (!self.type_needs_drop(&*ck, t)) { return; }
+        self.load_reg(&*ck, RAX, slot);
+        self.a.store(RSP, 0, RAX, 8);
+        var name = self.ax.drop_symbol(t);
+        self.a.call_sym(name.as_str());
+    }
+    /// Calls a Drop implementation with the internal convention.
+    void call_drop_impl(&self, &Checker ck, TypeId t, int slot) {
+        uint d = self.drop_impl_for(&*ck, t);
+        if (d == NONE) { return; }
+        self.load_reg(&*ck, RAX, slot);
+        self.a.store(RSP, 0, RAX, 8);
+        var name = self.fn_symbol(&*ck, d);
+        self.a.call_sym(name.as_str());
+    }
+    /// Drops field type ft at [slot] + offset through scratch slot + 1.
+    void drop_field(&self, &Checker ck, TypeId ft, int slot, ulong offset) {
+        self.load_reg(&*ck, RAX, slot);
+        self.a.alu_ri(ALU_ADD, RAX, offset as int);
+        self.save_rax(&*ck, slot + 1);
+        self.drop_at_slot(&*ck, ft, slot + 1);
+    }
+    /// Emits the body of one cleanup function. Child values call their own
+    /// functions rather than expanding another cleanup tree in this frame.
+    void drop_body_at_slot(&self, &Checker ck, TypeId t, int slot) {
+        match self.kind(&*ck, t) {
+            TypeKind.Fn => {
+                int done = self.a.new_label();
+                self.load_reg(&*ck, RAX, slot);
+                // Owned environment, null for a plain function.
+                self.a.load(RAX, RAX, 8, 8, false);
+                self.a.test_rr(RAX, RAX);
+                self.a.jcc(COND_E, done);
+                // Destructor's environment argument, then its code pointer.
+                self.a.store(RSP, 0, RAX, 8);
+                self.a.load(RAX, RAX, 0, 8, false);
+                self.a.call_reg(RAX);
+                self.a.bind(done);
+            }
+            TypeKind.Struct => {
+                self.call_drop_impl(&*ck, t, slot);
+                var def = ck.r.types.get(t).def;
+                if (same_def(def, ck.r.program.string_def)) {
+                    self.load_reg(&*ck, RAX, slot);
+                    self.c_call_ptr_arg(&*ck, "synx_rt_string_drop");
+                    return;
+                }
+                if (same_def(def, ck.r.program.vec_def)) {
+                    var elem = self.elem(&*ck, t, 0);
+                    if (self.type_needs_drop(&*ck, elem)) {
+                        // for i in 0..len: drop data[i]
+                        int head = self.a.new_label(); int done = self.a.new_label();
+                        self.load_reg(&*ck, RAX, slot);
+                        // len, kept as the remaining count
+                        self.a.load(RCX, RAX, 8, 8, false);
+                        self.save_reg(&*ck, RCX, slot + 1);
+                        // data, kept as the cursor
+                        self.a.load(RAX, RAX, 0, 8, false);
+                        self.save_rax(&*ck, slot + 2);
+                        self.a.bind(head);
+                        self.load_reg(&*ck, RCX, slot + 1);
+                        self.a.test_rr(RCX, RCX);
+                        self.a.jcc(COND_E, done);
+                        self.drop_at_slot(&*ck, elem, slot + 2);
+                        self.load_reg(&*ck, RAX, slot + 2);
+                        self.a.mov_ri(RCX, self.size_of(&*ck, elem) as long);
+                        self.a.alu_rr(ALU_ADD, RAX, RCX);
+                        self.save_rax(&*ck, slot + 2);
+                        self.load_reg(&*ck, RCX, slot + 1);
+                        self.a.alu_ri(ALU_SUB, RCX, 1);
+                        self.save_reg(&*ck, RCX, slot + 1);
+                        self.a.jmp(head);
+                        self.a.bind(done);
+                    }
+                    self.load_reg(&*ck, RAX, slot);
+                    self.c_call_ptr_arg(&*ck, "synx_rt_vec_drop");
+                    return;
+                }
+                var fields = struct_field_types(&*ck, t);
+                for (i in 0..fields.len()) {
+                    var ft = *fields.get(i).unwrap();
+                    if (!self.type_needs_drop(&*ck, ft)) { continue; }
+                    ulong offset = self.field_offset(&*ck, t, i as uint); self.drop_field(&*ck, ft, slot, offset);
+                }
+            }
+            TypeKind.Enum => {
+                self.call_drop_impl(&*ck, t, slot);
+                int done = self.a.new_label();
+                usize count = ck.r.program.def(ck.r.types.get(t).def).variants.len();
+                for (v in 0..count) {
+                    var fields = variant_field_types(&*ck, t, v as uint);
+                    bool any = false;
+                    for (ft in &const fields) { if (self.type_needs_drop(&*ck, *ft)) { any = true; } }
+                    if (!any) { continue; }
+                    int next = self.a.new_label();
+                    self.load_reg(&*ck, RAX, slot);
+                    self.a.load(RCX, RAX, 0, 8, false);
+                    self.a.mov_ri(RAX, v as long);
+                    self.a.alu_rr(ALU_CMP, RCX, RAX);
+                    self.a.jcc(COND_NE, next);
+                    var pl = self.ax.lay.variant_payload(&*ck, t, v as uint);
+                    ulong payload = self.lay_of(&*ck, t).payload_offset;
+                    for (i in 0..fields.len()) {
+                        var ft = *fields.get(i).unwrap();
+                        if (!self.type_needs_drop(&*ck, ft)) { continue; }
+                        self.drop_field(&*ck, ft, slot, payload + *pl.field_offsets.get(i).unwrap());
+                    }
+                    self.a.jmp(done);
+                    self.a.bind(next);
+                }
+                self.a.bind(done);
+            }
+            TypeKind.Tuple => {
+                usize count = ck.r.types.get(t).elems.len();
+                for (i in 0..count) {
+                    var et = self.elem(&*ck, t, i);
+                    if (!self.type_needs_drop(&*ck, et)) { continue; }
+                    ulong offset = self.field_offset(&*ck, t, i as uint); self.drop_field(&*ck, et, slot, offset);
+                }
+            }
+            TypeKind.Array => {
+                var inner = self.inner(&*ck, t);
+                ulong esz = self.size_of(&*ck, inner);
+                int head = self.a.new_label(); int done = self.a.new_label();
+                self.a.mov_ri(RAX, ck.r.types.get(t).length as long); self.save_rax(&*ck, slot + 1);
+                self.load_reg(&*ck, RAX, slot); self.save_rax(&*ck, slot + 2);
+                self.a.bind(head);
+                self.load_reg(&*ck, RCX, slot + 1); self.a.test_rr(RCX, RCX); self.a.jcc(COND_E, done);
+                self.drop_at_slot(&*ck, inner, slot + 2);
+                self.load_reg(&*ck, RAX, slot + 2); self.a.mov_ri(RCX, esz as long);
+                self.a.alu_rr(ALU_ADD, RAX, RCX); self.save_rax(&*ck, slot + 2);
+                self.load_reg(&*ck, RCX, slot + 1); self.a.alu_ri(ALU_SUB, RCX, 1); self.save_reg(&*ck, RCX, slot + 1);
+                self.a.jmp(head); self.a.bind(done);
+            }
+            _ => {}
+        }
+    }
+    void gen_drop(&self, &Checker ck, &const Statement s) {
+        var t = self.place_type(&*ck, &const s.place);
+        if (!self.type_needs_drop(&*ck, t)) { return; }
+        int skip = -1;
+        match s.kind {
+            StatementKind.DropIf => {
+                skip = self.a.new_label();
+                var flag = Operand.copy_of(Place.of(s.flag_local));
+                self.load_operand_rax(&*ck, &const flag);
+                self.a.test_rr(RAX, RAX);
+                self.a.jcc(COND_E, skip);
+            }
+            _ => {}
+        }
+        self.addr(&*ck, &const s.place, RAX);
+        self.save_rax(&*ck, 0);
+        self.drop_at_slot(&*ck, t, 0);
+        if (skip >= 0) { self.a.bind(skip); }
+    }
+
+    // ----- C ABI calls -----
+
+    byte c_arg_reg(&const self, usize i) {
+        if (self.target.win64_abi()) {
+            if (i == 0) { return RCX; } if (i == 1) { return RDX; } if (i == 2) { return R8; } return R9;
+        }
+        if (i == 0) { return RDI; } if (i == 1) { return RSI; } if (i == 2) { return RDX; } if (i == 3) { return RCX; } if (i == 4) { return R8; }
+        return R9;
+    }
+    /// Calls a runtime function taking one pointer argument held in rax.
+    void c_call_ptr_arg(&self, &Checker ck, &const str symbol) {
+        self.a.mov_rr(self.c_arg_reg(0), RAX);
+        self.a.call_sym(symbol);
+    }
+    void emit_panic(&self, &Checker ck, &const str message) {
+        Vec<byte> text = Vec.new(); bytes.text(&text, message);
+        ulong off = self.add_rodata(&*ck, &const text);
+        self.a.lea_rip(self.c_arg_reg(0), "synx_rodata", off as long);
+        self.a.mov_ri(self.c_arg_reg(1), message.len() as long);
+        self.a.call_sym("synx_rt_panic");
+        self.a.ud2();
+    }
+
+    /// Calls a runtime or extern C function. Arguments are scalars or fat
+    /// pointers; a struct result goes through an out pointer.
+    void gen_c_call(&self, &Checker ck, &const Terminator t, &const str symbol, bool returns_struct) {
+        // Evaluate each argument into scratch slots first (two per fat pointer).
+        Vec<Piece> pieces = Vec.new();
+        int slot = 0;
+        bool none = t.dest.is_none();
+        var dest_t = if (none) { ck.void_t() } else { self.place_type(&*ck, &const t.dest) };
+        bool out_ptr = returns_struct || (!none && self.size_of(&*ck, dest_t) > 8);
+        if (!out_ptr && !none) {
+            bool plain = false;
+            match self.kind(&*ck, dest_t) { TypeKind.Prim => { plain = true; }, TypeKind.Ptr => { plain = true; }, TypeKind.Ref => { plain = true; }, TypeKind.Fn => { plain = true; }, _ => {} }
+            out_ptr = !plain && self.size_of(&*ck, dest_t) > 0 && !self.is_float(&*ck, dest_t);
+        }
+        if (out_ptr) {
+            self.addr(&*ck, &const t.dest, RAX);
+            self.save_rax(&*ck, slot);
+            pieces.push(Piece { slot: slot, is_float: false }); slot += 1;
+        }
+        for (arg in &const t.args) {
+            var at = self.operand_type(&*ck, arg);
+            ulong size = self.size_of(&*ck, at);
+            bool fat = self.lay_of(&*ck, at).is_fat_pointer;
+            if (slot + (if (fat) { 2 } else { 1 }) > 14) { self.error(&*ck, t.span, "too many arguments for a C call"); return; }
+            if (fat) {
+                if (arg.is_const()) {
+                    self.load_const(&*ck, &const arg.constant);
+                    self.save_rax(&*ck, slot); pieces.push(Piece { slot: slot, is_float: false }); slot += 1;
+                    self.a.mov_rr(RAX, RDX);
+                    self.save_rax(&*ck, slot); pieces.push(Piece { slot: slot, is_float: false }); slot += 1;
+                } else {
+                    self.addr(&*ck, &const arg.place, RSI);
+                    self.a.load(RAX, RSI, 0, 8, false);
+                    self.save_rax(&*ck, slot); pieces.push(Piece { slot: slot, is_float: false }); slot += 1;
+                    self.a.load(RAX, RSI, 8, 8, false);
+                    self.save_rax(&*ck, slot); pieces.push(Piece { slot: slot, is_float: false }); slot += 1;
+                }
+                continue;
+            }
+            if (size > 8) {
+                var shown = ck.show(at);
+                self.error(&*ck, t.span, "cannot pass a value of type '{shown}' to a C function");
+                return;
+            }
+            if (self.is_float(&*ck, at)) {
+                self.load_operand_xmm0(&*ck, arg);
+                self.a.movq_rx(RAX, XMM0);
+                self.save_rax(&*ck, slot); pieces.push(Piece { slot: slot, is_float: true }); slot += 1;
+            } else {
+                self.load_operand_rax(&*ck, arg);
+                self.save_rax(&*ck, slot); pieces.push(Piece { slot: slot, is_float: false }); slot += 1;
+            }
+        }
+        bool win = self.target.win64_abi();
+        usize int_regs = 0; usize float_regs = 0;
+        usize max_int = if (win) { 4 } else { 6 };
+        for (i in 0..pieces.len()) {
+            var p = pieces.get(i).unwrap(); int sl = p.slot; bool is_f = p.is_float;
+            if (win) {
+                // Position based: argument i uses register i (int or xmm).
+                if (i >= 4) { self.error(&*ck, t.span, "more than four C arguments are not supported on Windows yet"); return; }
+                self.load_rax(&*ck, sl);
+                if (is_f) { self.a.movq_xr(i as byte, RAX); } else { self.a.mov_rr(self.c_arg_reg(i), RAX); }
+            } else {
+                self.load_rax(&*ck, sl);
+                if (is_f) {
+                    if (float_regs >= 8) { self.error(&*ck, t.span, "too many float arguments"); return; }
+                    self.a.movq_xr(float_regs as byte, RAX); float_regs += 1;
+                } else {
+                    if (int_regs >= max_int) { self.error(&*ck, t.span, "too many integer arguments"); return; }
+                    self.a.mov_rr(self.c_arg_reg(int_regs), RAX); int_regs += 1;
+                }
+            }
+        }
+        // al = number of vector registers (varargs rule)
+        if (!win) { self.a.mov_ri(RAX, float_regs as long); }
+        self.a.call_sym(symbol);
+        if (t.diverges) { self.a.ud2(); return; }
+        if (out_ptr || none || self.size_of(&*ck, dest_t) == 0) { return; }
+        if (self.is_float(&*ck, dest_t)) { self.store_xmm0_to_place(&*ck, &const t.dest, dest_t); return; }
+        self.write_scalar(&*ck, &const t.dest);
+    }
+
+    // ----- intrinsics generated inline -----
+
+    bool gen_intrinsic(&self, &Checker ck, &const Terminator t) {
+        var name = t.callee.builtin.as_str();
+        if (name == "drop_in_place") {
+            if (t.callee.type_args.len() != 1 || t.args.len() != 1) { self.error(&*ck, t.span, "invalid drop_in_place arguments"); return true; }
+            var ty = *t.callee.type_args.get(0).unwrap();
+            if (self.type_needs_drop(&*ck, ty)) {
+                self.load_operand_rax(&*ck, t.args.get(0).unwrap()); self.save_rax(&*ck, 0);
+                self.drop_at_slot(&*ck, ty, 0);
+            }
+            return true;
+        }
+        if (name == "size_of") {
+            if (t.callee.type_args.is_empty()) { self.error(&*ck, t.span, "size_of needs a type argument"); return true; }
+            self.a.mov_ri(RAX, self.size_of(&*ck, *t.callee.type_args.get(0).unwrap()) as long);
+            self.write_scalar(&*ck, &const t.dest);
+            return true;
+        }
+        if (name == "str_from_raw") {
+            self.load_operand_rax(&*ck, t.args.get(1).unwrap());
+            self.save_rax(&*ck, 1);
+            self.load_operand_rax(&*ck, t.args.get(0).unwrap());
+            self.save_rax(&*ck, 0);
+            self.addr(&*ck, &const t.dest, RDI);
+            self.load_rax(&*ck, 0);
+            self.a.store(RDI, 0, RAX, 8);
+            self.load_rax(&*ck, 1);
+            self.a.store(RDI, 8, RAX, 8);
+            return true;
+        }
+        if (name == "str_len" || name == "str_as_ptr") {
+            bool len = name == "str_len";
+            var s = t.args.get(0).unwrap();
+            if (s.is_const()) {
+                self.load_const(&*ck, &const s.constant);
+                if (len) { self.a.mov_rr(RAX, RDX); }
+            } else {
+                self.addr(&*ck, &const s.place, RSI);
+                self.a.load(RAX, RSI, if (len) { 8 } else { 0 }, 8, false);
+            }
+            self.write_scalar(&*ck, &const t.dest);
+            return true;
+        }
+        return false;
+    }
+
+    // ----- Synx calls -----
+
+    void gen_synx_call(&self, &Checker ck, &const Terminator t) {
+        bool none = t.dest.is_none();
+        var dest_t = if (none) { ck.void_t() } else { self.place_type(&*ck, &const t.dest) };
+        ulong ret_size = self.size_of(&*ck, dest_t);
+        bool hidden = ret_size > 16;
+        ulong off = 0;
+        if (hidden) {
+            self.addr(&*ck, &const t.dest, RAX);
+            self.a.store(RSP, 0, RAX, 8);
+            off = 8;
+        }
+        bool is_virtual = false;
+        match t.callee.kind { CalleeKind.Virtual => { is_virtual = true; }, _ => {} }
+        for (i in 0..t.args.len()) {
+            var arg = t.args.get(i).unwrap();
+            bool erased_receiver = is_virtual && i == 0;
+            var at = self.operand_type(&*ck, arg); ulong size = if (erased_receiver) { 8 as ulong } else { self.size_of(&*ck, at) };
+            if (size == 0) { continue; }
+            if (erased_receiver) {
+                // The concrete method takes a thin reference to its concrete Self.
+                self.load_operand_rax(&*ck, arg);
+                self.a.store(RSP, off as int, RAX, 8);
+            } else {
+                self.a.lea(RDI, RSP, off as int);
+                self.store_operand_to_rdi(&*ck, arg);
+            }
+            off += round8(size);
+        }
+        match t.callee.kind {
+            CalleeKind.Direct => { var name = self.fn_symbol(&*ck, t.callee.fn_index); self.a.call_sym(name.as_str()); }
+            CalleeKind.Virtual => {
+                self.addr(&*ck, &const t.args.get(0).unwrap().place, RAX);
+                self.a.load(RAX, RAX, 8, 8, false);
+                self.a.load(RAX, RAX, 24 + (t.callee.vtable_slot * 8) as int, 8, false);
+                self.a.call_reg(RAX);
+            }
+            CalleeKind.Indirect => {
+                // Reusable calls borrow the pair; a consuming call moves the pair.
+                var callee_t = self.operand_type(&*ck, &const t.callee.fn_operand); if (self.is_kind(&*ck, callee_t, TypeKind.Fn)) { self.addr(&*ck, &const t.callee.fn_operand.place, RAX); }
+                else { self.load_operand_rax(&*ck, &const t.callee.fn_operand); }
+                self.a.load(R10, RAX, 8, 8, false);
+                self.a.load(RAX, RAX, 0, 8, false);
+                self.a.call_reg(RAX);
+            }
+            _ => {}
+        }
+        if (t.diverges) { self.a.ud2(); return; }
+        if (hidden || ret_size == 0 || none) { return; }
+        if (ret_size <= 8) { self.write_scalar(&*ck, &const t.dest); return; }
+        self.save_rax(&*ck, 0);
+        self.save_reg(&*ck, RDX, 1);
+        self.addr(&*ck, &const t.dest, RDI);
+        self.load_rax(&*ck, 0);
+        self.a.store(RDI, 0, RAX, 8);
+        self.load_rax(&*ck, 1);
+        self.store_scalar(&*ck, ret_size - 8, RDI, 8);
+    }
+
+    int label(&const self, uint block) { return *self.block_labels.get(block as usize).unwrap(); }
+
+    void gen_terminator(&self, &Checker ck, &const Terminator t) {
+        match t.kind {
+            TerminatorKind.Goto => { self.a.jmp(self.label(t.target)); }
+            TerminatorKind.Switch => {
+                self.load_operand_rax(&*ck, &const t.discr);
+                for (c in &const t.cases) {
+                    self.a.mov_ri(RCX, c.value as long);
+                    self.a.alu_rr(ALU_CMP, RAX, RCX);
+                    self.a.jcc(COND_E, self.label(c.block));
+                }
+                self.a.jmp(self.label(t.otherwise));
+            }
+            TerminatorKind.Assert => {
+                self.load_operand_rax(&*ck, &const t.cond);
+                self.a.test_rr(RAX, RAX);
+                self.a.jcc(COND_NE, self.label(t.target));
+                self.emit_panic(&*ck, t.message.as_str());
+            }
+            TerminatorKind.Return => { self.a.jmp(self.epilogue_label); }
+            TerminatorKind.Unreachable => { self.emit_panic(&*ck, "entered unreachable code"); }
+            TerminatorKind.Call => {
+                bool builtin = false;
+                match t.callee.kind { CalleeKind.Builtin => { builtin = true; }, _ => {} }
+                if (builtin && self.gen_intrinsic(&*ck, t)) { self.a.jmp(self.label(t.target)); return; }
+                if (builtin) {
+                    var name = t.callee.builtin.as_str();
+                    if (is_runtime(name)) { var symbol = "synx_rt_{name}"; self.gen_c_call(&*ck, t, symbol.as_str(), runtime_returns_struct(name)); }
+                    else { self.gen_c_call(&*ck, t, name, false); }
+                } else { self.gen_synx_call(&*ck, t); }
+                if (!t.diverges) { self.a.jmp(self.label(t.target)); }
+            }
+        }
+    }
+
+    // ----- frame and body -----
+
+    void compute_frame(&self, &Checker ck) {
+        bool closure = self.f.closure != check_data.NO_KEY;
+        if (self.target.register_allocation) { self.allocation = allocate_registers(&*ck, self.f, &self.ax.lay); }
+        else {
+            self.allocation = RegisterAllocation { registers: Vec.new(), saved: Vec.new() };
+            for (i in 0..self.f.locals.len()) { self.allocation.registers.push(-1); }
+        }
+        usize n = self.f.locals.len();
+        self.slot_off = Vec.new(); for (i in 0..n) { self.slot_off.push(NO_SLOT); }
+        var ret_t = self.local_type(0);
+        self.big_ret = self.size_of(&*ck, ret_t) > 16;
+        // Arguments: positive offsets.
+        int arg_off = 16 + if (self.big_ret) { 8 } else { 0 };
+        uint argc = self.f.arg_count;
+        for (i in 1..argc + 1) {
+            // The environment arrives in R10.
+            if (closure && i == 1) { continue; }
+            var at = self.slot_off.get_mut(i as usize).unwrap(); *at = arg_off;
+            arg_off += round8(self.size_of(&*ck, self.local_type(i))) as int;
+        }
+        // Everything else: negative offsets.
+        int off = 0;
+        for (i in 0..n) {
+            uint local = i as uint;
+            if (local >= 1 && local <= argc && !(closure && local == 1)) { continue; }
+            if (local == 0 && self.big_ret) { continue; }
+            if (self.reg(local) >= 0) { continue; }
+            ulong size = round8(self.size_of(&*ck, self.local_type(local)));
+            if (size == 0) { size = 8; }
+            off += size as int;
+            *self.slot_off.get_mut(i).unwrap() = -off;
+        }
+        for (i in 0..self.allocation.saved.len()) { off += 8; self.saved_off.push(-off); }
+        off += 8 * self.scratch_slots as int;
+        self.scratch_off = -off;
+        // Outgoing area; drop glue can call a Synx destructor.
+        self.max_out = if (self.target.win64_abi()) { 32 } else { 8 };
+        for (bi in 0..self.f.blocks.len()) {
+            // A copy: the queries below borrow the generator.
+            var term = self.f.blocks.get(bi).unwrap().term.copy();
+            match term.kind { TerminatorKind.Call => {}, _ => { continue; } }
+            uint size = 0;
+            var dest_t = if (term.dest.is_none()) { ck.void_t() } else { self.place_type(&*ck, &const term.dest) };
+            if (self.size_of(&*ck, dest_t) > 16) { size += 8; }
+            for (arg in &const term.args) { var at = self.operand_type(&*ck, arg); size += round8(self.size_of(&*ck, at)) as uint; }
+            if (size > self.max_out) { self.max_out = size; }
+        }
+        self.frame_size = align_up(off as ulong + self.max_out as ulong, 16) as uint;
+    }
+
+    bool generate(&self, &Checker ck, TypeId drop_body) {
+        self.compute_frame(&*ck);
+        if (!self.ok) { return false; }
+        for (i in 0..self.f.blocks.len()) { int l = self.a.new_label(); self.block_labels.push(l); }
+        self.epilogue_label = self.a.new_label();
+
+        self.a.push(RBP);
+        self.a.mov_rr(RBP, RSP);
+        self.a.alu_ri(ALU_SUB, RSP, self.frame_size as int);
+        // Windows commits stack pages through one guard page. Touch each page of
+        // a large frame from the top down before any access can skip the guard.
+        // RAX holds no argument at entry on either ABI.
+        if (self.target.win64_abi()) {
+            uint probe = 4096;
+            while (probe <= self.frame_size) { self.a.load(RAX, RBP, -(probe as int), 8, false); probe += 4096; }
+        }
+        for (i in 0..self.allocation.saved.len()) {
+            self.a.store(RBP, *self.saved_off.get(i).unwrap(), *self.allocation.saved.get(i).unwrap() as byte, 8);
+        }
+        // Spill before adding any prologue calls (including Windows stack probes).
+        if (self.f.closure != check_data.NO_KEY) { self.a.store(RBP, self.slot(1), R10, 8); }
+        uint argc = self.f.arg_count;
+        for (i in 1..argc + 1) {
+            if (self.reg(i) < 0) { continue; }
+            self.load_scalar(&*ck, self.local_type(i), RBP, self.slot(i));
+            self.write_scalar(&*ck, &const Place.of(i));
+        }
+
+        if (drop_body.index != NONE) {
+            self.a.load(RAX, RBP, 16, 8, false);
+            self.save_rax(&*ck, 0);
+            self.drop_body_at_slot(&*ck, drop_body, 0);
+        }
+
+        for (bi in 0..self.f.blocks.len()) {
+            self.a.bind(self.label(bi as uint));
+            // Copies: generation borrows the generator while it reads them.
+            usize count = self.f.blocks.get(bi).unwrap().stmts.len();
+            for (si in 0..count) {
+                var s = self.f.blocks.get(bi).unwrap().stmts.get(si).unwrap().copy();
+                match s.kind {
+                    StatementKind.Assign => { self.gen_assign(&*ck, &const s); }
+                    StatementKind.Drop => { self.gen_drop(&*ck, &const s); }
+                    StatementKind.DropIf => { self.gen_drop(&*ck, &const s); }
+                    _ => {}
+                }
+                if (!self.ok) { return false; }
+            }
+            var term = self.f.blocks.get(bi).unwrap().term.copy();
+            self.gen_terminator(&*ck, &const term);
+            if (!self.ok) { return false; }
+        }
+
+        self.a.bind(self.epilogue_label);
+        var ret_t = self.local_type(0);
+        ulong ret_size = self.size_of(&*ck, ret_t);
+        if (!self.big_ret && ret_size > 0) {
+            self.a.lea(RSI, RBP, self.slot(0));
+            if (ret_size <= 8) { self.load_scalar(&*ck, ret_t, RSI, 0); }
+            else { self.a.load(RAX, RSI, 0, 8, false); self.a.load(RDX, RSI, 8, 8, false); }
+        }
+        for (i in 0..self.allocation.saved.len()) {
+            self.a.load(*self.allocation.saved.get(i).unwrap() as byte, RBP, *self.saved_off.get(i).unwrap(), 8, false);
+        }
+        self.a.mov_rr(RSP, RBP);
+        self.a.pop(RBP);
+        self.a.ret();
+        self.a.finish();
+        return self.ok;
+    }
+}
+
+uint types_kind_index(TypeKind k) {
+    match k {
+        TypeKind.Prim => return 0, TypeKind.Str => return 1, TypeKind.Dyn => return 2, TypeKind.Struct => return 3, TypeKind.Enum => return 4,
+        TypeKind.Ref => return 5, TypeKind.Ptr => return 6, TypeKind.Array => return 7, TypeKind.Slice => return 8, TypeKind.Tuple => return 9,
+        TypeKind.Fn => return 10, TypeKind.Param => return 11, TypeKind.Infer => return 12, TypeKind.Never => return 13, TypeKind.Error => return 14,
+    }
+}
+
+/// Generates the object for one target and serializes it. ok is false after
+/// an SNX0601 error; the bytes are then empty.
+pub Vec<byte> object_bytes(&Checker ck, &const Vec<ast.Ast> trees, &Module m, Target target, &bool ok) {
+    var ax = Axon.new(target);
+    *ok = ax.generate(&*ck, trees, &*m);
+    if (!*ok) { return Vec.new(); }
+    return write_object(&const ax.obj, target.format());
+}

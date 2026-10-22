@@ -1,0 +1,64 @@
+import std.task.pool.{Executor,Join};
+import std.sync.{Arc,AtomicUsize,AtomicBool,Mutex};
+import std.thread;
+import std.mem;
+T ok<T,E>(Result<T,E> value) { match value { Ok(result) => return result, Err(_) => panic("pool error") } }
+void require(bool value) { if (!value) { panic("cancel assertion failed"); } }
+struct Token { Arc<AtomicUsize> drops; String value; }
+impl Drop for Token { void drop(&self) { self.drops.get().fetch_add(1); } }
+struct Gate { AtomicBool entered; AtomicBool release; Mutex<Waker?> wake; }
+struct Hold { Arc<Gate> gate; bool block; }
+impl Future<void> for Hold {
+    Poll<void> poll(&self,Waker wake) {
+        Waker? previous = None;
+        { var guard = self.gate.get().wake.lock(); previous = guard.get_mut().replace(wake); }
+        self.gate.get().entered.store(true);
+        if (self.block) { while (!self.gate.get().release.load()) { thread.sleep_ms(1); } }
+        return Poll.Pending;
+    }
+}
+Arc<Gate> gate() { return Arc.new(Gate { entered: AtomicBool.new(false), release: AtomicBool.new(false), wake: Mutex.new(None) }); }
+async send void held(Token token, Arc<Gate> gate, bool block) { await Hold { gate: gate, block: block }; print(token.value); }
+void entered(&const Arc<Gate> gate) { while (!gate.get().entered.load()) { thread.sleep_ms(1); } }
+void late(&const Arc<Gate> gate) {
+    Waker? wake = None;
+    { var guard = gate.get().wake.lock(); match guard.get().as_ref() { Some(value) => { wake = Some(value.clone()); }, None => {} } }
+    match wake { Some(value) => value.wake(), None => {} }
+}
+main() {
+    var executor = ok(Executor.new(1));
+    var drops = Arc.new(AtomicUsize.new(0));
+    var first = gate();
+    var running = ok(executor.spawn(held(Token { drops: drops.clone(), value: String.from("running") },first.clone(),true)));
+    entered(first);
+    var queued = ok(executor.spawn(held(Token { drops: drops.clone(), value: String.from("queued") },gate(),false)));
+    queued.cancel();
+    running.cancel();
+    first.get().release.store(true);
+    require(queued.join().is_err());
+    require(running.join().is_err());
+    require(drops.get().load() == 2);
+    print("queued and polling cancelled");
+    var idle = gate();
+    var waiting = ok(executor.spawn(held(Token { drops: drops.clone(), value: String.from("idle") },idle.clone(),false)));
+    entered(idle);
+    waiting.cancel();
+    require(waiting.join().is_err());
+    require(drops.get().load() == 3);
+    late(idle);
+    var discarded = gate();
+    var handle = ok(executor.spawn(held(Token { drops: drops.clone(), value: String.from("drop") },discarded.clone(),false)));
+    entered(discarded);
+    mem.drop(handle);
+    executor.wait();
+    require(drops.get().load() == 4);
+    print("idle and dropped cancelled");
+    var shutdown = gate();
+    var final = ok(executor.spawn(held(Token { drops: drops.clone(), value: String.from("shutdown") },shutdown.clone(),false)));
+    entered(shutdown);
+    executor.shutdown();
+    require(final.join().is_err());
+    require(drops.get().load() == 5);
+    late(first); late(idle); late(discarded); late(shutdown);
+    print("shutdown and late wakes complete");
+}

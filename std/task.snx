@@ -1,0 +1,97 @@
+pub import std.prelude.{Task, SendTask, Future, Poll, Waker};
+import std.mem;
+extern "C" { void synx_rt_blocking_check(*byte pool); }
+
+/// Run one task on this thread. Futures must wake when they can progress.
+pub T block_on<T>(Task<T> task) {
+    unsafe { synx_rt_blocking_check(0 as *byte); }
+    var wake = Waker.new();
+    loop {
+        if (!wake.take_ready()) {
+            if (!wake.is_retained()) {
+                // The final external handle can signal after take_ready, then
+                // drop before the reference-count load. Consume that signal
+                // and poll now; restarting the loop would lose it.
+                if (!wake.take_ready()) { panic("local executor has no ready task"); }
+            } else { wake.wait(); continue; }
+        }
+        match task.poll(wake.clone()) {
+            Poll.Ready(value) => return value,
+            Poll.Pending => {},
+        }
+    }
+    panic("local executor stopped without a result");
+}
+
+pub T block_on_send<T: Send + Owned>(SendTask<T> task) {
+    unsafe { synx_rt_blocking_check(0 as *byte); }
+    var wake = Waker.new();
+    loop {
+        if (!wake.take_ready()) {
+            if (!wake.is_retained()) {
+                if (!wake.take_ready()) { panic("local executor has no ready task"); }
+            } else { wake.wait(); continue; }
+        }
+        match task.poll(wake.clone()) {
+            Poll.Ready(value) => return value, Poll.Pending => {}
+        }
+    }
+    panic("local executor stopped without a result");
+}
+struct LocalSignal { Waker root; }
+impl Wake for LocalSignal { void wake(&const self) { self.root.wake(); } }
+
+pub struct YieldNow { bool yielded; }
+impl Future<void> for YieldNow {
+    Poll<void> poll(&self, Waker wake) {
+        if (self.yielded) { return Poll.Ready(()); }
+        self.yielded = true;
+        wake.wake();
+        return Poll.Pending;
+    }
+}
+pub YieldNow yield_now() { return YieldNow { yielded: false }; }
+
+/// Cooperatively poll ready tasks, in spawn order on each pass.
+pub struct LocalExecutor {
+    Vec<Task<void>?> tasks;
+    Vec<Waker> wakes;
+    Waker signal;
+    pub LocalExecutor new() { return LocalExecutor { tasks: Vec.new(), wakes: Vec.new(), signal: Waker.new() }; }
+    pub void spawn(&self, Task<void> task) { self.tasks.push(Some(task)); self.wakes.push(Waker.from(LocalSignal { root: self.signal.clone() })); }
+    pub void run(&self) {
+        unsafe { synx_rt_blocking_check(0 as *byte); }
+        loop {
+            bool pending = false;
+            bool progress = false;
+            for (i in 0..self.tasks.len()) {
+                if (self.tasks[i].is_some()) {
+                    pending = true;
+                    if (self.wakes[i].take_ready()) {
+                        progress = true;
+                        bool done = false;
+                        {
+                            var wake = self.wakes[i].clone();
+                            match self.tasks[i].as_mut() {
+                                Some(task) => match task.poll(wake) {
+                                    Poll.Ready(_) => { done = true; },
+                                    Poll.Pending => {},
+                                },
+                                None => {},
+                            }
+                        }
+                        if (done) { mem.drop(self.tasks[i].take()); }
+                    }
+                }
+            }
+            if (!pending) { self.tasks.clear(); self.wakes.clear(); return; }
+            if (!progress && !self.signal.take_ready()) {
+                bool retained = false;
+                for (i in 0..self.tasks.len()) { if (self.tasks[i].is_some() && self.wakes[i].is_retained()) { retained = true; } }
+                if (!retained) {
+                    if (!self.signal.take_ready()) { panic("local executor has no ready task"); }
+                } else { self.signal.wait(); }
+            }
+        }
+    }
+}

@@ -1,0 +1,13 @@
+strings true true true false
+alpha::beta::
+part [alpha]
+part [beta]
+part []
+caf?
+empty []
+empty parts 1
+drop 2
+drop 1
+cleared 0
+args true
+length 7.0

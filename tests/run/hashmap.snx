@@ -1,0 +1,207 @@
+import std.collections.HashMap;
+import std.hash.{Hash, hash_str, combine};
+
+void expect(bool condition, &const str message) { if (!condition) { panic(message); } }
+int value(&const HashMap<int, int> map, int key) {
+    match map.get(key) { Some(found) => return *found, None => panic("missing integer key") }
+}
+
+struct Collision { int id; }
+impl Hash for Collision { ulong hash(&const self) { return 7; } }
+impl Eq for Collision { bool eq(&const self, &const Self other) { return self.id == other.id; } }
+
+struct PairKey { int left; int right; }
+trait Choice { int kind(&const self); }
+impl<T> Choice for &const T { int kind(&const self) { return 1; } }
+impl Choice for &const str { int kind(&const self) { return 2; } }
+int choice<T: Choice>(&const T key) { return key.kind(); }
+impl Hash for PairKey { ulong hash(&const self) { return combine(self.left.hash(), self.right.hash()); } }
+impl Eq for PairKey {
+    bool eq(&const self, &const Self other) { return self.left == other.left && self.right == other.right; }
+}
+
+struct OwnedKey { int id; int serial; }
+impl Hash for OwnedKey { ulong hash(&const self) { return 1; } }
+impl Eq for OwnedKey { bool eq(&const self, &const Self other) { return self.id == other.id; } }
+impl Drop for OwnedKey { void drop(&self) { print("key {self.serial}"); } }
+struct OwnedValue { int id; }
+impl Drop for OwnedValue { void drop(&self) { print("value {self.id}"); } }
+struct Holder { HashMap<int, OwnedValue> map; }
+struct Empty {}
+impl Drop for Empty { void drop(&self) { print("empty value"); } }
+
+void stress() {
+    var map = HashMap<int, int>.new();
+    expect(map.is_empty() && map.capacity() == 0, "new table");
+    expect(map.get(1).is_none() && map.get_mut(1).is_none(), "empty lookup");
+    expect(!map.contains_key(1) && map.remove(1).is_none(), "empty remove");
+    map.clear();
+    for (i in 0..2048) { expect(map.insert(i, i * 3).is_none(), "new insertion"); }
+    expect(map.len() == 2048, "growth length");
+    int total = 0;
+    for (i in 0..2048) { total += value(map, i); }
+    expect(total == 6288384, "growth contents");
+    for (i in 0..2048) {
+        if (i % 2 == 0) { expect((map.remove(i) ?? -1) == i * 3, "remove value"); }
+    }
+    for (i in 0..2048) {
+        if (i % 2 == 0) { expect(!map.contains_key(i), "removed key"); }
+        else { expect(value(map, i) == i * 3, "neighbor after removal"); }
+    }
+    for (i in 0..2048) { if (i % 2 == 0) { map.insert(i, i * 4); } }
+    expect((map.insert(7, 99) ?? -1) == 21, "replacement");
+    match map.get_mut(7) { Some(found) => { *found = 100; } None => panic("missing writable value") }
+    expect(value(map, 7) == 100, "get_mut");
+    usize capacity = map.capacity();
+    map.clear(); expect(map.is_empty() && map.capacity() == capacity, "clear retains allocation");
+    map.insert(-1, -2); expect(value(map, -1) == -2, "reuse after clear");
+    for (stride in [4096, 65536]) {
+        var buckets = Vec<int>.new(); for (i in 0..16) { buckets.push(0); }
+        var strided = HashMap<int, int>.new();
+        for (i in 0..1024) {
+            int key = i * stride;
+            usize bucket = (key.hash() as usize) & 15;
+            match buckets.get_mut(bucket) { Some(count) => { *count += 1; } None => panic("bucket") }
+            strided.insert(key, i);
+        }
+        for (count in &const buckets) { expect(*count < 128, "hash low-bit distribution"); }
+        for (i in 0..1024) { expect(value(strided, i * stride) == i, "strided lookup"); }
+    }
+    print("stress ok");
+}
+
+void collisions() {
+    var map = HashMap<Collision, int>.new();
+    for (i in 0..100) { map.insert(Collision { id: i }, i); }
+    for (i in 0..100) {
+        var key = Collision { id: i };
+        match map.get(key) { Some(found) => expect(*found == i, "collision lookup"), None => panic("collision missing") }
+    }
+    for (i in 0..50) { map.remove(Collision { id: i }); }
+    for (i in 50..100) { expect(map.contains_key(Collision { id: i }), "probe past tombstone"); }
+    expect((map.insert(Collision { id: 99 }, 200) ?? -1) == 99, "duplicate beyond tombstone");
+    expect(map.len() == 50, "duplicate keeps length");
+    for (i in 100..200) { map.insert(Collision { id: i }, i); }
+    expect(map.len() == 150, "tombstone reuse");
+
+    // Force a tombstone rebuild at unchanged capacity, and wrap the probe.
+    var churn = HashMap<Collision, int>.new();
+    for (round in 0..20) {
+        for (i in 0..6) { churn.insert(Collision { id: i }, i); }
+        expect(churn.capacity() == 8, "churn capacity");
+        for (i in 0..6) { churn.remove(Collision { id: i }); }
+        expect(churn.is_empty(), "churn removes all");
+    }
+    print("collisions ok");
+}
+
+void key_types() {
+    expect(combine(1, 2) != combine(2, 1), "field order affects combination");
+    var borrowed_text = "text"; expect(choice(&const borrowed_text) == 2, "unsized impl selection");
+    ulong empty_hash = 14695981039346656037 as ulong;
+    ulong hello_hash = 11831194018420276491 as ulong;
+    expect(hash_str("") == (empty_hash ^ (empty_hash >> 32)), "empty text hash");
+    expect(hash_str("hello") == (hello_hash ^ (hello_hash >> 32)), "text hash vector");
+    var text = String.from("hello"); expect(text.hash() == hash_str("hello"), "owned text hash");
+    expect("hello".hash() == text.hash(), "borrowed text hash");
+    var strings = HashMap<String, String>.new();
+    strings.insert(String.from("alpha"), String.from("one"));
+    strings.insert(String.from("alpha"), String.from("two"));
+    var alpha = String.from("alpha");
+    match strings.get_mut(alpha) { Some(found) => { found.push_str("!"); } None => panic("String lookup") }
+    match strings.get(alpha) { Some(found) => expect(found.as_str() == "two!", "String mutation"), None => panic("String result") }
+    for (i in 0..100) { strings.insert("key {i}", "value {i}"); }
+    for (i in 0..100) {
+        String key = "key {i}"; String expected = "value {i}";
+        match strings.get(key) { Some(found) => expect(found.as_str() == expected.as_str(), "owned growth"), None => panic("owned missing") }
+    }
+    var borrowed = HashMap<&const str, int>.new(); borrowed.insert("hello", 12);
+    var lookup = "hello"; match borrowed.get(&const lookup) { Some(found) => expect(*found == 12, "str key"), None => panic("str missing") }
+    var flags = HashMap<bool, int>.new(); flags.insert(true, 1); flags.insert(false, 2); expect(flags.len() == 2, "bool keys");
+    var chars = HashMap<char, int>.new(); chars.insert('A', 1); expect(chars.contains_key('A'), "char key");
+    var bytes = HashMap<byte, int>.new(); bytes.insert(255 as byte, 1); expect(bytes.contains_key(255 as byte), "byte key");
+    var shorts = HashMap<short, int>.new(); shorts.insert(-1 as short, 1); expect(shorts.contains_key(-1 as short), "short key");
+    var longs = HashMap<long, int>.new(); longs.insert(-9000000000L, 1); expect(longs.contains_key(-9000000000L), "long key");
+    var uints = HashMap<uint, int>.new(); uints.insert(4294967295 as uint, 1); expect(uints.contains_key(4294967295 as uint), "uint key");
+    var ulongs = HashMap<ulong, int>.new(); ulongs.insert(18446744073709551615 as ulong, 1); expect(ulongs.contains_key(18446744073709551615 as ulong), "ulong key");
+    var sizes = HashMap<usize, int>.new(); sizes.insert(99, 1); expect(sizes.contains_key(99), "usize key");
+    var pairs = HashMap<PairKey, int>.new(); pairs.insert(PairKey { left: 1, right: 2 }, 3);
+    expect(pairs.contains_key(PairKey { left: 1, right: 2 }), "composite key");
+    var pair_key = PairKey { left: 4, right: 5 };
+    var pair_ref = &const pair_key;
+    var borrowed_pairs = HashMap<&const PairKey, int>.new(); borrowed_pairs.insert(pair_ref, 9);
+    expect(borrowed_pairs.contains_key(&const pair_ref), "borrowed custom key");
+    int number = 7; var r = &const number; var rr = &const r;
+    var deep_refs = HashMap<&const (&const int), int>.new(); deep_refs.insert(rr, 8);
+    expect(deep_refs.contains_key(&const rr), "nested reference key");
+    var text_ref = &const text;
+    var string_refs = HashMap<&const String, int>.new(); string_refs.insert(text_ref, 9);
+    expect(string_refs.contains_key(&const text_ref), "String reference key");
+    print("key types ok");
+}
+
+void ownership() {
+    print("owned begin");
+    {
+        var map = HashMap<OwnedKey, OwnedValue>.new();
+        map.insert(OwnedKey { id: 1, serial: 10 }, OwnedValue { id: 100 });
+        { var previous = map.insert(OwnedKey { id: 1, serial: 11 }, OwnedValue { id: 101 }); }
+        {
+            var key = OwnedKey { id: 1, serial: 12 };
+            var removed = map.remove(key);
+        }
+        map.insert(OwnedKey { id: 2, serial: 20 }, OwnedValue { id: 200 });
+        map.clear(); map.clear();
+        map.insert(OwnedKey { id: 3, serial: 30 }, OwnedValue { id: 300 });
+    }
+    print("owned end");
+    {
+        print("key growth begin");
+        var map = HashMap<OwnedKey, OwnedValue>.new();
+        for (i in 0..10) { map.insert(OwnedKey { id: i, serial: 600 + i }, OwnedValue { id: 700 + i }); }
+        print("key growth clear");
+        map.clear();
+        print("key growth end");
+    }
+    {
+        var map = HashMap<int, OwnedValue>.new();
+        for (i in 0..10) { map.insert(i, OwnedValue { id: i }); }
+        // Remove in a fixed order so drop output also verifies rehash moves.
+        for (i in 0..10) { var removed = map.remove(i); }
+    }
+    {
+        var maps = Vec<HashMap<int, OwnedValue>>.new();
+        var map = HashMap<int, OwnedValue>.new(); map.insert(1, OwnedValue { id: 400 }); maps.push(map);
+    }
+    { var holder = Holder { map: HashMap.new() }; holder.map.insert(1, OwnedValue { id: 500 }); }
+    { var map = HashMap<int, Empty>.new(); map.insert(1, Empty {}); map.insert(2, Empty {}); var removed = map.remove(1); }
+    {
+        var outer = HashMap<String, HashMap<int, String>>.new();
+        var inner = HashMap<int, String>.new();
+        outer.insert(String.from("inner"), inner);
+        var key = String.from("inner");
+        match outer.get_mut(key) {
+            Some(map) => { for (i in 0..64) { map.insert(i, "nested {i}"); } }
+            None => panic("missing inner map"),
+        }
+        match outer.remove(key) {
+            Some(map) => expect(map.len() == 64 && map.contains_key(63), "removed map remains owned"),
+            None => panic("missing removed map"),
+        }
+        var vectors = HashMap<int, Vec<String>>.new(); vectors.insert(1, Vec.new());
+        match vectors.get_mut(1) { Some(items) => { items.push(String.from("owned")); } None => panic("missing Vec") }
+        match vectors.get(1) { Some(items) => expect(items.len() == 1, "nested Vec remains owned"), None => panic("missing Vec result") }
+    }
+    {
+        var captured = OwnedValue { id: 800 };
+        var callback = |int x| captured.id + x;
+        var callbacks = HashMap<int, fn(int) -> int>.new(); callbacks.insert(1, callback);
+        match callbacks.get_mut(1) {
+            Some(call) => expect((*call)(2) == 802, "stored closure"),
+            None => panic("missing closure"),
+        }
+    }
+    print("ownership ok");
+}
+
+main() { stress(); collisions(); key_types(); ownership(); }

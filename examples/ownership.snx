@@ -1,0 +1,57 @@
+// Ownership, borrowing, Option, Result, and the ? operator.
+
+struct Inventory {
+    Vec<String> items;
+
+    Inventory new() {
+        return Inventory { items: Vec.new() };
+    }
+
+    void add(&self, String name) {       // takes ownership of name
+        self.items.push(name);
+    }
+
+    &const str? first(&const self) {     // Option of a borrowed str
+        if (self.items.len() == 0) { return None; }
+        return Some(self.items[0].as_str());
+    }
+}
+
+enum ParseError {
+    Empty,
+    NotANumber(String),
+}
+
+Result<int, ParseError> parse_count(&const str text) {
+    if (text.len() == 0) { return Err(ParseError.Empty); }
+    match text.parse_int() {
+        Some(n) => return Ok(n),
+        None => return Err(ParseError.NotANumber(String.from(text))),
+    }
+}
+
+Result<void, ParseError> run() {
+    var inv = Inventory.new();
+    String apple = String.from("apple");
+    inv.add(apple);                      // apple is moved here
+    // print(apple);                     // error: use after move
+
+    int count = parse_count("3")?;       // error returns early from run
+    const name = inv.first() ?? "nothing";
+    print("{count} of {name}");
+
+    var r = &inv;                        // exclusive borrow
+    r.add(String.from("pear"));
+    // inv.first();                      // error: inv is borrowed by r
+    print("{r.items.len()} items");      // last use of r, borrow ends
+    print("{inv.items.len()} items");    // ok again
+    return Ok(());
+}
+
+int main() {
+    match run() {
+        Ok(_) => return 0,
+        Err(ParseError.Empty) => { print("empty input"); return 1; }
+        Err(ParseError.NotANumber(s)) => { print("bad number {s}"); return 1; }
+    }
+}

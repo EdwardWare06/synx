@@ -1,0 +1,11 @@
+exit 0
+not flag
+false
+not switch
+off
+not flag
+true
+not owned
+false
+drop owned false
+false -2

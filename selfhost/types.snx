@@ -1,0 +1,230 @@
+/// Interned semantic types and substitution. Source: compiler/src/types.cpp.
+/// Parity: tests/selfhost_types_test.cpp.
+/// TypeId identity defines equality. Inference variables always get fresh IDs.
+/// Nominal names are copied at declaration; the definition ID defines identity.
+import ids.{TypeId, DefId, DefKind, NONE};
+import ast.{PrimKind, CallMode};
+import std.collections.HashMap;
+
+pub enum TypeKind { Prim, Str, Dyn, Struct, Enum, Ref, Ptr, Array, Slice, Tuple, Fn, Param, Infer, Never, Error }
+pub enum InferKind { Any, Int, Float }
+pub struct Type {
+    pub TypeKind kind;
+    pub PrimKind prim;
+    pub bool is_const;
+    pub TypeId inner;
+    pub ulong length;
+    pub Vec<TypeId> elems;
+    pub TypeId ret;
+    pub CallMode call_mode;
+    pub bool is_send;
+    pub DefId def;
+    pub String name;
+    pub DefId owner;
+    pub uint index;
+    pub InferKind infer_kind;
+    pub Type new(TypeKind kind) {
+        return Type { kind: kind, prim: PrimKind.Void, is_const: false, inner: TypeId.none(), length: 0,
+            elems: Vec.new(), ret: TypeId.none(), call_mode: CallMode.Writable, is_send: false,
+            def: DefId.none(), name: String.new(), owner: DefId.none(), index: 0, infer_kind: InferKind.Any };
+    }
+    pub bool is_prim(&const self, PrimKind p) { match self.kind { TypeKind.Prim => return prim_index(self.prim) == prim_index(p), _ => return false } }
+    pub bool is_void(&const self) { return self.is_prim(PrimKind.Void); }
+    pub bool is_bool(&const self) { return self.is_prim(PrimKind.Bool); }
+    pub bool is_numeric(&const self) { return self.is_integer() || self.is_float(); }
+    pub bool is_ref(&const self) { match self.kind { TypeKind.Ref => return true, _ => return false } }
+    pub bool is_error(&const self) { match self.kind { TypeKind.Error => return true, _ => return false } }
+    pub bool is_never(&const self) { match self.kind { TypeKind.Never => return true, _ => return false } }
+    pub bool is_infer(&const self) { match self.kind { TypeKind.Infer => return true, _ => return false } }
+    pub bool is_integer(&const self) {
+        match self.kind { TypeKind.Infer => { match self.infer_kind { InferKind.Int => return true, _ => return false } }, TypeKind.Prim => {}, _ => return false }
+        match self.prim { PrimKind.Byte => return true, PrimKind.Short => return true, PrimKind.Int => return true,
+            PrimKind.Long => return true, PrimKind.Uint => return true, PrimKind.Ulong => return true, PrimKind.Usize => return true, _ => return false }
+    }
+    pub bool is_signed_integer(&const self) {
+        match self.kind { TypeKind.Prim => {}, _ => return false }
+        match self.prim { PrimKind.Short => return true, PrimKind.Int => return true, PrimKind.Long => return true, _ => return false }
+    }
+    pub bool is_float(&const self) {
+        match self.kind { TypeKind.Infer => { match self.infer_kind { InferKind.Float => return true, _ => return false } }, TypeKind.Prim => {}, _ => return false }
+        match self.prim { PrimKind.Float => return true, PrimKind.Double => return true, _ => return false }
+    }
+    pub bool is_unsized(&const self) { match self.kind { TypeKind.Str => return true, TypeKind.Slice => return true, TypeKind.Dyn => return true, _ => return false } }
+}
+&const str prim_name(PrimKind kind) {
+    match kind {
+        PrimKind.Bool => return "bool",
+        PrimKind.Byte => return "byte",
+        PrimKind.Short => return "short",
+        PrimKind.Int => return "int",
+        PrimKind.Long => return "long",
+        PrimKind.Uint => return "uint",
+        PrimKind.Ulong => return "ulong",
+        PrimKind.Usize => return "usize",
+        PrimKind.Float => return "float",
+        PrimKind.Double => return "double",
+        PrimKind.Char => return "char",
+        PrimKind.Void => return "void",
+    }
+}
+
+pub uint prim_index(PrimKind kind) {
+    match kind {
+        PrimKind.Bool => return 0, PrimKind.Byte => return 1, PrimKind.Short => return 2, PrimKind.Int => return 3,
+        PrimKind.Long => return 4, PrimKind.Uint => return 5, PrimKind.Ulong => return 6, PrimKind.Usize => return 7,
+        PrimKind.Float => return 8, PrimKind.Double => return 9, PrimKind.Char => return 10, PrimKind.Void => return 11,
+    }
+}
+pub uint def_kind(DefKind kind) {
+    match kind { DefKind.Struct => return 0, DefKind.Enum => return 1, DefKind.Trait => return 2,
+        DefKind.Impl => return 3, DefKind.Function => return 4, DefKind.Const => return 5 }
+}
+pub String def_key(DefId def) { uint kind = def_kind(def.kind); return "{kind}:{def.index}"; }
+pub struct TypeContext {
+    pub Vec<Type> arena;
+    HashMap<String, TypeId> table;
+    pub uint infer_count;
+    pub TypeContext new() {
+        var ctx = TypeContext { arena: Vec.new(), table: HashMap.new(), infer_count: 0 };
+        Vec<PrimKind> prims = Vec.new();
+        prims.push(PrimKind.Bool); prims.push(PrimKind.Byte); prims.push(PrimKind.Short); prims.push(PrimKind.Int);
+        prims.push(PrimKind.Long); prims.push(PrimKind.Uint); prims.push(PrimKind.Ulong); prims.push(PrimKind.Usize);
+        prims.push(PrimKind.Float); prims.push(PrimKind.Double); prims.push(PrimKind.Char); prims.push(PrimKind.Void);
+        for (p in &const prims) { var t = Type.new(TypeKind.Prim); t.prim = *p; uint i = prim_index(*p); ctx.intern("prim:{i}", t); }
+        ctx.intern(String.from("str"), Type.new(TypeKind.Str));
+        ctx.intern(String.from("never"), Type.new(TypeKind.Never));
+        ctx.intern(String.from("error"), Type.new(TypeKind.Error));
+        return ctx;
+    }
+    pub &const Type get(&const self, TypeId id) { return self.arena.get(id.index as usize).unwrap(); }
+    pub TypeId prim(&const self, PrimKind p) { return TypeId { index: prim_index(p) }; }
+    pub TypeId str(&const self) { return TypeId { index: 12 }; }
+    pub TypeId never(&const self) { return TypeId { index: 13 }; }
+    pub TypeId error(&const self) { return TypeId { index: 14 }; }
+    pub TypeId intern(&self, String key, Type value) {
+        { match self.table.get(key) { Some(id) => return *id, None => {} } }
+        if (self.arena.len() >= NONE as usize) { panic("type arena exhausted"); }
+        var id = TypeId { index: self.arena.len() as uint };
+        self.arena.push(value); self.table.insert(key, id); return id;
+    }
+    pub TypeId ref_type(&self, TypeId inner, bool is_const) {
+        var t = Type.new(TypeKind.Ref); t.inner = inner; t.is_const = is_const;
+        return self.intern("ref:{is_const}:{inner.index}", t);
+    }
+    pub TypeId ptr(&self, TypeId inner, bool is_const) {
+        var t = Type.new(TypeKind.Ptr); t.inner = inner; t.is_const = is_const;
+        return self.intern("ptr:{is_const}:{inner.index}", t);
+    }
+    pub TypeId array(&self, TypeId inner, ulong length) {
+        var t = Type.new(TypeKind.Array); t.inner = inner; t.length = length;
+        return self.intern("array:{length}:{inner.index}", t);
+    }
+    pub TypeId slice(&self, TypeId inner) {
+        var t = Type.new(TypeKind.Slice); t.inner = inner;
+        return self.intern("slice:{inner.index}", t);
+    }
+    pub TypeId tuple(&self, Vec<TypeId> elems) {
+        if (elems.is_empty()) { return self.prim(PrimKind.Void); }
+        var key = String.from("tuple:"); for (e in &const elems) { key.push_str("{e.index},"); }
+        var t = Type.new(TypeKind.Tuple); t.elems = elems; return self.intern(key, t);
+    }
+    pub TypeId fn_type(&self, Vec<TypeId> params, TypeId ret, CallMode mode, bool is_send) {
+        uint m = 0; match mode { CallMode.Shared => { m = 1; }, CallMode.Once => { m = 2; }, _ => {} }
+        var key = "fn:{m}:{is_send}:"; for (e in &const params) { key.push_str("{e.index},"); } key.push_str("->{ret.index}");
+        var t = Type.new(TypeKind.Fn); t.elems = params; t.ret = ret; t.call_mode = mode; t.is_send = is_send; return self.intern(key, t);
+    }
+    pub TypeId nominal(&self, TypeKind kind, DefId def, String name, Vec<TypeId> args) {
+        uint k = 0; match kind { TypeKind.Struct => { k = 0; }, TypeKind.Enum => { k = 1; }, TypeKind.Dyn => { k = 2; }, _ => panic("invalid nominal type") }
+        var dk = def_key(def); var key = "nominal:{k}:{dk}:"; for (e in &const args) { key.push_str("{e.index},"); }
+        var t = Type.new(kind); t.def = def; t.name = name; t.elems = args; return self.intern(key, t);
+    }
+    pub TypeId param(&self, DefId owner, uint index, &const str name) {
+        var dk = def_key(owner); var t = Type.new(TypeKind.Param); t.owner = owner; t.index = index; t.name = String.from(name);
+        return self.intern("param:{dk}:{index}", t);
+    }
+    pub TypeId fresh_infer(&self, InferKind kind) {
+        if (self.arena.len() >= NONE as usize || self.infer_count == NONE) { panic("inference arena exhausted"); }
+        var t = Type.new(TypeKind.Infer); t.infer_kind = kind; t.index = self.infer_count; self.infer_count += 1;
+        var id = TypeId { index: self.arena.len() as uint }; self.arena.push(t); return id;
+    }
+    pub bool contains_infer(&const self, TypeId id) { return self.contains(id, false); }
+    pub bool contains_param(&const self, TypeId id) { return self.contains(id, true); }
+    bool contains(&const self, TypeId id, bool param) {
+        if (id.index == NONE) { return false; }
+        var t = self.get(id);
+        match t.kind { TypeKind.Infer => { if (!param) { return true; } }, TypeKind.Param => { if (param) { return true; } }, _ => {} }
+        if (self.contains(t.inner, param) || self.contains(t.ret, param)) { return true; }
+        for (e in &const t.elems) { if (self.contains(*e, param)) { return true; } } return false;
+    }
+    pub String to_string(&const self, TypeId id) {
+        var t = self.get(id);
+        match t.kind {
+            TypeKind.Prim => return String.from(prim_name(t.prim)),
+            TypeKind.Str => return String.from("str"),
+            TypeKind.Never => return String.from("never"),
+            TypeKind.Error => return String.from("{{error}}"),
+            TypeKind.Infer => { match t.infer_kind { InferKind.Int => return String.from("{{integer}}"), InferKind.Float => return String.from("{{float}}"), _ => return String.from("_") } }
+            TypeKind.Param => return String.from(t.name),
+            TypeKind.Ref => { var s = String.from(if (t.is_const) { "&const " } else { "&" }); var inner = self.to_string(t.inner); s.push_str(inner); return s; }
+            TypeKind.Ptr => { var s = String.from(if (t.is_const) { "*const " } else { "*" }); var inner = self.to_string(t.inner); s.push_str(inner); return s; }
+            TypeKind.Array => { var s = self.to_string(t.inner); s.push_str("[{t.length}]"); return s; }
+            TypeKind.Slice => { var s = self.to_string(t.inner); s.push_str("[]"); return s; }
+            _ => {}
+        }
+        var out = String.new(); var end = String.new();
+        match t.kind {
+            TypeKind.Fn => {
+                out.push_str("fn"); match t.call_mode { CallMode.Shared => out.push_str(" const"), CallMode.Once => out.push_str(" once"), _ => {} }
+                if (t.is_send) { out.push_str(" send"); } out.push_str("("); end.push_str(")");
+            }
+            TypeKind.Tuple => { out.push_str("("); end.push_str(")"); }
+            _ => {
+                match t.kind { TypeKind.Dyn => out.push_str("dyn "), _ => {} }
+                out.push_str(t.name); if (t.elems.is_empty()) { return out; } out.push_str("<"); end.push_str(">");
+            }
+        }
+        for (i in 0..t.elems.len()) { if (i != 0) { out.push_str(", "); } var elem = self.to_string(*t.elems.get(i).unwrap()); out.push_str(elem); }
+        out.push_str(end);
+        match t.kind { TypeKind.Fn => { if (t.ret.index != NONE && t.ret.index != 11) { out.push_str(" -> "); var ret = self.to_string(t.ret); out.push_str(ret); } }, _ => {} }
+        return out;
+    }
+}
+pub struct Subst {
+    Vec<TypeId> from;
+    Vec<TypeId> to;
+    pub Subst new() { return Subst { from: Vec.new(), to: Vec.new() }; }
+    pub Subst copy(&const self) {
+        var out = Subst.new(); for (i in 0..self.from.len()) { out.from.push(*self.from.get(i).unwrap()); out.to.push(*self.to.get(i).unwrap()); } return out;
+    }
+    pub bool is_empty(&const self) { return self.from.is_empty(); }
+    pub void bind(&self, TypeId from, TypeId to) {
+        for (i in 0..self.from.len()) { if (self.from.get(i).unwrap().index == from.index) { *self.to.get_mut(i).unwrap() = to; return; } }
+        self.from.push(from); self.to.push(to);
+    }
+    pub TypeId lookup(&const self, TypeId from) {
+        for (i in 0..self.from.len()) { if (self.from.get(i).unwrap().index == from.index) { return *self.to.get(i).unwrap(); } } return TypeId.none();
+    }
+    pub TypeId apply(&const self, &TypeContext ctx, TypeId id) {
+        if (self.from.is_empty() || id.index == NONE) { return id; }
+        // Copy the fields needed below before recursion grows the type arena.
+        TypeKind kind = ctx.get(id).kind; TypeId inner = ctx.get(id).inner; TypeId ret = ctx.get(id).ret;
+        bool is_const = ctx.get(id).is_const; ulong length = ctx.get(id).length; CallMode mode = ctx.get(id).call_mode;
+        bool send = ctx.get(id).is_send; DefId def = ctx.get(id).def; var name = String.from(ctx.get(id).name);
+        Vec<TypeId> elems = Vec.new(); for (e in &const ctx.get(id).elems) { elems.push(*e); }
+        match kind {
+            TypeKind.Param => { var to = self.lookup(id); return if (to.index == NONE) { id } else { to }; }
+            TypeKind.Ref => { var sub = self.apply(&*ctx, inner); return ctx.ref_type(sub, is_const); }
+            TypeKind.Ptr => { var sub = self.apply(&*ctx, inner); return ctx.ptr(sub, is_const); }
+            TypeKind.Array => { var sub = self.apply(&*ctx, inner); return ctx.array(sub, length); }
+            TypeKind.Slice => { var sub = self.apply(&*ctx, inner); return ctx.slice(sub); }
+            TypeKind.Tuple => {}, TypeKind.Fn => {}, TypeKind.Struct => {}, TypeKind.Enum => {}, TypeKind.Dyn => {},
+            _ => return id,
+        }
+        Vec<TypeId> args = Vec.new(); for (e in &const elems) { args.push(self.apply(&*ctx, *e)); }
+        match kind {
+            TypeKind.Tuple => return ctx.tuple(args),
+            TypeKind.Fn => { var sub = self.apply(&*ctx, ret); return ctx.fn_type(args, sub, mode, send); }
+            _ => return ctx.nominal(kind, def, name, args),
+        }
+    }
+}

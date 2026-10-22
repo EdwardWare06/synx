@@ -1,0 +1,3 @@
+import link.elf_object_checks;
+import std.io;
+main() { var count = elf_object_checks.run(); print("ELF object reader: {count} cases passed"); }

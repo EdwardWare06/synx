@@ -1,0 +1,22 @@
+import std.collections.HashMap;
+import std.hash.Hash;
+
+extern "C" { *byte synx_rt_alloc(usize size); }
+
+// Deliberately breaks the Hash contract. Both calls use valid allocated
+// storage; the table must reject an occupied slot after the second search.
+struct Unstable { *int counter; }
+impl Hash for Unstable {
+    ulong hash(&const self) {
+        unsafe { *self.counter += 1; return (*self.counter % 2) as ulong; }
+    }
+}
+impl Eq for Unstable { bool eq(&const self, &const Self other) { return true; } }
+
+main() {
+    var counter = unsafe { synx_rt_alloc(size_of<int>()) as *int };
+    unsafe { *counter = 0; }
+    var map = HashMap<Unstable, String>.new();
+    map.insert(Unstable { counter }, String.from("first"));
+    map.insert(Unstable { counter }, String.from("second"));
+}

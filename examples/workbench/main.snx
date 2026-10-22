@@ -1,0 +1,17 @@
+import std.io;
+import calculator.describe;
+main() {
+    io.print("Synx workbench");
+    io.print("Enter an integer. A blank line ends the session.");
+    int count = 0;
+    loop {
+        String line = io.input();
+        String text = line.trim();
+        if (text.is_empty()) { break; }
+        match text.as_str().parse_int() {
+            Some(value) => { io.print(describe(value)); count += 1; }
+            None => { io.print("That input is not an integer."); }
+        }
+    }
+    io.print("Processed {count} integers.");
+}

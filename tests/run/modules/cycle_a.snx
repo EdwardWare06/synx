@@ -1,0 +1,2 @@
+import cycle_b;
+pub int first() { return cycle_b.second(); }

@@ -1,0 +1,1 @@
+int ping(int value) { return value; } main() { int n=2147483646; for (i in 0..2) { ping(i); n+=1; } if (n != -2147483648) { panic("wrong loop result"); } }

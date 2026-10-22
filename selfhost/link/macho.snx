@@ -1,0 +1,172 @@
+/// x86-64 PIE executable with eager dyld imports and SHA-256 ad-hoc signature.
+/// __TEXT is RX. Constants, writable data and zero-fill share __DATA (RW), so
+/// dyld can rebase constant function/vtable pointers without executable writes.
+/// Inputs remain owned by the caller. No filesystem or system-linker calls.
+import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
+import link.model;
+import link.image;
+import link.imports;
+import link.buffer.{Buffer, align};
+import link.buffer;
+import link.macho_sha256;
+import std.utf8;
+
+Vec<byte> copy_bytes(&const Vec<byte> data) { Vec<byte> out = Vec.new(); for (b in data) { out.push(*b); } return out; }
+Object copy_object(&const Object source) {
+    var out = Object.new(source.name, source.archive_member);
+    for (section in &const source.sections) { out.sections.push(Section { kind: section.kind, alignment: section.alignment, size: section.size, data: copy_bytes(section.data) }); }
+    for (symbol in &const source.symbols) { out.symbols.push(Symbol { name: copy_bytes(symbol.name), binding: symbol.binding, definition: symbol.definition }); }
+    for (reloc in &const source.relocations) { out.relocations.push(*reloc); }
+    return out;
+}
+void fixed(&Buffer out, &const str text, usize width) {
+    for (i in 0..width) { out.word(if (i < text.len()) { unsafe { *((text.as_ptr() as usize + i) as *const byte) } as ulong } else { 0 }, 1); }
+}
+void cstring(&Buffer out, &const str text) {
+    for (b in &const utf8.encode(text)) { out.word(*b as ulong, 1); } out.word(0, 1);
+}
+void uleb(&Buffer out, ulong value) {
+    ulong rest = value;
+    loop { ulong part = rest & 127; rest >>= 7; out.word(part | if (rest != 0) { 128 } else { 0 }, 1); if (rest == 0) { break; } }
+}
+void be(&Buffer out, ulong value, usize width) {
+    for (i in 0..width) { out.word((value >> ((width - i - 1) * 8)) & 255, 1); }
+}
+void segment(&Buffer out, &const str name, ulong address, ulong size, ulong offset,
+             ulong file_size, ulong maxprot, ulong prot, ulong sections) {
+    out.word(0x19, 4); out.word(72 + 80 * sections, 4); fixed(&*out, name, 16);
+    out.word(address, 8); out.word(size, 8); out.word(offset, 8); out.word(file_size, 8);
+    out.word(maxprot, 4); out.word(prot, 4); out.word(sections, 4); out.word(0, 4);
+}
+void section(&Buffer out, &const str name, &const str segment_name, ulong address,
+             ulong size, ulong offset, ulong flags) {
+    fixed(&*out, name, 16); fixed(&*out, segment_name, 16); out.word(address, 8);
+    out.word(size, 8); out.word(offset, 4); out.word(4, 4);
+    out.word(0, 4); out.word(0, 4); out.word(flags, 4);
+    out.word(0, 4); out.word(0, 4); out.word(0, 4);
+}
+Result<bool, Failure> path_command(&Buffer out, ulong command, &const str path, bool dylib) {
+    for (ch in &const utf8.encode(path)) { if (*ch == 0) { return Err(model.fail(Code.Invalid, 0, 0)); } }
+    ulong prefix = if (dylib) { 24 } else { 12 };
+    ulong size = align(prefix + path.len() as ulong + 1, 8)?;
+    ulong start = out.data.len() as ulong;
+    out.word(command, 4); out.word(size, 4); out.word(prefix, 4);
+    if (dylib) { out.word(0, 4); out.word(0x10000, 4); out.word(0x10000, 4); }
+    cstring(&*out, path); var padded = out.pad(start + size)?;
+    return Ok(true);
+}
+ulong ordinal(&const Vec<String> libraries, &const str name) {
+    for (i in 0..libraries.len()) { if (libraries.get(i).unwrap().as_str() == name) { return i as ulong + 1; } }
+    panic("Mach-O import library missing");
+}
+String slot_name(usize index) { return "__synx_macho_slot_{index}"; }
+
+/// Import definitions are six-byte RIP-relative jump thunks plus eight-byte
+/// eager-bound slots. Function addresses therefore remain stable local thunks.
+pub Result<Vec<byte>, Failure> write_dynamic(&const Vec<Object> inputs, &const str entry,
+                                             &const Vec<imports.Import> imported) {
+    Vec<Object> objects = Vec.new(); for (object in inputs) { objects.push(copy_object(object)); }
+    var extra = Object.new("<Mach-O imports>", false);
+    var code = Buffer.new(); var slots = Buffer.new();
+    Vec<String> libraries = Vec.new();
+    // libSystem initializes dyld's LC_MAIN return path even in runtime-free fixtures.
+    libraries.push(String.from("/usr/lib/libSystem.B.dylib"));
+    for (i in 0..imported.len()) {
+        var item = imported.get(i).unwrap();
+        if (item.name.is_empty()) { return Err(model.fail(Code.Invalid, 0, i)); }
+        for (b in &const item.name) { if (*b == 0) { return Err(model.fail(Code.Invalid, 0, i)); } }
+        bool found = false;
+        for (library in &const libraries) { if (library.as_str() == item.library.as_str()) { found = true; } }
+        if (!found) { if (item.library.is_empty()) { return Err(model.fail(Code.Invalid, 0, i)); } libraries.push(String.from(item.library)); }
+        extra.symbols.push(Symbol { name: copy_bytes(item.name), binding: Binding.Global,
+            definition: Definition.Section(0, code.data.len() as ulong) });
+        extra.symbols.push(Symbol.new(slot_name(i), Binding.Global, Definition.Section(1, slots.data.len() as ulong)));
+        code.word(0xff, 1); code.word(0x25, 1); code.word(0, 4); slots.word(0, 8);
+        extra.relocations.push(Relocation { section: 0, offset: i as ulong * 6 + 2,
+            symbol: i * 2 + 1, kind: RelocKind.Pc32, addend: -4 });
+    }
+    extra.sections.push(Section.new(SectionKind.Text, 16, code.data));
+    extra.sections.push(Section.new(SectionKind.Data, 8, slots.data)); objects.push(extra);
+    var linked = image.build(objects, entry, 0x100000000)?;
+    if (!linked.rebase_safe) { return Err(model.fail(Code.Unsupported, 0, 0)); }
+    var text = linked.segments.get(0).unwrap(); var constants = linked.segments.get(1).unwrap();
+    var data = linked.segments.get(2).unwrap(); var bss = linked.segments.get(3).unwrap();
+    ulong text_end = constants.rva; ulong data_start = constants.rva;
+    ulong data_file_end = align(data.rva + data.data.len() as ulong, 4096)?;
+    ulong linkedit = data_file_end;
+    ulong linkedit_rva = linked.end_rva;
+    var rebases = Buffer.new();
+    for (site in &const linked.absolute_sites) {
+        if (*site < data_start || *site + 8 > bss.rva + bss.size) { return Err(model.fail(Code.Unsupported, 0, 0)); }
+        rebases.word(0x11, 1); rebases.word(0x22, 1); uleb(&rebases, *site - data_start); rebases.word(0x51, 1);
+    }
+    rebases.word(0, 1);
+    var binds = Buffer.new();
+    for (i in 0..imported.len()) {
+        var item = imported.get(i).unwrap(); ulong library = ordinal(libraries, item.library);
+        if (library <= 15) { binds.word(0x10 | library, 1); } else { binds.word(0x20, 1); uleb(&binds, library); }
+        binds.word(0x40, 1); binds.append(item.name); binds.word(0, 1); binds.word(0x51, 1);
+        binds.word(0x72, 1);
+        ulong slot = match image.symbol(linked, slot_name(i)) { Some(address) => address, None => return Err(model.fail(Code.Unresolved, 0, i)) };
+        uleb(&binds, slot - linked.base - data_start); binds.word(0x90, 1);
+    }
+    binds.word(0, 1);
+    ulong bind_offset = align(linkedit + rebases.data.len() as ulong, 8)?;
+    ulong signature_offset = align(bind_offset + binds.data.len() as ulong, 16)?;
+    ulong pages = (signature_offset + 4095) / 4096;
+    ulong signature_size = 20 + 96 + pages * 32;
+    ulong final_size = signature_offset + signature_size;
+    if (final_size > buffer.LIMIT) { return Err(model.fail(Code.Range, 0, 0)); }
+    var commands = Buffer.new();
+    segment(&commands, "__PAGEZERO", 0, linked.base, 0, 0, 0, 0, 0);
+    segment(&commands, "__TEXT", linked.base, text_end, 0, text_end, 5, 5, 1);
+    section(&commands, "__text", "__TEXT", linked.base + text.rva, text.size, text.rva, 0x80000400);
+    segment(&commands, "__DATA", linked.base + data_start, linked.end_rva - data_start,
+        data_start, data_file_end - data_start, 3, 3, 3);
+    section(&commands, "__const", "__DATA", linked.base + constants.rva, constants.size, constants.rva, 0);
+    section(&commands, "__data", "__DATA", linked.base + data.rva, data.size, data.rva, 0);
+    section(&commands, "__bss", "__DATA", linked.base + bss.rva, bss.size, 0, 1);
+    segment(&commands, "__LINKEDIT", linked.base + linkedit_rva, align(final_size - linkedit, 4096)?,
+        linkedit, final_size - linkedit, 1, 1, 0);
+    commands.word(0x80000022, 4); commands.word(48, 4);
+    commands.word(linkedit, 4); commands.word(rebases.data.len() as ulong, 4);
+    commands.word(bind_offset, 4); commands.word(binds.data.len() as ulong, 4);
+    for (i in 0..6) { commands.word(0, 4); }
+    var dyld = path_command(&commands, 0xe, "/usr/lib/dyld", false)?;
+    for (library in &const libraries) { var loaded = path_command(&commands, 0xc, library, true)?; }
+    var rpath = path_command(&commands, 0x8000001c, "@loader_path", false)?;
+    commands.word(0x80000028, 4); commands.word(24, 4); commands.word(linked.entry - linked.base, 8); commands.word(8388608, 8);
+    commands.word(0x32, 4); commands.word(24, 4); commands.word(1, 4); commands.word(0xa0f00, 4); commands.word(0xa0f00, 4); commands.word(0, 4);
+    commands.word(0x1b, 4); commands.word(24, 4);
+    var uuid = macho_sha256.digest(text.data, 0, text.data.len());
+    for (i in 0..16) { commands.word(*uuid.get(i).unwrap() as ulong, 1); }
+    commands.word(0x1d, 4); commands.word(16, 4); commands.word(signature_offset, 4); commands.word(signature_size, 4);
+    if (commands.data.len() + 32 > 4096) { return Err(model.fail(Code.Range, 0, 0)); }
+    var out = Buffer.new(); out.word(0xfeedfacf, 4); out.word(0x1000007, 4); out.word(3, 4); out.word(2, 4);
+    out.word(11 + libraries.len() as ulong, 4); out.word(commands.data.len() as ulong, 4); out.word(0x200085, 4); out.word(0, 4);
+    out.append(commands.data); var headers = out.pad(4096)?;
+    for (part in &const linked.segments) {
+        if (part.data.is_empty()) { continue; }
+        var padding = out.pad(part.rva)?; out.append(part.data);
+    }
+    var linkedit_pad = out.pad(linkedit)?; out.append(rebases.data);
+    var bind_pad = out.pad(bind_offset)?; out.append(binds.data);
+    var signing_pad = out.pad(signature_offset)?;
+    var signature = Buffer.new();
+    be(&signature, 0xfade0cc0, 4); be(&signature, signature_size, 4); be(&signature, 1, 4);
+    be(&signature, 0, 4); be(&signature, 20, 4);
+    be(&signature, 0xfade0c02, 4); be(&signature, signature_size - 20, 4);
+    be(&signature, 0x20400, 4); be(&signature, 0x20002, 4);
+    be(&signature, 96, 4); be(&signature, 88, 4); be(&signature, 0, 4);
+    be(&signature, pages, 4); be(&signature, signature_offset, 4);
+    signature.word(32, 1); signature.word(2, 1); signature.word(0, 1); signature.word(12, 1);
+    be(&signature, 0, 4); be(&signature, 0, 4); be(&signature, 0, 4); be(&signature, 0, 4);
+    be(&signature, 0, 8); be(&signature, 0, 8); be(&signature, text_end, 8); be(&signature, 1, 8);
+    fixed(&signature, "synx", 8);
+    for (i in 0..pages as usize) {
+        usize start = i * 4096; usize length = if (signature_offset as usize - start < 4096) { signature_offset as usize - start } else { 4096 };
+        var hash = macho_sha256.digest(out.data, start, length); signature.append(hash);
+    }
+    if (signature.data.len() as ulong != signature_size) { panic("Mach-O signature size"); }
+    out.append(signature.data); return Ok(out.data);
+}

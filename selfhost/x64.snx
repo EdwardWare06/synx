@@ -1,0 +1,448 @@
+/// x86-64 byte encoder. Source: compiler/src/x64.cpp.
+/// Parity: tests/selfhost_backend_test.cpp, selfhost_backend_0..3.
+/// Register, XMM, ALU and condition inputs are hardware codes: 0..15,
+/// 0..7, 0..7 and 0..15. Addresses use a stable disp32 encoding.
+/// Each Assembler owns code, relocations and label fixups for one function.
+/// Bind all branch labels before finish; finish clears applied fixups.
+
+pub const byte RAX = 0;
+pub const byte RCX = 1;
+pub const byte RDX = 2;
+pub const byte RBX = 3;
+pub const byte RSP = 4;
+pub const byte RBP = 5;
+pub const byte RSI = 6;
+pub const byte RDI = 7;
+pub const byte R8 = 8;
+pub const byte R9 = 9;
+pub const byte R10 = 10;
+pub const byte R11 = 11;
+pub const byte R12 = 12;
+pub const byte R13 = 13;
+pub const byte R14 = 14;
+pub const byte R15 = 15;
+pub const byte XMM0 = 0;
+pub const byte XMM1 = 1;
+pub const byte XMM2 = 2;
+pub const byte XMM3 = 3;
+pub const byte XMM4 = 4;
+pub const byte XMM5 = 5;
+pub const byte XMM6 = 6;
+pub const byte XMM7 = 7;
+pub const byte COND_O = 0;
+pub const byte COND_NO = 1;
+pub const byte COND_B = 2;
+pub const byte COND_AE = 3;
+pub const byte COND_E = 4;
+pub const byte COND_NE = 5;
+pub const byte COND_BE = 6;
+pub const byte COND_A = 7;
+pub const byte COND_S = 8;
+pub const byte COND_NS = 9;
+pub const byte COND_P = 10;
+pub const byte COND_NP = 11;
+pub const byte COND_L = 12;
+pub const byte COND_GE = 13;
+pub const byte COND_LE = 14;
+pub const byte COND_G = 15;
+pub const byte ALU_ADD = 0;
+pub const byte ALU_OR = 1;
+pub const byte ALU_ADC = 2;
+pub const byte ALU_SBB = 3;
+pub const byte ALU_AND = 4;
+pub const byte ALU_SUB = 5;
+pub const byte ALU_XOR = 6;
+pub const byte ALU_CMP = 7;
+
+pub enum RelocKind { Call32, Pc32, Abs64 }
+pub struct Reloc { pub usize offset; pub String symbol; pub RelocKind kind; pub long addend; }
+struct Label { int pos; Vec<usize> fixups; }
+
+pub struct Assembler {
+    pub Vec<byte> code;
+    pub Vec<Reloc> relocs;
+    Vec<Label> labels;
+    pub Assembler new() { return Assembler { code: Vec.new(), relocs: Vec.new(), labels: Vec.new() }; }
+    void emit(&self, byte b) { self.code.push(b); }
+    pub bool is_bound(&const self, int label) { return self.labels.get(label as usize).unwrap().pos >= 0; }
+    pub usize label_pos(&const self, int label) { return self.labels.get(label as usize).unwrap().pos as usize; }
+
+    void emit32(&self, uint v) {
+        for (i in 0..4) { self.emit(((v >> (8 * i)) & 255) as byte); }
+    }
+
+    void emit64(&self, ulong v) {
+        for (i in 0..8) { self.emit(((v >> (8 * i)) & 255) as byte); }
+    }
+
+    void rex(&self, bool w, byte reg, byte index, byte base, bool force) {
+        byte b = 0x40;
+        if (w) { b |= 8; }
+        if ((reg & 8) != 0) { b |= 4; }
+        if ((index & 8) != 0) { b |= 2; }
+        if ((base & 8) != 0) { b |= 1; }
+        if (b != 0x40 || force) { self.emit(b); }
+    }
+
+    void modrm_mem(&self, byte reg, byte base, int disp) {
+        byte rm = base & 7;
+        self.emit((0x80 | ((reg & 7) << 3) | rm as byte));
+        if (rm == 4) { self.emit(0x24); }  // SIB: base rsp/r12, no index
+        self.emit32((disp as uint));
+    }
+
+    void modrm_rr(&self, byte reg, byte rm) {
+        self.emit((0xC0 | ((reg & 7) << 3) | (rm & 7) as byte));
+    }
+
+    pub int new_label(&self) {
+        int id = self.labels.len() as int; self.labels.push(Label { pos: -1, fixups: Vec.new() }); return id;
+    }
+
+    pub void bind(&self, int label) {
+        int pos = self.code.len() as int; self.labels.get_mut(label as usize).unwrap().pos = pos;
+    }
+
+    void rel32_to(&self, int label) {
+        usize field = self.code.len(); self.emit32(0); self.labels.get_mut(label as usize).unwrap().fixups.push(field);
+    }
+
+    pub void finish(&self) {
+        for (i in 0..self.labels.len()) {
+            int pos = self.labels.get(i).unwrap().pos;
+            usize count = self.labels.get(i).unwrap().fixups.len();
+            for (j in 0..count) {
+                usize field = *self.labels.get(i).unwrap().fixups.get(j).unwrap();
+                uint rel = (pos as long - (field as long + 4)) as uint;
+                for (k in 0..4) { *self.code.get_mut(field + k).unwrap() = ((rel >> (k * 8)) & 255) as byte; }
+            }
+            self.labels.get_mut(i).unwrap().fixups.clear();
+        }
+    }
+
+    pub void mov_rr(&self, byte dst, byte src) {
+        self.rex(true, src, 0, dst, false);
+        self.emit(0x89);
+        self.modrm_rr(src, dst);
+    }
+
+    pub void mov_ri(&self, byte dst, long imm) {
+        if (imm >= 0 && imm <= 4294967295) {
+            // mov r32, imm32 zero extends.
+            self.rex(false, 0, 0, dst, false);
+            self.emit((0xB8 | (dst & 7) as byte));
+            self.emit32((imm as uint));
+        } else if (imm >= -2147483648 && imm <= 2147483647) {
+            self.rex(true, 0, 0, dst, false);
+            self.emit(0xC7);
+            self.modrm_rr(0, dst);
+            self.emit32(((imm as int) as uint));
+        } else {
+            self.rex(true, 0, 0, dst, false);
+            self.emit((0xB8 | (dst & 7) as byte));
+            self.emit64((imm as ulong));
+        }
+    }
+
+    pub void load(&self, byte dst, byte base, int disp, byte size, bool sign_extend) {
+        match size {
+            1 => { self.rex(sign_extend, dst, 0, base, false); self.emit(0x0F); self.emit(if (sign_extend) { 0xBE } else { 0xB6 }); self.modrm_mem(dst, base, disp); },
+            2 => { self.rex(sign_extend, dst, 0, base, false); self.emit(0x0F); self.emit(if (sign_extend) { 0xBF } else { 0xB7 }); self.modrm_mem(dst, base, disp); },
+            4 => { self.rex(sign_extend, dst, 0, base, false); self.emit(if (sign_extend) { 0x63 } else { 0x8B }); self.modrm_mem(dst, base, disp); },
+            _ => { self.rex(true, dst, 0, base, false); self.emit(0x8B); self.modrm_mem(dst, base, disp); },
+        }
+    }
+
+    pub void store(&self, byte base, int disp, byte src, byte size) {
+        match size {
+            1 => { self.rex(false, src, 0, base, true); self.emit(0x88); self.modrm_mem(src, base, disp); },
+            2 => { self.emit(0x66); self.rex(false, src, 0, base, false); self.emit(0x89); self.modrm_mem(src, base, disp); },
+            4 => { self.rex(false, src, 0, base, false); self.emit(0x89); self.modrm_mem(src, base, disp); },
+            _ => { self.rex(true, src, 0, base, false); self.emit(0x89); self.modrm_mem(src, base, disp); },
+        }
+    }
+
+    pub void lea(&self, byte dst, byte base, int disp) {
+        self.rex(true, dst, 0, base, false);
+        self.emit(0x8D);
+        self.modrm_mem(dst, base, disp);
+    }
+
+    pub void lea_rip(&self, byte dst, &const str symbol, long addend) {
+        self.rex(true, dst, 0, 0, false); self.emit(0x8D); self.emit(0x05 | ((dst & 7) << 3));
+        usize offset = self.code.len(); self.relocs.push(Reloc { offset: offset, symbol: String.from(symbol), kind: RelocKind.Pc32, addend: (addend - 4) }); self.emit32(0);
+    }
+
+    pub void lea_label(&self, byte dst, int label) {
+        self.rex(true, dst, 0, 0, false);
+        self.emit(0x8D);
+        self.emit((0x05 | ((dst & 7) << 3) as byte));
+        self.rel32_to(label);
+    }
+
+    pub void alu_rr(&self, byte op, byte dst, byte src) {
+        self.rex(true, src, 0, dst, false);
+        self.emit(((op as byte) * 8 + 1 as byte));
+        self.modrm_rr(src, dst);
+    }
+
+    pub void alu_ri(&self, byte op, byte dst, int imm) {
+        self.rex(true, 0, 0, dst, false);
+        if (imm >= -128 && imm <= 127) {
+            self.emit(0x83);
+            self.modrm_rr((op as byte), dst);
+            self.emit((imm as byte));
+        } else {
+            self.emit(0x81);
+            self.modrm_rr((op as byte), dst);
+            self.emit32((imm as uint));
+        }
+    }
+
+    pub void imul_rr(&self, byte dst, byte src) {
+        self.rex(true, dst, 0, src, false);
+        self.emit(0x0F);
+        self.emit(0xAF);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void cqo(&self) {
+        self.emit(0x48); self.emit(0x99);
+    }
+
+    pub void mul(&self, byte src) {
+        self.rex(true, 0, 0, src, false); self.emit(0xF7); self.modrm_rr(4, src);
+    }
+
+    pub void idiv(&self, byte src) {
+        self.rex(true, 0, 0, src, false); self.emit(0xF7); self.modrm_rr(7, src);
+    }
+
+    pub void div(&self, byte src) {
+        self.rex(true, 0, 0, src, false); self.emit(0xF7); self.modrm_rr(6, src);
+    }
+
+    pub void neg(&self, byte r) {
+        self.rex(true, 0, 0, r, false); self.emit(0xF7); self.modrm_rr(3, r);
+    }
+
+    pub void not_(&self, byte r) {
+        self.rex(true, 0, 0, r, false); self.emit(0xF7); self.modrm_rr(2, r);
+    }
+
+    pub void shl_cl(&self, byte r) {
+        self.rex(true, 0, 0, r, false); self.emit(0xD3); self.modrm_rr(4, r);
+    }
+
+    pub void shr_cl(&self, byte r) {
+        self.rex(true, 0, 0, r, false); self.emit(0xD3); self.modrm_rr(5, r);
+    }
+
+    pub void sar_cl(&self, byte r) {
+        self.rex(true, 0, 0, r, false); self.emit(0xD3); self.modrm_rr(7, r);
+    }
+
+    pub void test_rr(&self, byte a, byte b) {
+        self.rex(true, b, 0, a, false);
+        self.emit(0x85);
+        self.modrm_rr(b, a);
+    }
+
+    pub void setcc(&self, byte c, byte dst) {
+        self.rex(false, 0, 0, dst, true);
+        self.emit(0x0F);
+        self.emit((0x90 | (c as byte) as byte));
+        self.modrm_rr(0, dst);
+        self.movzx8(dst, dst);
+    }
+
+    pub void movzx8(&self, byte dst, byte src) {
+        self.rex(true, dst, 0, src, true);
+        self.emit(0x0F);
+        self.emit(0xB6);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void movzx16(&self, byte dst, byte src) {
+        self.rex(true, dst, 0, src, false);
+        self.emit(0x0F);
+        self.emit(0xB7);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void movsx8(&self, byte dst, byte src) {
+        self.rex(true, dst, 0, src, true);
+        self.emit(0x0F);
+        self.emit(0xBE);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void movsx16(&self, byte dst, byte src) {
+        self.rex(true, dst, 0, src, false);
+        self.emit(0x0F);
+        self.emit(0xBF);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void movsx32(&self, byte dst, byte src) {
+        self.rex(true, dst, 0, src, false);
+        self.emit(0x63);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void mov32(&self, byte dst, byte src) {
+        self.rex(false, src, 0, dst, false);
+        self.emit(0x89);
+        self.modrm_rr(src, dst);
+    }
+
+    pub void jmp(&self, int label) {
+        self.emit(0xE9);
+        self.rel32_to(label);
+    }
+
+    pub void jcc(&self, byte c, int label) {
+        self.emit(0x0F);
+        self.emit((0x80 | (c as byte) as byte));
+        self.rel32_to(label);
+    }
+
+    pub void call_sym(&self, &const str symbol) {
+        self.emit(0xE8); usize offset = self.code.len(); self.relocs.push(Reloc { offset: offset, symbol: String.from(symbol), kind: RelocKind.Call32, addend: -4 }); self.emit32(0);
+    }
+
+    pub void call_reg(&self, byte r) {
+        self.rex(false, 0, 0, r, false);
+        self.emit(0xFF);
+        self.modrm_rr(2, r);
+    }
+
+    pub void ret(&self) {
+        self.emit(0xC3);
+    }
+
+    pub void push(&self, byte r) {
+        self.rex(false, 0, 0, r, false);
+        self.emit((0x50 | (r & 7) as byte));
+    }
+
+    pub void pop(&self, byte r) {
+        self.rex(false, 0, 0, r, false);
+        self.emit((0x58 | (r & 7) as byte));
+    }
+
+    pub void ud2(&self) {
+        self.emit(0x0F); self.emit(0x0B);
+    }
+
+    pub void rep_movsb(&self) {
+        self.emit(0xF3); self.emit(0xA4);
+    }
+
+    pub void movsd_load(&self, byte dst, byte base, int disp) {
+        self.emit(0xF2);
+        self.rex(false, dst, 0, base, false);
+        self.emit(0x0F);
+        self.emit(0x10);
+        self.modrm_mem(dst, base, disp);
+    }
+
+    pub void movsd_store(&self, byte base, int disp, byte src) {
+        self.emit(0xF2);
+        self.rex(false, src, 0, base, false);
+        self.emit(0x0F);
+        self.emit(0x11);
+        self.modrm_mem(src, base, disp);
+    }
+
+    pub void movss_load(&self, byte dst, byte base, int disp) {
+        self.emit(0xF3);
+        self.rex(false, dst, 0, base, false);
+        self.emit(0x0F);
+        self.emit(0x10);
+        self.modrm_mem(dst, base, disp);
+    }
+
+    pub void movss_store(&self, byte base, int disp, byte src) {
+        self.emit(0xF3);
+        self.rex(false, src, 0, base, false);
+        self.emit(0x0F);
+        self.emit(0x11);
+        self.modrm_mem(src, base, disp);
+    }
+
+    pub void movq_xr(&self, byte dst, byte src) {
+        self.emit(0x66);
+        self.rex(true, dst, 0, src, false);
+        self.emit(0x0F);
+        self.emit(0x6E);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void movq_rx(&self, byte dst, byte src) {
+        self.emit(0x66);
+        self.rex(true, src, 0, dst, false);
+        self.emit(0x0F);
+        self.emit(0x7E);
+        self.modrm_rr(src, dst);
+    }
+
+    pub void addsd(&self, byte dst, byte src) {
+        self.sse_rr(0xF2, 0x58, dst, src);
+    }
+
+    pub void subsd(&self, byte dst, byte src) {
+        self.sse_rr(0xF2, 0x5C, dst, src);
+    }
+
+    pub void mulsd(&self, byte dst, byte src) {
+        self.sse_rr(0xF2, 0x59, dst, src);
+    }
+
+    pub void divsd(&self, byte dst, byte src) {
+        self.sse_rr(0xF2, 0x5E, dst, src);
+    }
+
+    pub void ucomisd(&self, byte a, byte b) {
+        self.sse_rr(0x66, 0x2E, a, b);
+    }
+
+    pub void xorpd(&self, byte dst, byte src) {
+        self.sse_rr(0x66, 0x57, dst, src);
+    }
+
+    pub void movsd_rr(&self, byte dst, byte src) {
+        self.sse_rr(0xF2, 0x10, dst, src);
+    }
+
+    pub void cvtss2sd(&self, byte dst, byte src) {
+        self.sse_rr(0xF3, 0x5A, dst, src);
+    }
+
+    pub void cvtsd2ss(&self, byte dst, byte src) {
+        self.sse_rr(0xF2, 0x5A, dst, src);
+    }
+
+    pub void cvtsi2sd(&self, byte dst, byte src) {
+        self.emit(0xF2);
+        self.rex(true, dst, 0, src, false);
+        self.emit(0x0F);
+        self.emit(0x2A);
+        self.modrm_rr(dst, src);
+    }
+
+    pub void cvttsd2si(&self, byte dst, byte src) {
+        self.emit(0xF2);
+        self.rex(true, dst, 0, src, false);
+        self.emit(0x0F);
+        self.emit(0x2C);
+        self.modrm_rr(dst, src);
+    }
+
+    void sse_rr(&self, byte prefix, byte op, byte dst, byte src) {
+        if (prefix != 0) { self.emit(prefix); }
+        self.rex(false, dst, 0, src, false);
+        self.emit(0x0F); self.emit(op); self.modrm_rr(dst, src);
+    }
+}
+

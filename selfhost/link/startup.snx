@@ -1,0 +1,49 @@
+/// Platform process-entry stubs. Runtime bootstrap receives executable callbacks;
+/// no unresolved callback from a shared runtime points back into the executable.
+import link.model.{Object, Section, Symbol, Definition, Binding, Relocation, RelocKind, SectionKind};
+import x64;
+import std.utf8;
+import std.collections.HashMap;
+
+pub Object make(int os) {
+    var out = Object.new("<startup>", false);
+    var a = x64.Assembler.new();
+    out.symbols.push(Symbol.new("__synx_start", Binding.Global, Definition.Section(0, 0)));
+    HashMap<String, usize> symbols = HashMap.new(); symbols.insert(String.from("__synx_start"), 0);
+    if (os == 1) {
+        a.alu_ri(x64.ALU_SUB, x64.RSP, 40);
+        a.lea_rip(x64.RCX, "synx_entry", 0); a.lea_rip(x64.RDX, "synx_thread_entry", 0);
+        a.call_sym("synx_rt_link_start_v1");
+        a.mov_rr(x64.RCX, x64.RAX); a.call_sym("ExitProcess"); a.ud2();
+    } else {
+        if (os == 0) {
+            a.alu_rr(x64.ALU_XOR, x64.RBP, x64.RBP); a.mov_rr(x64.R9, x64.RDX);
+            a.pop(x64.RSI); a.mov_rr(x64.RDX, x64.RSP);
+            a.alu_ri(x64.ALU_AND, x64.RSP, -16); a.push(x64.RAX); a.push(x64.RSP);
+            a.alu_rr(x64.ALU_XOR, x64.R8, x64.R8); a.alu_rr(x64.ALU_XOR, x64.RCX, x64.RCX);
+            a.lea_rip(x64.RDI, "__synx_main", 0); a.call_sym("__libc_start_main"); a.ud2();
+            out.symbols.push(Symbol.new("__synx_main", Binding.Global, Definition.Section(0, a.code.len() as ulong)));
+            symbols.insert(String.from("__synx_main"), 1);
+        }
+        a.push(x64.RBP); a.mov_rr(x64.RBP, x64.RSP);
+        a.lea_rip(x64.RDX, if (os == 2) { "_synx_entry" } else { "synx_entry" }, 0);
+        a.lea_rip(x64.RCX, if (os == 2) { "_synx_thread_entry" } else { "synx_thread_entry" }, 0);
+        a.call_sym(if (os == 2) { "_synx_rt_link_start_v1" } else { "synx_rt_link_start_v1" });
+        a.mov_rr(x64.RSP, x64.RBP); a.pop(x64.RBP); a.ret();
+    }
+    a.finish();
+    for (reloc in &const a.relocs) {
+        usize symbol = 0;
+        match symbols.get(reloc.symbol) {
+            Some(index) => { symbol = *index; },
+            None => {
+                symbol = out.symbols.len(); symbols.insert(String.from(reloc.symbol), symbol);
+                out.symbols.push(Symbol { name: utf8.encode(reloc.symbol), binding: Binding.Global, definition: Definition.Undefined });
+            }
+        }
+        var kind = match reloc.kind { Abs64 => RelocKind.Abs64, _ => RelocKind.Pc32 };
+        out.relocations.push(Relocation { section: 0, offset: reloc.offset as ulong, symbol: symbol, kind: kind, addend: reloc.addend });
+    }
+    out.sections.push(Section.new(SectionKind.Text, 16, a.code));
+    return out;
+}

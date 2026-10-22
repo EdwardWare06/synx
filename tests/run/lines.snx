@@ -1,0 +1,9 @@
+import std.io;
+void require(bool value) { if (!value) { panic("line input test failed"); } }
+main() {
+    match io.read_line() { Ok(line) => { match line { Some(s) => require(s.is_empty()), None => panic("blank became EOF") } } Err(_) => panic("blank read failed") }
+    match io.read_line() { Ok(line) => { match line { Some(s) => require(s == String.from("héllo 🧠")), None => panic("missing Unicode line") } } Err(_) => panic("text read failed") }
+    match io.read_line() { Ok(line) => { match line { Some(s) => require(s == String.from("tail\r")), None => panic("missing final line") } } Err(_) => panic("tail read failed") }
+    match io.read_line() { Ok(line) => require(line.is_none()), Err(_) => panic("EOF read failed") }
+    print("lines ok");
+}

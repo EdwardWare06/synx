@@ -1,0 +1,49 @@
+/// Owns one compilation. Sources and ASTs remain alive through all passes.
+/// Stage ordinals: declarations=0, signatures=1, check=2, lower=3, borrow=4,
+/// async=5. Each pass runs once and only after the preceding pass succeeds.
+import ast;
+import source.SourceFile;
+import modules.{ModuleLoader, standard_library};
+import diagnostics.DiagnosticSink;
+import declare.Resolver;
+import check.Checker;
+import lower.Lowerer;
+import borrow.BorrowChecker;
+import async_frame;
+import bytes;
+import std.fs;
+import std.mem;
+
+pub struct Compilation {
+    pub Vec<SourceFile> sources;
+    pub Vec<ast.Ast> trees;
+    pub DiagnosticSink prelude_sink;
+    pub Lowerer lowerer;
+    pub bool ok;
+    pub uint stage;
+    pub Result<Compilation, fs.IoError> load(&const str input, Vec<byte> prelude, &const str std_fallback, uint stage, bool require_main) {
+        var user = SourceFile.load(input, 0)?;
+        var prelude_file = SourceFile.new(String.from("<prelude>"), prelude, 1);
+        bool std_failed = false; String std_root = String.new();
+        match standard_library(std_fallback) { Ok(path) => { std_root = path; }, Err(_) => { std_failed = true; } }
+        var loader = ModuleLoader.new(user, prelude_file, std_root); if (std_failed) { loader.host_failed = true; }
+        bool ok = loader.run();
+        if (loader.prelude_sink.has_errors()) { ok = false; }
+        if (ok && stage >= 1) { ok = loader.resolve_signatures(); }
+        var checker = Checker.new(mem.replace(&loader.resolver, Resolver.new()));
+        if (ok && stage >= 2) { checker.check_program(&loader.trees); ok = !checker.r.sink.has_errors(); }
+        if (loader.prelude_sink.has_errors()) { ok = false; }
+        var lowerer = Lowerer.new(checker);
+        if (ok && stage >= 3) { ok = lowerer.lower_program(&loader.trees, require_main); }
+        if (ok && stage >= 4) { var pass = BorrowChecker.new(); ok = pass.check_module(&lowerer.ck, &lowerer.module); }
+        if (ok && stage >= 5) { ok = async_frame.convert(&lowerer.ck, &loader.trees, &lowerer.module); }
+        var sources = mem.replace(&loader.sources, Vec.new()); var trees = mem.replace(&loader.trees, Vec.new());
+        var prelude_sink = mem.replace(&loader.prelude_sink, DiagnosticSink.new());
+        return Ok(Compilation { sources: sources, trees: trees, prelude_sink: prelude_sink,
+            lowerer: lowerer, ok: ok, stage: stage });
+    }
+    pub Vec<byte> diagnostics(&const self) {
+        return self.lowerer.ck.r.sink.render(self.sources.get(0).unwrap(), self.sources);
+    }
+    pub Vec<byte> prelude_diagnostics(&const self) { return self.prelude_sink.render(self.sources.get(1).unwrap(), self.sources); }
+}

@@ -1,0 +1,104 @@
+import std.mem;
+import std.collections.HashMap;
+void expect(bool condition) { if (!condition) { panic("closure mode assertion failed"); } }
+struct Ticket { int id; }
+impl Drop for Ticket { void drop(&self) { print("drop {self.id}"); } }
+struct Shared { fn const(int) -> int run; }
+struct Borrowed { &const fn const(int) -> int run; }
+fn() -> int read_ref(&const int value) { return || *value; }
+int twice(int value) { return value * 2; }
+int apply_shared(&const fn const(int) -> int f) { return f(3); }
+fn once() -> Ticket take_ticket(int id) {
+    var value = Ticket { id:id };
+    var other = Ticket { id:id+1 };
+    return [other, value] once || { print("consume {other.id}"); value };
+}
+fn once(int) -> int argument_target(int id) {
+    var ticket = Ticket { id:id };
+    return once |int n| ticket.id+n;
+}
+int early_argument() { argument_target(40)({ return 7; }); return 0; }
+int? absent() { return None; }
+int? try_argument() { return Some(argument_target(41)(absent()?)); }
+void conditional(bool consume) {
+    var ticket = Ticket { id:if (consume) { 50 } else { 51 } };
+    var f=once || { if (consume) { mem.drop(ticket); } print("conditional"); };
+    f();
+}
+main() {
+    int number=10;
+    {
+        var read=read_ref(&const number);
+        print("reference {read()} {read()}");
+    }
+    {
+        var increment=[&number] |int amount| { number+=amount; number };
+        print("write {increment(2)} {increment(3)}");
+    }
+    print("outer {number}");
+    {
+        const shared=const |int n| n+1;
+        print("shared {shared(shared(1))} {apply_shared(shared)}");
+        var holder=Shared { run:const |int n| n+2 };
+        var view=&const holder;
+        print("field {view.run(3)}");
+        var refs=Borrowed { run:&const shared };
+        print("reference field {refs.run(4)}");
+        var callbacks=[const |int n| n+5];
+        var values=&const callbacks;
+        print("array {values[0](2)}");
+        fn(int) -> int writable=shared;
+        print("adapted {writable(8)}");
+        fn const(int) -> int named_shared=twice;
+        fn once(int) -> int named_once=twice;
+        print("named {named_shared(4)} {named_once(5)}");
+    }
+    {
+        var call=take_ticket(20);
+        var ticket=call();
+        print("value {ticket.id}");
+    }
+    { var unused=take_ticket(30); }
+    print("early {early_argument()}");
+    expect(try_argument().is_none());
+    conditional(true); conditional(false);
+    {
+        int base=4;
+        var outer=|| [&const base] const |int n| base+n;
+        var inner=outer();
+        print("nested borrow {inner(3)}");
+    }
+    {
+        var ticket=Ticket { id:60 };
+        var outer=once || once || ticket;
+        var inner=outer();
+        var value=inner();
+        print("nested owner {value.id}");
+    }
+    {
+        Vec<fn const() -> int> callbacks=Vec.new();
+        callbacks.push([&const number] const || number);
+        {
+            var f=callbacks.get(0).unwrap();
+            print("vector {f()}");
+        }
+        callbacks.clear();
+    }
+    {
+        HashMap<int, fn const() -> int> callbacks=HashMap.new();
+        callbacks.insert(1, [&const number] const || number+1);
+        {
+            var f=callbacks.get(1).unwrap();
+            print("map {f()}");
+        }
+    }
+    {
+        var ticket=Ticket { id:70 };
+        Vec<fn once() -> Ticket> callbacks=Vec.new();
+        callbacks.push(once || ticket);
+        var f=callbacks.pop().unwrap();
+        var value=f();
+        print("popped {value.id}");
+    }
+    print("done");
+}

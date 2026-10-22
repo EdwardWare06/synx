@@ -1,0 +1,57 @@
+/// Import collection retains lazy archive selection and exact error origins.
+import link.model.{Object, Section, Symbol, Binding, Definition, SectionKind, Failure};
+import link.imports;
+import link.resolve;
+import bytes;
+
+void require(bool value, &const str message) { if (!value) { panic(message); } }
+T expect<T>(Result<T, Failure> value) {
+    return match value { Ok(item) => item, Err(error) => panic("import selection failed at {error.input}:{error.record}") };
+}
+Object object(&const str name, bool lazy) {
+    var result = Object.new(name, lazy);
+    Vec<byte> code = Vec.new(); code.push(0xc3);
+    result.sections.push(Section.new(SectionKind.Text, 1, code));
+    result.symbols.push(Symbol.new(name, Binding.Global, Definition.Section(0, 0)));
+    return result;
+}
+void undefined(&Object value, &const str name) { value.symbols.push(Symbol.new(name, Binding.Global, Definition.Undefined)); }
+Vec<Object> chain() {
+    var tail = object("tail", true); undefined(&tail, "__synx_start");
+    var middle = object("archive_entry", true); undefined(&middle, "tail"); undefined(&middle, "synx_rt_print");
+    var root = object("__synx_start", false); undefined(&root, "archive_entry");
+    // Duplicate entry in an inactive archive member must stay inactive.
+    var unused = object("__synx_start", true); undefined(&unused, "foreign_unknown");
+    Vec<Object> inputs = Vec.new(); inputs.push(tail); inputs.push(middle); inputs.push(root); inputs.push(unused); return inputs;
+}
+pub usize run() {
+    usize count = 0; var inputs = chain();
+    var selected = expect(resolve.active(inputs, "__synx_start"));
+    require(selected.len() == 4 && *selected.get(0).unwrap() && *selected.get(1).unwrap() &&
+        *selected.get(2).unwrap() && !*selected.get(3).unwrap(), "import archive fixed point"); count += 1;
+    var imported = expect(imports.collect(inputs, "libsynx_rt.so", 0));
+    require(imported.len() == 1 && bytes.equals(imported.get(0).unwrap().name, "synx_rt_print"), "inactive foreign import leaked"); count += 1;
+    require(imported.get(0).unwrap().library == String.from("libsynx_rt.so"), "runtime library selection"); count += 1;
+    inputs.push(object("synx_rt_print", false));
+    var resolved = expect(resolve.run(inputs, "__synx_start"));
+    require(resolved.targets.get(1).unwrap().get(1).unwrap().input.index == 0 &&
+        resolved.targets.get(2).unwrap().get(1).unwrap().input.index == 1, "archive chain targets"); count += 1;
+    require(expect(imports.collect(inputs, "libsynx_rt.so", 0)).is_empty(), "defined archive/runtime symbol imported"); count += 1;
+    Vec<Object> foreign = Vec.new(); var root = object("__synx_start", false); undefined(&root, "archive_entry");
+    var member = object("archive_entry", true); undefined(&member, "foreign_unknown");
+    foreign.push(root); foreign.push(member);
+    match imports.collect(foreign, "libsynx_rt.so", 0) {
+        Ok(_) => panic("selected foreign symbol accepted"),
+        Err(error) => {
+            require(match error.code { Unresolved => true, _ => false }, "selected foreign symbol error code");
+            require(error.input == 1 && error.record == 1 && error.symbol == String.from("foreign_unknown"), "selected foreign symbol diagnostic"); count += 1;
+        }
+    }
+    var malformed = chain();
+    malformed.get_mut(3).unwrap().symbols.push(Symbol.new("weak", Binding.Weak, Definition.Undefined));
+    match resolve.active(malformed, "__synx_start") {
+        Ok(_) => panic("inactive malformed archive member accepted"),
+        Err(error) => { require(match error.code { Unsupported => true, _ => false }, "inactive archive validation"); count += 1; }
+    }
+    return count;
+}

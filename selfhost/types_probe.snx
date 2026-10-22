@@ -1,0 +1,65 @@
+/// Type interning, predicates, formatting, and substitution parity.
+/// Oracle: tests/selfhost_types_test.cpp. Includes the full identity matrix.
+import types.{TypeContext, TypeKind, InferKind, Subst};
+import ids.{TypeId, DefId, DefKind};
+import ast.{PrimKind, CallMode};
+import std.env;
+import std.fs;
+import std.binary;
+import bytes;
+
+void put(&Vec<byte> out, ulong n, usize width) { if (!binary.write_uint(&*out, n, width, true)) { panic("type report overflow"); } }
+void flag(&Vec<byte> out, bool b) { out.push(if (b) { 1 } else { 0 }); }
+main() {
+    var args = env.args(); if (args.len() != 2) { panic("usage: types_probe <report>"); }
+    var ctx = TypeContext.new(); Vec<TypeId> samples = Vec.new();
+    for (i in 0..15) { samples.push(TypeId { index: i as uint }); }
+    Vec<InferKind> infers = Vec.new(); infers.push(InferKind.Any); infers.push(InferKind.Int); infers.push(InferKind.Float);
+    for (kind in &const infers) { samples.push(ctx.fresh_infer(*kind)); samples.push(ctx.fresh_infer(*kind)); }
+    var owner = DefId { kind: DefKind.Function, index: 0 }; var other = DefId { kind: DefKind.Function, index: 1 };
+    TypeId p = ctx.param(owner, 0, "T"); TypeId q = ctx.param(other, 0, "T");
+    samples.push(p); samples.push(q); samples.push(ctx.param(owner, 0, "ignored")); samples.push(ctx.param(owner, 1, "U"));
+    TypeId int_type = ctx.prim(PrimKind.Int); TypeId void_type = ctx.prim(PrimKind.Void);
+    var sd = DefId { kind: DefKind.Struct, index: 0 }; var ed = DefId { kind: DefKind.Enum, index: 0 }; var td = DefId { kind: DefKind.Trait, index: 0 };
+    var sd2 = DefId { kind: DefKind.Struct, index: 1 };
+    samples.push(ctx.nominal(TypeKind.Struct, sd, String.from("m.Record"), Vec.new()));
+    samples.push(ctx.nominal(TypeKind.Struct, sd2, String.from("m.Record"), Vec.new()));
+    samples.push(ctx.nominal(TypeKind.Enum, ed, String.from("m.Choice"), Vec.new()));
+    samples.push(ctx.nominal(TypeKind.Dyn, td, String.from("m.View"), Vec.new()));
+    samples.push(ctx.param(sd, 0, "T"));
+    Vec<TypeId> singleton = Vec.new(); singleton.push(p); samples.push(ctx.tuple(singleton));
+    samples.push(ctx.tuple(Vec.new()));
+    usize count = samples.len();
+    Vec<CallMode> modes = Vec.new(); modes.push(CallMode.Writable); modes.push(CallMode.Shared); modes.push(CallMode.Once);
+    for (i in 0..count) {
+        TypeId base = *samples.get(i).unwrap();
+        for (repeat in 0..2) {
+            samples.push(ctx.ref_type(base, false)); samples.push(ctx.ref_type(base, true));
+            samples.push(ctx.ptr(base, false)); samples.push(ctx.ptr(base, true));
+            samples.push(ctx.array(base, 0)); samples.push(ctx.array(base, 1)); samples.push(ctx.array(base, 18446744073709551615)); samples.push(ctx.slice(base));
+            Vec<TypeId> tuple = Vec.new(); tuple.push(base); tuple.push(int_type); samples.push(ctx.tuple(tuple));
+            for (mode in &const modes) {
+                for (send in 0..2) {
+                    Vec<TypeId> params = Vec.new(); params.push(base); params.push(p); samples.push(ctx.fn_type(params, base, *mode, send == 1));
+                    Vec<TypeId> empty = Vec.new(); samples.push(ctx.fn_type(empty, void_type, *mode, send == 1));
+                }
+            }
+            Vec<TypeId> sa = Vec.new(); sa.push(base); samples.push(ctx.nominal(TypeKind.Struct, sd, String.from("m.Record"), sa));
+            Vec<TypeId> ea = Vec.new(); ea.push(base); samples.push(ctx.nominal(TypeKind.Enum, ed, String.from("m.Choice"), ea));
+            Vec<TypeId> ta = Vec.new(); ta.push(base); samples.push(ctx.nominal(TypeKind.Dyn, td, String.from("m.View"), ta));
+        }
+    }
+    TypeId deep = p; for (i in 0..32) { deep = ctx.ref_type(deep, i % 2 == 0); } samples.push(deep);
+    var subst = Subst.new(); subst.bind(p, int_type); subst.bind(p, ctx.prim(PrimKind.Long)); subst.bind(q, void_type);
+    count = samples.len(); for (i in 0..count) { TypeId value = *samples.get(i).unwrap(); samples.push(subst.apply(&ctx, value)); }
+    var empty_subst = Subst.new(); samples.push(empty_subst.apply(&ctx, deep)); samples.push(subst.lookup(p)); samples.push(subst.lookup(q));
+    Vec<byte> out = Vec.new(); put(&out, samples.len() as ulong, 8); put(&out, ctx.infer_count as ulong, 4);
+    for (id in &const samples) {
+        var t = ctx.get(*id); var text = ctx.to_string(*id); put(&out, text.len() as ulong, 8); bytes.text(&out, text);
+        flag(&out, t.is_integer()); flag(&out, t.is_signed_integer()); flag(&out, t.is_float()); flag(&out, t.is_numeric()); flag(&out, t.is_void()); flag(&out, t.is_bool());
+        flag(&out, t.is_ref()); flag(&out, t.is_error()); flag(&out, t.is_never()); flag(&out, t.is_infer()); flag(&out, t.is_unsized());
+        flag(&out, ctx.contains_infer(*id)); flag(&out, ctx.contains_param(*id));
+    }
+    for (a in &const samples) { for (b in &const samples) { flag(&out, a.index == b.index); } }
+    match fs.write(args.get(1).unwrap().as_str(), out) { Ok(_) => {}, Err(_) => panic("type report I/O failed") }
+}

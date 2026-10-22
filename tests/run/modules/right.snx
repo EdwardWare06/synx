@@ -1,0 +1,2 @@
+pub struct Same { pub int n; pub int read(&const self) { return self.n * 2; } }
+pub Same make() { return Same { n: 12 }; }

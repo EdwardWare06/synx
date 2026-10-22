@@ -1,0 +1,87 @@
+:root {
+  --paper: #faf8f3;
+  --ink: #2b2a28;
+  --muted: #6b6760;
+  --moss: #4f6b3a;
+  --copper: #b0643a;
+  --rule: #e2ddd2;
+  --code: #f1ede4;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.6 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1.5rem;
+  padding: 0.75rem 2rem;
+  background: var(--ink);
+}
+header a { color: var(--paper); text-decoration: none; }
+header a:hover { color: #e9b48f; }
+header .home { font-weight: 700; font-size: 1.2rem; }
+header .version { color: #a9a49a; font-size: 0.85rem; }
+header nav { display: flex; flex-wrap: wrap; gap: 1.1rem; }
+.layout {
+  display: flex;
+  gap: 2.5rem;
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1.5rem 2rem 4rem;
+}
+main { flex: 1; min-width: 0; max-width: 50rem; }
+.toc {
+  flex: 0 0 13rem;
+  position: sticky;
+  top: 1rem;
+  align-self: flex-start;
+  font-size: 0.875rem;
+  border-left: 2px solid var(--rule);
+  padding-left: 1rem;
+}
+.toc p { margin: 0 0 0.4rem; color: var(--muted); font-weight: 600; }
+.toc ul { list-style: none; margin: 0; padding: 0; }
+.toc li { margin: 0.25rem 0; }
+h1, h2, h3, h4 { line-height: 1.25; color: var(--ink); }
+h1 { font-size: 2rem; margin: 0.5rem 0 1rem; }
+h2 { font-size: 1.45rem; margin-top: 2.2rem; padding-bottom: 0.25rem; border-bottom: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; margin-top: 1.8rem; }
+a { color: var(--moss); }
+a:hover { color: var(--copper); }
+code {
+  font: 0.9em/1.5 "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace;
+  background: var(--code);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code);
+  border-left: 3px solid var(--moss);
+  padding: 0.8rem 1rem;
+  overflow-x: auto;
+  border-radius: 3px;
+}
+pre.text { border-left-color: var(--rule); }
+pre code { background: none; padding: 0; font-size: 0.875rem; }
+.kw { color: #7a3e9d; font-weight: 600; }
+.ty { color: #2e6f8e; }
+.string { color: var(--copper); }
+.number { color: #8a5a00; }
+.comment { color: var(--muted); font-style: italic; }
+table { border-collapse: collapse; margin: 1rem 0; font-size: 0.95rem; }
+th, td { border: 1px solid var(--rule); padding: 0.4rem 0.7rem; text-align: left; vertical-align: top; }
+th { background: #efeadf; }
+@media (max-width: 900px) {
+  .toc { display: none; }
+  .layout { padding: 1rem; }
+}
+@media print {
+  header, .toc { display: none; }
+  body { background: white; }
+  pre { white-space: pre-wrap; }
+}

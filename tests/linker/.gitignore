@@ -1,0 +1,5 @@
+_work-*/
+probe*.exe
+probe*.exe.obj
+probe*.o
+probe-linux*

@@ -1,0 +1,146 @@
+/// Checker results. Source: CheckResult, NameRef, Coercion, LocalVar in
+/// compiler/include/synx/check.hpp. Parity: tests/selfhost_check_test.cpp.
+/// Tables iterate in first-insertion order, matching InsertionMap in C++.
+/// Keys identify syntax nodes by file and arena index (see node keys below);
+/// records hold IDs only and no references into syntax or semantic arenas.
+import ids.{TypeId, DefId, NONE};
+import ast.CaptureMode;
+import source.Span;
+import std.collections.HashMap;
+
+/// Expression, pattern, and statement keys: file in the high 32 bits, arena
+/// index in the low 32 bits. Field initializers add the position in the
+/// literal: file << 48 | expression << 16 | position.
+pub ulong node_key(uint file, uint index) { return ((file as ulong) << 32) | (index as ulong); }
+pub ulong field_key(uint file, uint expr, usize position) {
+    if (file >= 65536 || position >= 65536) { panic("field initializer key out of range"); }
+    return ((file as ulong) << 48) | ((expr as ulong) << 16) | (position as ulong);
+}
+pub uint key_file(ulong key) { return (key >> 32) as uint; }
+pub uint key_index(ulong key) { return (key & 4294967295) as uint; }
+pub const ulong NO_KEY = 18446744073709551615;
+
+/// Keyed records in first-insertion order. Replacing a value keeps its position.
+pub struct Table<V> {
+    pub Vec<ulong> keys;
+    pub Vec<V> values;
+    HashMap<ulong, usize> index;
+    pub Table<V> new() { return Table { keys: Vec.new(), values: Vec.new(), index: HashMap.new() }; }
+    pub usize len(&const self) { return self.keys.len(); }
+    pub bool has(&const self, ulong key) { return self.index.contains_key(&key); }
+    pub usize position(&const self, ulong key) {
+        match self.index.get(&key) { Some(i) => return *i, None => return NONE as usize }
+    }
+    pub (&const V)? get(&const self, ulong key) {
+        match self.index.get(&key) { Some(i) => return self.values.get(*i), None => return None }
+    }
+    pub (&V)? get_mut(&self, ulong key) {
+        usize i = self.position(key); if (i == NONE as usize) { return None; } return self.values.get_mut(i);
+    }
+    /// Inserts or replaces, as operator[] assignment does in C++.
+    pub void put(&self, ulong key, V value) {
+        usize i = self.position(key);
+        if (i != NONE as usize) { *self.values.get_mut(i).unwrap() = value; return; }
+        self.index.insert(key, self.keys.len()); self.keys.push(key); self.values.push(value);
+    }
+    /// Inserts value only when key is absent, as operator[] does in C++.
+    pub &V entry(&self, ulong key, V value) {
+        usize i = self.position(key);
+        if (i == NONE as usize) { i = self.keys.len(); self.index.insert(key, i); self.keys.push(key); self.values.push(value); }
+        return self.values.get_mut(i).unwrap();
+    }
+}
+
+pub struct LocalVar { pub String name; pub TypeId type; pub bool is_const; pub Span span; }
+pub LocalVar copy_local(&const LocalVar l) { return LocalVar { name: String.from(l.name), type: l.type, is_const: l.is_const, span: l.span }; }
+pub Vec<LocalVar> copy_locals(&const Vec<LocalVar> values) { Vec<LocalVar> out = Vec.new(); for (l in values) { out.push(copy_local(l)); } return out; }
+
+/// Order matches RefKind in check.hpp.
+pub enum RefKind { Local, Function, Method, AssocFn, Variant, Const, TypeName, Field, TupleField }
+pub uint ref_kind_index(RefKind kind) {
+    match kind { RefKind.Local => return 0, RefKind.Function => return 1, RefKind.Method => return 2, RefKind.AssocFn => return 3,
+        RefKind.Variant => return 4, RefKind.Const => return 5, RefKind.TypeName => return 6, RefKind.Field => return 7, RefKind.TupleField => return 8 }
+}
+
+/// What a name, field, call, or literal refers to. A variant is its enum
+/// plus variant index; absent definitions are none.
+pub struct NameRef {
+    pub RefKind kind;
+    pub uint local_id;
+    pub DefId fn_def;
+    pub DefId impl_def;
+    pub DefId trait_def;
+    pub DefId variant_enum;
+    pub uint variant;
+    pub DefId const_def;
+    pub DefId struct_def;
+    pub DefId enum_def;
+    pub uint field_index;
+    pub int auto_derefs;
+    pub Vec<TypeId> type_args;
+    pub Vec<TypeId> owner_args;
+    pub NameRef new() {
+        return NameRef { kind: RefKind.Local, local_id: 0, fn_def: DefId.none(), impl_def: DefId.none(), trait_def: DefId.none(),
+            variant_enum: DefId.none(), variant: NONE, const_def: DefId.none(), struct_def: DefId.none(), enum_def: DefId.none(),
+            field_index: 0, auto_derefs: 0, type_args: Vec.new(), owner_args: Vec.new() };
+    }
+    pub NameRef copy(&const self) {
+        var out = NameRef { kind: self.kind, local_id: self.local_id, fn_def: self.fn_def, impl_def: self.impl_def, trait_def: self.trait_def,
+            variant_enum: self.variant_enum, variant: self.variant, const_def: self.const_def, struct_def: self.struct_def, enum_def: self.enum_def,
+            field_index: self.field_index, auto_derefs: self.auto_derefs, type_args: Vec.new(), owner_args: Vec.new() };
+        for (t in &const self.type_args) { out.type_args.push(*t); }
+        for (t in &const self.owner_args) { out.owner_args.push(*t); }
+        return out;
+    }
+}
+
+/// Order matches CoercionKind in check.hpp.
+pub enum CoercionKind { None, AutoBorrowConst, AutoBorrowMut, MutToConst, StringToStr, ArrayToSlice, VecToSlice, ToDyn, FnMode, NeverToAny }
+pub uint coercion_index(CoercionKind kind) {
+    match kind { CoercionKind.None => return 0, CoercionKind.AutoBorrowConst => return 1, CoercionKind.AutoBorrowMut => return 2,
+        CoercionKind.MutToConst => return 3, CoercionKind.StringToStr => return 4, CoercionKind.ArrayToSlice => return 5,
+        CoercionKind.VecToSlice => return 6, CoercionKind.ToDyn => return 7, CoercionKind.FnMode => return 8, CoercionKind.NeverToAny => return 9 }
+}
+pub struct Coercion { pub CoercionKind kind; pub bool borrow_first; pub TypeId target; }
+pub Coercion coercion(CoercionKind kind) { return Coercion { kind: kind, borrow_first: false, target: TypeId.none() }; }
+
+/// One explicit capture; lists stay sorted by local ID like std::map.
+pub struct CaptureEntry { pub uint local; pub CaptureMode mode; }
+
+pub struct CheckResult {
+    pub Table<TypeId> expr_types;
+    pub Table<NameRef> refs;
+    pub Table<Coercion> coercions;
+    pub Table<uint> decl_locals;
+    pub Table<uint> pattern_locals;
+    pub Table<int> pattern_derefs;
+    /// Keyed by function arena index.
+    pub Table<Vec<LocalVar>> fn_locals;
+    /// Keyed by const arena index.
+    pub Table<Vec<LocalVar>> const_locals;
+    pub Table<Vec<uint>> closure_params;
+    pub Table<Vec<uint>> closure_captures;
+    pub Table<Vec<CaptureEntry>> closure_capture_modes;
+    pub Table<Vec<LocalVar>> closure_locals;
+    pub Table<uint> shorthand_locals;
+    pub CheckResult new() {
+        return CheckResult { expr_types: Table.new(), refs: Table.new(), coercions: Table.new(), decl_locals: Table.new(),
+            pattern_locals: Table.new(), pattern_derefs: Table.new(), fn_locals: Table.new(), const_locals: Table.new(),
+            closure_params: Table.new(), closure_captures: Table.new(), closure_capture_modes: Table.new(),
+            closure_locals: Table.new(), shorthand_locals: Table.new() };
+    }
+}
+
+/// Capture mode for a local in a sorted capture list, or None.
+pub CaptureMode? capture_mode(&const Vec<CaptureEntry> modes, uint local) {
+    for (m in modes) { if (m.local == local) { return Some(m.mode); } }
+    return None;
+}
+/// Inserts into a sorted capture list. Returns false when the local exists.
+pub bool add_capture(&Vec<CaptureEntry> modes, uint local, CaptureMode mode) {
+    for (m in &const *modes) { if (m.local == local) { return false; } }
+    modes.push(CaptureEntry { local: local, mode: mode });
+    usize i = modes.len() - 1;
+    while (i > 0 && modes.get(i - 1).unwrap().local > local) { modes.swap(i, i - 1); i -= 1; }
+    return true;
+}

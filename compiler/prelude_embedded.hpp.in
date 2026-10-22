@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr char embedded_prelude[] = R"SYNX(@SYNX_PRELUDE@)SYNX";

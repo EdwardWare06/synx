@@ -1,0 +1,37 @@
+// Functions that end in a loop, a body that only panics, and large doubles.
+int first_even(&const Vec<int> values) {
+    usize i = 0;
+    loop {
+        int value = *values.get(i).unwrap();
+        if (value % 2 == 0) { return value; }
+        i += 1;
+    }
+}
+
+int settle(int start) {
+    int left = start;
+    loop {
+        while (true) { break; }
+        if (left == 0) { return start; }
+        left -= 1;
+    }
+}
+
+stop() { panic("stop"); }
+
+main() {
+    Vec<int> values = Vec.new();
+    values.push(3);
+    values.push(5);
+    values.push(8);
+    print("{first_even(&values)}");
+    print("{settle(4)}");
+    double big = 1.234567890123456e301;
+    print("{big}");
+    print("{-big}");
+    print("{1.7976931348623157e308}");
+    print("{1e300}");
+    print("{2.5}");
+    print("{10.0}");
+    stop();
+}

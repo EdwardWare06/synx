@@ -1,0 +1,7 @@
+Synx workbench
+Enter an integer. A blank line ends the session.
+sqrt(81) = 9.0
+sqrt(25) = 5.0
+Use a nonnegative integer.
+That input is not an integer.
+Processed 3 integers.

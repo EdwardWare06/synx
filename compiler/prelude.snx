@@ -1,0 +1,480 @@
+
+extern "C" {
+    *byte synx_rt_alloc(usize size);
+    *byte synx_rt_realloc(*byte p, usize size);
+    void synx_rt_free(*byte p);
+    void synx_rt_memcpy(*byte dst, *const byte src, usize n);
+    usize synx_rt_atomic_load(*usize value);
+    usize synx_rt_atomic_add(*usize value, usize amount);
+    usize synx_rt_atomic_sub(*usize value, usize amount);
+    *byte synx_rt_event_new();
+    void synx_rt_event_signal(*byte event);
+    int synx_rt_event_take(*byte event);
+    void synx_rt_event_wait(*byte event);
+    void synx_rt_blocking_check(*byte pool);
+    void synx_rt_event_free(*byte event);
+}
+
+pub enum Option<T> {
+    None,
+    Some(T),
+
+    pub bool is_some(&const self) {
+        match self {
+            Some(_) => return true,
+            None => return false,
+        }
+    }
+
+    pub bool is_none(&const self) {
+        return !self.is_some();
+    }
+    pub T unwrap(self) { return self.expect("called Option.unwrap on None"); }
+    pub T expect(self, &const str message) {
+        match self { Some(value) => return value, None => panic(message) }
+    }
+    pub T unwrap_or(self, T fallback) {
+        match self { Some(value) => return value, None => return fallback }
+    }
+    pub Option<&const T> as_ref(&const self) {
+        match self { Some(value) => return Some(value), None => return None }
+    }
+    pub Option<&T> as_mut(&self) {
+        match self { Some(value) => return Some(value), None => return None }
+    }
+    pub Option<T> take(&self) {
+        unsafe {
+            var pointer = self as *Option<T>;
+            Option<T> previous = *pointer;
+            *pointer = None;
+            return previous;
+        }
+    }
+    pub Option<T> replace(&self, T value) {
+        unsafe {
+            var pointer = self as *Option<T>;
+            Option<T> previous = *pointer;
+            *pointer = Some(value);
+            return previous;
+        }
+    }
+}
+
+pub enum Result<T, E> {
+    Ok(T),
+    Err(E),
+
+    pub bool is_ok(&const self) {
+        match self {
+            Ok(_) => return true,
+            Err(_) => return false,
+        }
+    }
+
+    pub bool is_err(&const self) {
+        return !self.is_ok();
+    }
+}
+
+pub struct Range<T> {
+    pub T start;
+    pub T end;
+}
+
+pub struct RangeInclusive<T> {
+    pub T start;
+    pub T end;
+}
+
+/// Types that are copied bit for bit instead of moved. Plain data types
+/// are Copy automatically; this trait documents it.
+pub trait Copy {}
+
+/// Values whose ownership can cross a thread boundary.
+pub trait Send {}
+/// Values that allow shared references on several threads.
+pub trait Sync {}
+/// Values that contain no borrowed storage, including erased captures.
+pub trait Owned {}
+
+/// Types with a destructor.
+pub trait Drop {
+    void drop(&self);
+}
+
+pub enum Poll<T> { Pending, Ready(T) }
+
+/// A wake callback can be invoked concurrently through a shared reference.
+pub trait Wake { void wake(&const self); }
+struct WakeState {
+    usize refs;
+    *byte event;
+    *byte data;
+    fn(*byte) signal;
+    fn(*byte) cleanup;
+}
+struct WakeBridge<W: Wake + Send + Sync + Owned> {
+    void signal(*byte data) {
+        unsafe { (&const *(data as *W)).wake(); }
+    }
+    void cleanup(*byte data) {
+        unsafe { drop_in_place<W>(data as *W); synx_rt_free(data); }
+    }
+}
+pub struct Waker {
+    *WakeState state;
+    void noop(*byte data) {}
+    pub Waker new() {
+        unsafe {
+            var state = synx_rt_alloc(size_of<WakeState>()) as *WakeState;
+            *state = WakeState { refs: 1, event: synx_rt_event_new(), data: 0 as *byte, signal: Waker.noop, cleanup: Waker.noop };
+            return Waker { state: state };
+        }
+    }
+    pub Waker from<W: Wake + Send + Sync + Owned>(W value) {
+        unsafe {
+            var data = synx_rt_alloc(size_of<W>()) as *W;
+            *data = value;
+            var state = synx_rt_alloc(size_of<WakeState>()) as *WakeState;
+            *state = WakeState { refs: 1, event: synx_rt_event_new(), data: data as *byte, signal: WakeBridge<W>.signal, cleanup: WakeBridge<W>.cleanup };
+            return Waker { state: state };
+        }
+    }
+    pub Waker clone(&const self) {
+        unsafe {
+            if (synx_rt_atomic_add(&(*self.state).refs as *usize, 1) >= 9223372036854775807 as usize) { panic("too many waker references"); }
+            return Waker { state: self.state };
+        }
+    }
+    pub void wake(&const self) {
+        unsafe { synx_rt_event_signal((*self.state).event); (*self.state).signal((*self.state).data); }
+    }
+    pub bool take_ready(&const self) { return unsafe { synx_rt_event_take((*self.state).event) != 0 }; }
+    pub void wait(&const self) { unsafe { synx_rt_blocking_check(0 as *byte); synx_rt_event_wait((*self.state).event); } }
+    pub bool is_retained(&const self) { return unsafe { synx_rt_atomic_load(&(*self.state).refs as *usize) > 1 }; }
+}
+impl Drop for Waker {
+    void drop(&self) {
+        unsafe {
+            if (synx_rt_atomic_sub(&(*self.state).refs as *usize, 1) == 1) {
+                (*self.state).cleanup((*self.state).data);
+                synx_rt_event_free((*self.state).event);
+                synx_rt_free(self.state as *byte);
+            }
+        }
+    }
+}
+unsafe impl Send for Waker {}
+unsafe impl Sync for Waker {}
+unsafe impl Owned for Waker {}
+
+pub trait Future<T> { Poll<T> poll(&self, Waker wake); }
+
+// Only the compiler constructs Tasks. Their frame allocation never moves.
+pub struct Task<T> {
+    *byte frame;
+    fn(*byte, Waker) -> Poll<T> resume;
+    fn(*byte) cancel;
+    bool running;
+}
+impl<T> Future<T> for Task<T> {
+    Poll<T> poll(&self, Waker wake) {
+        if (self.running) { panic("async task is already being polled"); }
+        self.running = true;
+        var result = self.resume(self.frame, wake);
+        self.running = false;
+        return result;
+    }
+}
+impl<T> Drop for Task<T> {
+    void drop(&self) { self.cancel(self.frame); }
+}
+
+// The compiler checks inputs and suspension storage before erasing this frame.
+pub struct SendTask<T: Send + Owned> {
+    *byte frame;
+    fn send(*byte, Waker) -> Poll<T> resume;
+    fn send(*byte) cancel;
+    bool running;
+}
+impl<T: Send + Owned> Future<T> for SendTask<T> {
+    Poll<T> poll(&self, Waker wake) {
+        if (self.running) { panic("async task is already being polled"); }
+        self.running = true;
+        var result = self.resume(self.frame, wake);
+        self.running = false;
+        return result;
+    }
+}
+impl<T: Send + Owned> Drop for SendTask<T> { void drop(&self) { self.cancel(self.frame); } }
+unsafe impl<T: Send + Owned> Send for SendTask<T> {}
+unsafe impl<T: Send + Owned> Owned for SendTask<T> {}
+
+pub trait Eq {
+    bool eq(&const self, &const Self other);
+}
+
+pub trait Ord {
+    bool lt(&const self, &const Self other);
+}
+
+pub trait Display {
+    String to_string(&const self);
+}
+
+pub trait Add { Self add(self, Self other); }
+pub trait Sub { Self sub(self, Self other); }
+pub trait Mul { Self mul(self, Self other); }
+pub trait Div { Self div(self, Self other); }
+pub trait Rem { Self rem(self, Self other); }
+pub trait Neg { Self neg(self); }
+pub trait Not { Self not(self); }
+
+/// An owned, growable UTF-8 string.
+pub struct String {
+    *byte data;
+    usize len;
+    usize cap;
+
+    pub String new() {
+        return String { data: 0 as *byte, len: 0, cap: 0 };
+    }
+
+    pub String from(&const str s) {
+        var r = String.new();
+        r.push_str(s);
+        return r;
+    }
+
+    pub usize len(&const self) { return self.len; }
+
+    pub bool is_empty(&const self) { return self.len == 0; }
+
+    pub &const str as_str(&const self) {
+        return unsafe { str_from_raw(self.data as *const byte, self.len) };
+    }
+
+    void reserve(&self, usize extra) {
+        usize limit = ~(0 as usize);
+        if (extra > limit - self.len) { panic("String capacity is too large"); }
+        usize need = self.len + extra;
+        if (need <= self.cap) { return; }
+        usize cap = if (self.cap == 0) { 16 } else { self.cap };
+        while (cap < need) {
+            if (cap > limit / 2) { cap = need; break; }
+            cap = cap * 2;
+        }
+        unsafe { self.data = synx_rt_realloc(self.data, cap); }
+        self.cap = cap;
+    }
+
+    void push_byte(&self, byte b) {
+        self.reserve(1);
+        unsafe { *((self.data as usize + self.len) as *byte) = b; }
+        self.len += 1;
+    }
+
+    pub void push_str(&self, &const str s) {
+        usize n = s.len();
+        if (n == 0) { return; }
+        self.reserve(n);
+        unsafe { synx_rt_memcpy((self.data as usize + self.len) as *byte, s.as_ptr(), n); }
+        self.len += n;
+    }
+
+    pub void push(&self, char c) {
+        uint v = c as uint;
+        if (v < 128) {
+            self.push_byte(v as byte);
+        } else if (v < 2048) {
+            self.push_byte((192 | (v >> 6)) as byte);
+            self.push_byte((128 | (v & 63)) as byte);
+        } else if (v < 65536) {
+            self.push_byte((224 | (v >> 12)) as byte);
+            self.push_byte((128 | ((v >> 6) & 63)) as byte);
+            self.push_byte((128 | (v & 63)) as byte);
+        } else {
+            self.push_byte((240 | (v >> 18)) as byte);
+            self.push_byte((128 | ((v >> 12) & 63)) as byte);
+            self.push_byte((128 | ((v >> 6) & 63)) as byte);
+            self.push_byte((128 | (v & 63)) as byte);
+        }
+    }
+
+    pub bool starts_with(&const self, &const str prefix) {
+        usize n = prefix.len();
+        if (n > self.len) { return false; }
+        for (i in 0..n) {
+            if (unsafe { *((self.data as usize + i) as *const byte) != *((prefix.as_ptr() as usize + i) as *const byte) }) { return false; }
+        }
+        return true;
+    }
+    pub bool contains(&const self, &const str text) {
+        usize n = text.len();
+        if (n > self.len) { return false; }
+        for (start in 0..=(self.len - n)) {
+            bool same = true;
+            for (i in 0..n) {
+                if (unsafe { *((self.data as usize + start + i) as *const byte) != *((text.as_ptr() as usize + i) as *const byte) }) { same = false; break; }
+            }
+            if (same) { return true; }
+        }
+        return false;
+    }
+    /// Returns an owned copy with ASCII whitespace removed at both ends.
+    pub String trim(&const self) {
+        usize start = 0; usize end = self.len;
+        while (start < end) {
+            byte b = unsafe { *((self.data as usize + start) as *const byte) };
+            if (b != 32 && (b < 9 || b > 13)) { break; }
+            start += 1;
+        }
+        while (end > start) {
+            byte b = unsafe { *((self.data as usize + end - 1) as *const byte) };
+            if (b != 32 && (b < 9 || b > 13)) { break; }
+            end -= 1;
+        }
+        return String.from(unsafe { str_from_raw((self.data as usize + start) as *const byte, end - start) });
+    }
+    /// Splits on a nonempty separator; includes empty fields.
+    pub Vec<String> split(&const self, &const str separator) {
+        usize n = separator.len();
+        if (n == 0) { panic("split requires a nonempty separator"); }
+        Vec<String> parts = Vec.new();
+        usize start = 0; usize at = 0;
+        while (n <= self.len - at) {
+            bool same = true;
+            for (i in 0..n) {
+                if (unsafe { *((self.data as usize + at + i) as *const byte) != *((separator.as_ptr() as usize + i) as *const byte) }) { same = false; break; }
+            }
+            if (same) {
+                parts.push(String.from(unsafe { str_from_raw((self.data as usize + start) as *const byte, at - start) }));
+                at += n; start = at;
+            } else { at += 1; }
+        }
+        parts.push(String.from(unsafe { str_from_raw((self.data as usize + start) as *const byte, self.len - start) }));
+        return parts;
+    }
+    pub void clear(&self) { self.len = 0; }
+}
+
+/// An owning heap allocation for one sized value. Moving the Box keeps
+/// its value at the same address. into_inner explicitly moves the value out.
+pub struct Box<T> {
+    *T data;
+
+    pub Box<T> new(T value) {
+        var data = unsafe { synx_rt_alloc(size_of<T>()) as *T };
+        unsafe { *data = value; }
+        return Box { data: data };
+    }
+    pub &const T as_ref(&const self) { return unsafe { &const *self.data }; }
+    pub &T as_mut(&self) { return unsafe { &*self.data }; }
+    pub *const T as_ptr(&const self) { return self.data as *const T; }
+    pub *T as_mut_ptr(&self) { return self.data; }
+    pub T into_inner(self) {
+        unsafe {
+            var data = self.data;
+            T value = *data;
+            synx_rt_free(data as *byte);
+            self.data = 0 as *T;
+            return value;
+        }
+    }
+}
+impl<T> Drop for Box<T> {
+    void drop(&self) {
+        if (self.data as usize != 0) {
+            var data = self.data;
+            self.data = 0 as *T;
+            unsafe { drop_in_place<T>(data); synx_rt_free(data as *byte); }
+        }
+    }
+}
+
+/// A growable array of T.
+pub struct Vec<T> {
+    *T data;
+    usize len;
+    usize cap;
+
+    pub Vec<T> new() {
+        return Vec { data: 0 as *T, len: 0, cap: 0 };
+    }
+
+    pub usize len(&const self) { return self.len; }
+
+    pub bool is_empty(&const self) { return self.len == 0; }
+
+    pub usize capacity(&const self) { return self.cap; }
+    /// Raw pointers are valid only while the vector storage remains alive
+    /// and unchanged. Dereferencing them requires unsafe code.
+    pub *const T as_ptr(&const self) { return self.data as *const T; }
+    pub *T as_mut_ptr(&self) { return self.data; }
+
+    void reserve(&self, usize extra) {
+        usize limit = ~(0 as usize);
+        if (extra > limit - self.len) { panic("Vec capacity is too large"); }
+        usize need = self.len + extra;
+        if (size_of<T>() != 0 && need > limit / size_of<T>()) { panic("Vec capacity is too large"); }
+        if (need <= self.cap) { return; }
+        usize cap = if (self.cap == 0) { 4 } else { self.cap };
+        while (cap < need) {
+            if (cap > limit / 2) { cap = need; break; }
+            cap = cap * 2;
+        }
+        if (size_of<T>() != 0 && cap > limit / size_of<T>()) { cap = need; }
+        unsafe { self.data = synx_rt_realloc(self.data as *byte, cap * size_of<T>()) as *T; }
+        self.cap = cap;
+    }
+
+    pub void push(&self, T value) {
+        self.reserve(1);
+        unsafe { *((self.data as usize + self.len * size_of<T>()) as *T) = value; }
+        self.len += 1;
+    }
+
+    pub T? pop(&self) {
+        if (self.len == 0) { return None; }
+        self.len -= 1;
+        unsafe { return Some(*((self.data as usize + self.len * size_of<T>()) as *T)); }
+    }
+
+    pub (&const T)? get(&const self, usize index) {
+        if (index >= self.len) { return None; }
+        unsafe { return Some(&const *((self.data as usize + index * size_of<T>()) as *const T)); }
+    }
+
+    pub (&T)? get_mut(&self, usize index) {
+        if (index >= self.len) { return None; }
+        unsafe { return Some(&*((self.data as usize + index * size_of<T>()) as *T)); }
+    }
+
+    /// Exchange two elements without copying or dropping either value.
+    pub void swap(&self, usize left, usize right) {
+        if (left >= self.len || right >= self.len) { panic("Vec.swap index out of bounds"); }
+        if (left == right) { return; }
+        unsafe {
+            var a = (self.data as usize + left * size_of<T>()) as *T;
+            var b = (self.data as usize + right * size_of<T>()) as *T;
+            T temporary = *a;
+            *a = *b;
+            *b = temporary;
+        }
+    }
+
+    pub void clear(&self) {
+        while (self.len > 0) { var removed = self.pop(); }
+    }
+}
+// The raw storage is exclusively owned by these containers.
+unsafe impl Send for String {}
+unsafe impl Sync for String {}
+unsafe impl Owned for String {}
+unsafe impl<T: Send> Send for Vec<T> {}
+unsafe impl<T: Sync> Sync for Vec<T> {}
+unsafe impl<T: Owned> Owned for Vec<T> {}
+unsafe impl<T: Send> Send for Box<T> {}
+unsafe impl<T: Sync> Sync for Box<T> {}
+unsafe impl<T: Owned> Owned for Box<T> {}
+

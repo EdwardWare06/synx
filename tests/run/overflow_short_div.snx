@@ -1,0 +1,1 @@
+main() { short a = -32768; short b = -1; short result = a / b; if (result != -32768) { panic("wrong release result"); } }
