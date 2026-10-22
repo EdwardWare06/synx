@@ -1,0 +1,98 @@
+name: release
+
+# Started by hand from the Actions tab. Each host builds the C++ stage 0,
+# runs the full self-hosting bootstrap (stages 1, 2, and 3 must emit identical
+# objects), and builds its install package. With a tag, the packages are
+# attached to that existing release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag that receives the packages, such as v0.1.0. The packages are built from this tag. Empty builds the selected branch and keeps the packages as run artifacts only.
+        required: false
+        default: ''
+      overwrite:
+        description: Replace packages that the release already has. Off uploads only the missing packages.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - name: Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew list ninja >/dev/null 2>&1 || brew install ninja
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Stage 0 (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux
+      - name: Stage 0 (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cmake -S . -B build-win -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release || exit /b 1
+          cmake --build build-win || exit /b 1
+      - name: Bootstrap (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: scripts/bootstrap-linux.sh
+      - name: Bootstrap (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: scripts\bootstrap-win.cmd
+      - name: Package (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: scripts/package-linux.sh
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: scripts\package-win.cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ runner.os }}
+          path: dist/packages/*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    if: inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          cd packages
+          sha256sum *
+          existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for file in *; do
+            if [ "$OVERWRITE" != true ] && printf '%s\n' "$existing" | grep -qxF "$file"; then
+              echo "skip $file: the release already has it"
+              continue
+            fi
+            gh release upload "$TAG" "$file" --clobber --repo "$GITHUB_REPOSITORY"
+            echo "uploaded $file"
+          done
