@@ -52,14 +52,14 @@ jobs:
           cmake --build build-win || exit /b 1
       - name: Bootstrap (Linux and macOS)
         if: runner.os != 'Windows'
-        run: scripts/bootstrap-linux.sh
+        run: bash scripts/bootstrap-linux.sh
       - name: Bootstrap (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: scripts\bootstrap-win.cmd
       - name: Package (Linux and macOS)
         if: runner.os != 'Windows'
-        run: scripts/package-linux.sh
+        run: bash scripts/package-linux.sh
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: cmd
