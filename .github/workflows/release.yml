@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag that receives the packages, such as v0.1.0. The packages are built from this tag. Empty builds the selected branch and keeps the packages as run artifacts only.
+        description: Existing release tag that receives the packages, such as v0.1.0. Empty keeps the packages as run artifacts only. The packages are built from the selected branch, so pick a branch whose compiler source matches the tag.
         required: false
         default: ''
       overwrite:
@@ -28,8 +28,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.sha }}
       - name: Ninja (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ninja-build
