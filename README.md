@@ -2,7 +2,7 @@
 
 Synx is a programming language I designed and built from scratch, along with
 its compiler, standard library, and linker. It compiles straight to native
-x86-64 programs on Windows and Linux. Memory is managed with ownership and
+x86-64 programs on Windows, Linux, and macOS. Memory is managed with ownership and
 borrowing, there is no garbage collector, and the syntax looks like C.
 
 ```synx
@@ -75,10 +75,11 @@ don't need Visual Studio, a C compiler, or a system linker.
 |------|---------|
 | Windows x86-64 | `synx-0.1.0-windows-x86_64.zip` |
 | Linux x86-64 (glibc 2.34+) | `synx-0.1.0-linux-x86_64.tar.gz` |
+| macOS 10.15+ (Rosetta 2 on Apple Silicon) | `synx-0.1.0-macos-x86_64.tar.gz` |
 
 Windows: extract the zip and run `install.cmd`.
 
-Linux:
+Linux (on macOS, use `macos` in place of `linux`):
 
 ```text
 tar -xzf synx-0.1.0-linux-x86_64.tar.gz
@@ -112,7 +113,7 @@ synx run hello.snx
 ```
 
 `synx build hello.snx -o hello` makes an executable instead. The runtime
-library (`synx_rt.dll` or `libsynx_rt.so`) gets copied next to it. Copy
+library (`synx_rt.dll`, `libsynx_rt.so`, or `libsynx_rt.dylib`) gets copied next to it. Copy
 both files together and the program runs on another machine without Synx
 installed. `synx check` checks a file without building it, and `synx about`
 shows information about the build.
@@ -128,7 +129,8 @@ project:
   checks, and async conversion all run on it.
 - **Axon:** the code generator. It does register allocation, encodes x86-64
   instructions itself, and writes ELF, COFF, and Mach-O object files.
-- **Linker:** a built-in linker that writes Windows and Linux executables.
+- **Linker:** a built-in linker that writes Windows, Linux, and macOS
+  executables.
 - **Standard library:** written in Synx. String, Vec, HashMap, sorting,
   files, paths, text, math, threads, channels, and async tasks are all Synx
   code. A small C runtime handles the things that have to talk to the OS:
@@ -155,6 +157,8 @@ You only need this if you want to change the compiler.
   `scripts\build-win.cmd Release`
 - Linux: `build-essential`, `cmake`, and `ninja-build`, then
   `scripts/build-linux.sh Release`
+- macOS: the Xcode command line tools, `cmake`, and `ninja`, then
+  `scripts/build-linux.sh Release`
 
 Each script builds the compiler and runs the full test suite.
 `scripts\package-win.cmd` and `scripts/package-linux.sh` make the install
@@ -164,10 +168,9 @@ packages.
 
 Synx is at 0.1.0. It's a working language, but it's still early.
 
-- Windows and Linux on x86-64 are tested. The macOS code generator and
-  object writer exist, but the self-hosted compiler and packages haven't
-  been tested on macOS yet, so there's no macOS package.
-- No ARM64 support yet.
+- Windows, Linux, and macOS on x86-64 are tested. On Apple Silicon Macs,
+  Synx and the programs it builds run through Rosetta 2.
+- No ARM64 code generation yet.
 - It builds command-line programs. There are no GUI or web libraries yet,
   so the frontend part of the goal is still ahead.
 - Trait objects only work through references (`&dyn Trait`).

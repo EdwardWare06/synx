@@ -3,7 +3,7 @@
 #   ./install.sh                     copy to ~/.local/share/synx, link ~/.local/bin/synx
 #   ./install.sh --prefix DIR        copy to DIR
 #   ./install.sh --bindir DIR        create the synx link in DIR
-#   ./install.sh --no-path           do not add the link directory to ~/.profile
+#   ./install.sh --no-path           do not add the link directory to the shell profile
 #   ./install.sh --uninstall         remove the installed copy and its link
 set -eu
 
@@ -52,6 +52,11 @@ fi
 for item in bin lib std examples install.sh LICENSE-MIT LICENSE-APACHE; do
   cp -R -- "$source_dir/$item" "$prefix/"
 done
+# macOS marks files from a browser download as quarantined and then refuses
+# to run the unsigned compiler. Running this installer accepts the package.
+if [ "$(uname -s)" = Darwin ] && command -v xattr >/dev/null 2>&1; then
+  xattr -dr com.apple.quarantine "$prefix" 2>/dev/null || true
+fi
 if [ -d "$source_dir/libexec" ]; then cp -R -- "$source_dir/libexec" "$prefix/"; fi
 mkdir -p -- "$bindir"
 if [ -e "$link" ] && [ ! -L "$link" ]; then
@@ -65,7 +70,13 @@ case ":${PATH}:" in
   *) on_path=0 ;;
 esac
 if [ "$on_path" -eq 0 ] && [ "$update_path" -eq 1 ]; then
-  profile="${HOME}/.profile"
+  # Login shells read different files: zsh (the macOS default) reads
+  # ~/.zprofile, and bash reads ~/.bash_profile when it exists.
+  case "${SHELL:-}" in
+    */zsh) profile="${HOME}/.zprofile" ;;
+    */bash) if [ -f "${HOME}/.bash_profile" ]; then profile="${HOME}/.bash_profile"; else profile="${HOME}/.profile"; fi ;;
+    *) profile="${HOME}/.profile" ;;
+  esac
   line="export PATH=\"$bindir:\$PATH\""
   if ! grep -qxF -- "$line" "$profile" 2>/dev/null; then
     printf '\n# Added by the Synx installer\n%s\n' "$line" >> "$profile"

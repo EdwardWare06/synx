@@ -2,11 +2,12 @@
 
 Synx 0.1.0. Synx is a compiled language for systems code, applications,
 tools, and games. It uses ownership and borrowing in place of a garbage
-collector, and it compiles to native x86-64 programs for Windows and Linux.
+collector, and it compiles to native x86-64 programs for Windows, Linux, and
+macOS.
 
 ## Using Synx
 
-- [Installing Synx](guide/install.md): packages for Windows and Linux,
+- [Installing Synx](guide/install.md): packages for Windows, Linux, and macOS,
   `PATH` setup, and building from source.
 - [Getting started](guide/getting-started.md): the first program, compile
   errors, panics, and a program in two files.

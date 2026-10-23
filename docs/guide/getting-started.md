@@ -37,7 +37,7 @@ The build writes two files next to the source file:
 | File | Contents |
 |------|----------|
 | `hello.exe` (Windows) or `hello` (Linux) | The program. |
-| `synx_rt.dll` (Windows) or `libsynx_rt.so` (Linux) | The runtime library. The program needs it at startup. |
+| `synx_rt.dll` (Windows), `libsynx_rt.so` (Linux), or `libsynx_rt.dylib` (macOS) | The runtime library. The program needs it at startup. |
 
 Use `-o` to choose another output path. The folder must exist:
 

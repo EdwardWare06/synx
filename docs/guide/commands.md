@@ -33,7 +33,7 @@ prints the diagnostics and the error count to standard error and exits with
 status 1.
 
 The build also writes the runtime library (`synx_rt.dll` on Windows,
-`libsynx_rt.so` on Linux) to the folder of the executable. The file is not
+`libsynx_rt.so` on Linux, `libsynx_rt.dylib` on macOS) to the folder of the executable. The file is not
 written again if an identical copy is already there.
 
 Options can come before or after the file name:
