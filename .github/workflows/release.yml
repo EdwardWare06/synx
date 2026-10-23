@@ -53,9 +53,15 @@ jobs:
       - name: Package (Linux and macOS)
         if: runner.os != 'Windows'
         run: bash scripts/package-linux.sh
+      - name: Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y --no-progress
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: cmd
+        env:
+          SYNX_REQUIRE_INSTALLER: '1'
+          SYNX_TEST_INSTALLER: '1'
         run: scripts\package-win.cmd
       - uses: actions/upload-artifact@v4
         with:

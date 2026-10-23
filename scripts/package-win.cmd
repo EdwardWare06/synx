@@ -2,7 +2,8 @@
 rem Builds an installable Synx package on Windows.
 rem Usage: scripts\package-win.cmd
 rem Installs the compiler built by the seed release (stage 2) and checks it.
-rem Output: dist\packages\synx-<version>-windows-x86_64.zip
+rem Output: dist\packages\synx-<version>-windows-x86_64.zip, and
+rem synx-<version>-windows-x86_64-setup.exe when Inno Setup 6 is installed.
 setlocal
 call "%~dp0vcvars-win.cmd" || exit /b 1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0package-win.ps1" %*

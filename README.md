@@ -73,11 +73,11 @@ don't need Visual Studio, a C compiler, or a system linker.
 
 | Host | Package |
 |------|---------|
-| Windows x86-64 | `synx-0.1.0-windows-x86_64.zip` |
+| Windows x86-64 | `synx-0.1.0-windows-x86_64-setup.exe` or `synx-0.1.0-windows-x86_64.zip` |
 | Linux x86-64 (glibc 2.34+) | `synx-0.1.0-linux-x86_64.tar.gz` |
 | macOS 10.15+ (Rosetta 2 on Apple Silicon) | `synx-0.1.0-macos-x86_64.tar.gz` |
 
-Windows: extract the zip and run `install.cmd`.
+Windows: run the setup program, or extract the zip and run `install.cmd`.
 
 Linux (on macOS, use `macos` in place of `linux`):
 

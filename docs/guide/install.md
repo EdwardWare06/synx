@@ -7,7 +7,7 @@ build programs.
 
 | Host | Package | Requirements |
 |------|---------|--------------|
-| Windows | `synx-0.1.0-windows-x86_64.zip` | 64-bit Windows on x86-64 |
+| Windows | `synx-0.1.0-windows-x86_64-setup.exe` or `synx-0.1.0-windows-x86_64.zip` | 64-bit Windows on x86-64 |
 | Linux | `synx-0.1.0-linux-x86_64.tar.gz` | x86-64, glibc 2.34 or later |
 | macOS | `synx-0.1.0-macos-x86_64.tar.gz` | macOS 10.15 or later; Rosetta 2 on Apple Silicon |
 
@@ -16,6 +16,31 @@ the programs it builds run through Rosetta 2. If Rosetta 2 is not installed,
 install it with `softwareupdate --install-rosetta --agree-to-license`.
 
 ## Windows
+
+### Setup program
+
+1. Run `synx-0.1.0-windows-x86_64-setup.exe`.
+2. Select the install folder. The default is `%LOCALAPPDATA%\Programs\Synx`.
+3. Keep **Add Synx to my PATH** selected, then select **Install**.
+4. Open a new terminal and run `synx version`. The output is
+   `Synx 0.1.0 (windows)`.
+
+The setup program installs for the current user and does not need
+administrator rights. **Add Synx to my PATH** adds the `bin` folder to the
+user `PATH` and sets the user variable `SYNX_HOME`. The Start menu folder
+**Synx** has a command prompt that can run `synx` without a change to `PATH`.
+
+The setup program is not signed. Windows SmartScreen can show "Windows
+protected your PC". To continue, select **More info**, then **Run anyway**.
+
+To upgrade, run the setup program of the new version. It replaces the
+installed copy, including a copy installed from the zip file.
+
+To uninstall, open **Settings > Apps > Installed apps**, find **Synx**, and
+select **Uninstall**. The uninstaller removes the `PATH` entry and
+`SYNX_HOME`.
+
+### Zip file
 
 1. Extract the zip file to any folder.
 2. In the extracted folder, run `install.cmd`.

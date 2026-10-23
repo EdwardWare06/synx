@@ -74,3 +74,47 @@ if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 Push-Location -LiteralPath $stageRoot
 try { Invoke-Checked cmake @('-E', 'tar', 'cf', $zip, '--format=zip', $name) } finally { Pop-Location }
 Write-Output "Package: $zip"
+
+# The graphical installer needs Inno Setup 6 (ISCC.exe). SYNX_ISCC names it;
+# otherwise the usual install folders are searched. SYNX_REQUIRE_INSTALLER=1
+# makes a missing ISCC an error, as in the release workflow.
+$iscc = $env:SYNX_ISCC
+if (-not $iscc) {
+    $iscc = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+if (-not $iscc) {
+    if ($env:SYNX_REQUIRE_INSTALLER -eq '1') { throw 'Inno Setup 6 (ISCC.exe) was not found' }
+    Write-Output 'Installer: skipped, Inno Setup 6 (ISCC.exe) was not found'
+    return
+}
+$setup = Join-Path $out "$name-setup.exe"
+if (Test-Path -LiteralPath $setup) { Remove-Item -LiteralPath $setup -Force }
+Invoke-Checked $iscc @('/Q', "/DAppVersion=$version", "/DStageDir=$stage", "/DOutputDir=$out",
+    (Join-Path $root 'packaging\windows\synx.iss'))
+
+# The installer test registers Synx with Windows under the real AppId, so it
+# replaces the uninstall entry of an installed copy. It runs only when
+# SYNX_TEST_INSTALLER=1, as in the release workflow.
+if ($env:SYNX_TEST_INSTALLER -eq '1') {
+    $target = Join-Path $check 'setup Synx'
+    $process = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=""', "/DIR=`"$target`"")
+    if ($process.ExitCode -ne 0) { throw "setup failed with exit code $($process.ExitCode)" }
+    Invoke-WithoutToolchain {
+        $setupWorkbench = Join-Path $check 'workbench-setup.exe'
+        Invoke-Checked (Join-Path $target 'bin\synx.cmd') @('build', (Join-Path $target 'examples\workbench\main.snx'), '-o', $setupWorkbench)
+        $null | & $setupWorkbench > (Join-Path $check 'workbench-setup.out')
+        if ($LASTEXITCODE -ne 0) { throw "setup workbench failed with exit code $LASTEXITCODE" }
+    }
+    $process = Start-Process -FilePath (Join-Path $target 'unins000.exe') -Wait -PassThru -ArgumentList @(
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+    if ($process.ExitCode -ne 0) { throw "uninstall failed with exit code $($process.ExitCode)" }
+    # The uninstaller finishes from a temporary copy, so wait for the folder to go.
+    for ($i = 0; $i -lt 60 -and (Test-Path -LiteralPath $target); $i++) { Start-Sleep -Seconds 1 }
+    if (Test-Path -LiteralPath $target) { throw 'setup uninstall left files behind' }
+}
+Write-Output "Installer: $setup"
