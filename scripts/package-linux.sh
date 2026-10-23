@@ -42,7 +42,7 @@ native "$CHECK/workbench" < /dev/null > "$CHECK/workbench.out"
 run "$STAGE/install.sh" --prefix "$CHECK/home/synx" --bindir "$CHECK/home/bin" --no-path
 # The default package links with the built-in linker without a flag.
 linker_flag=(); if [[ "$COMPILER" == cpp ]]; then linker_flag=(--linker=builtin); fi
-native "$CHECK/home/bin/synx" build "$STAGE/examples/workbench/main.snx" -o "$CHECK/workbench-installed" "${linker_flag[@]}"
+native "$CHECK/home/bin/synx" build "$STAGE/examples/workbench/main.snx" -o "$CHECK/workbench-installed" ${linker_flag[@]+"${linker_flag[@]}"}
 native "$CHECK/workbench-installed" < /dev/null > /dev/null
 run "$CHECK/home/synx/install.sh" --prefix "$CHECK/home/synx" --bindir "$CHECK/home/bin" --uninstall
 if [[ -e "$CHECK/home/synx" || -L "$CHECK/home/bin/synx" ]]; then echo "uninstall left files behind" >&2; exit 1; fi
