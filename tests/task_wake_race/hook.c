@@ -1,6 +1,6 @@
 /* Test-only event adapter. Force a wake between the readiness read and the
  * retained-handle read. Production runtime sources remain unchanged.
- * Waker/WakeState and LocalSignal prefixes match compiler/prelude.snx and
+ * Waker/WakeState and LocalSignal prefixes match selfhost/prelude.snx and
  * std/task.snx. Only the event pointers are read; ownership stays in Synx. */
 #define synx_rt_event_take synx_test_event_take_original
 #include "../../runtime/synx_threads.c"

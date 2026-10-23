@@ -1,0 +1,4 @@
+// fixture: stored reference mutation
+// stage: full
+// expect: error while it is borrowed
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { int x=1; var m=HashMap<int,&const int>.new(); m.insert(1,&const x); x=2; m.len(); }

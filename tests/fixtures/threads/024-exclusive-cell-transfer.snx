@@ -1,0 +1,4 @@
+// fixture: exclusive cell transfer
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void transfer<T: Send>() {} main() { transfer<&Cell<int>>(); }

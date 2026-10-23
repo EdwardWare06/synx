@@ -1,0 +1,4 @@
+// fixture: int match
+// stage: check
+// expect: ok
+int f(int n) { match n { 0 => return 1, 1 | 2 => return 2, 3..=9 => return 3, _ => return 0 } }

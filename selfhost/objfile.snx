@@ -1,5 +1,4 @@
-/// ELF64, COFF and Mach-O object serialization. Source: compiler/src/objfile.cpp.
-/// Parity: tests/selfhost_backend_test.cpp, selfhost_backend_0..3.
+/// ELF64, COFF and Mach-O object serialization. Ported from compiler/src/objfile.cpp.
 /// Input owns text, read-only data, symbols and section-relative relocations.
 /// Output owns the complete file bytes; input remains unchanged.
 /// Relocation fields must fit their selected section. Sizes must fit the target

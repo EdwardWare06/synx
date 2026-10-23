@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (* (unary - x) (unary ! y))
+f() { var e = -x * !y; }

@@ -1,0 +1,6 @@
+// fixture: display in interp
+// stage: check
+// expect: ok
+struct V { int x; }
+impl Display for V { String to_string(&const self) { return String.from("v"); } }
+main() { var v = V { x: 1 }; print("{v} and {v.x}"); }

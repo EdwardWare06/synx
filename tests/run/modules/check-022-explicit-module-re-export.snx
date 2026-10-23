@@ -1,0 +1,4 @@
+// fixture: explicit module re-export
+// stage: full
+// expect: ok
+import export_child; main() { int n = export_child.child.value(); }

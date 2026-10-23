@@ -1,6 +1,5 @@
 /// Linear scan register allocation for Axon's scalar locals. Source:
 /// compiler/src/regalloc.cpp, a function-by-function port.
-/// Parity: tests/selfhost_modules_test.cpp (all stage, machine section).
 /// Each statement and terminator is one event at an even position; uses
 /// precede definitions. Block liveness iterates to a fixed point in reverse
 /// block order. Scalar locals that are never pinned to a stack slot get an

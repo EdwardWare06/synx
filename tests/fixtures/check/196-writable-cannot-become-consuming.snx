@@ -1,0 +1,4 @@
+// fixture: writable cannot become consuming
+// stage: check
+// expect: error type mismatch
+main() { fn once() -> int f=|| 1; }

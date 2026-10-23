@@ -1,0 +1,4 @@
+// fixture: cannot move callee in arguments
+// stage: full
+// expect: error use of moved value
+int take(fn(int) -> int f) { return 1; } main() { var f = |int n| n; int x = f(take(f)); }

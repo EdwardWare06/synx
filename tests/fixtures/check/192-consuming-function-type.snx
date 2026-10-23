@@ -1,0 +1,4 @@
+// fixture: consuming function type
+// stage: check
+// expect: ok
+int f(fn once(int) -> int value) { return value(1); } main() { int n=f(once |int n| n); }

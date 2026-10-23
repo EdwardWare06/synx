@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse errors 4
+enum E { A { int x; ) int y } }

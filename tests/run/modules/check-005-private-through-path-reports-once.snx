@@ -1,0 +1,4 @@
+// fixture: private through path reports once
+// stage: check
+// expect: errors 1
+import private; main() { int n = private.secret(); }

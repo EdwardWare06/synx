@@ -1,0 +1,4 @@
+// fixture: async trait method
+// stage: check
+// expect: error async trait
+trait T { async int f(&self); }

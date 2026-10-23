@@ -1,0 +1,4 @@
+// fixture: int plus float
+// stage: check
+// expect: error same type
+main() { var a = 1 + 2.0; }

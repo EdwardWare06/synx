@@ -1,0 +1,4 @@
+// fixture: reference alias retains stored loan
+// stage: full
+// expect: error while it is borrowed
+main() { int x = 1; Vec<&const int> v = Vec.new(); var p = &v; p.push(&const x); x = 2; int n = *v[0]; }

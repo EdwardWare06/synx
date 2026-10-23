@@ -1,0 +1,4 @@
+// fixture: dyn static method
+// stage: check
+// expect: error cannot be used as dyn
+trait T { int f(); } f(&const dyn T t) {}

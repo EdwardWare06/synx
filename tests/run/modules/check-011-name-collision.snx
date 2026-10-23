@@ -1,0 +1,4 @@
+// fixture: name collision
+// stage: full
+// expect: error conflicts
+import left.make; int make() { return 0; } main() {}

@@ -1,0 +1,7 @@
+// fixture: ref result borrows args
+// stage: full
+// expect: ok
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+&const S pick(&const S a, &const S b) { return a; }
+main() { var x = S { a: 1 }; var y = S { a: 2 }; var r = pick(&const x, &const y); int v = r.get(); x.a = 3; }

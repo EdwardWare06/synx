@@ -1,0 +1,4 @@
+// fixture: literal takes type
+// stage: check
+// expect: ok
+main() { byte b = 255; usize n = 3; }

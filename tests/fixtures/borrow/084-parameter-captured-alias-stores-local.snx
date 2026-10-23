@@ -1,0 +1,4 @@
+// fixture: parameter captured alias stores local
+// stage: full
+// expect: error does not live past
+void f(&Vec<&const int> v) { var callback=|&const int r| v.push(r); int n=1; callback(&const n); }

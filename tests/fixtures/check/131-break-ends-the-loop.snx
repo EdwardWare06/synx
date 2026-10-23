@@ -1,0 +1,5 @@
+// fixture: break ends the loop
+// stage: check
+// expect: error missing return value
+int f() { loop { break; } }
+main() { }

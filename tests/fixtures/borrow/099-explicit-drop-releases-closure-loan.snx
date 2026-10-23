@@ -1,0 +1,4 @@
+// fixture: explicit drop releases closure loan
+// stage: full
+// expect: ok
+import std.mem; main() { int x=1; var f=[&x] || x; int n=f(); mem.drop(f); x=2; }

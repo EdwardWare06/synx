@@ -1,0 +1,4 @@
+// fixture: task holds moved reference
+// stage: full
+// expect: error writable
+async int f(&int r) { return *r; } main() { int n=1; var task=f(&n); int value=n; }

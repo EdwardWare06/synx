@@ -1,0 +1,4 @@
+// fixture: send is still an identifier
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; int send(int n) { return n; } main() { int send = 4; int n = send; }

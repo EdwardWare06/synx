@@ -1,0 +1,4 @@
+// fixture: async main
+// stage: check
+// expect: error main must be synchronous
+async main() {}

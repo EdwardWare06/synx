@@ -1,0 +1,6 @@
+// fixture: try outside result
+// stage: check
+// expect: error needs the function to return a Result
+enum E { Bad }
+Result<int, E> p() { return Ok(1); }
+int q() { return p()?; }

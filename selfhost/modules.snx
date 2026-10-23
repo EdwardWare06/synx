@@ -1,5 +1,4 @@
-/// Module discovery and import binding. Source: compiler/src/modules.cpp.
-/// Parity: tests/selfhost_modules_test.cpp.
+/// Module discovery and import binding. Ported from compiler/src/modules.cpp.
 /// Discovery is depth first. File identity breaks cycles and hard-link aliases.
 /// Binding runs to a fixed point. Namespace overlays belong to one importer.
 /// Sources and syntax trees remain owned by file ID until all passes finish.

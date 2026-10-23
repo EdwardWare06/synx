@@ -1,0 +1,4 @@
+// fixture: async cannot return frame reference
+// stage: full
+// expect: error does not live past
+async &const int f() { int n=1; return &const n; }

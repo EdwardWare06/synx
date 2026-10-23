@@ -1,0 +1,4 @@
+// fixture: explicit generic destructor
+// stage: check
+// expect: error cannot be called explicitly
+void f<T: Drop>(&T value) { value.drop(); }

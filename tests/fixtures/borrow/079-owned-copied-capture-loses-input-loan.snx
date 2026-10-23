@@ -1,0 +1,4 @@
+// fixture: owned copied capture loses input loan
+// stage: full
+// expect: ok
+fn() -> usize make(&const str text) { var owned=String.from(text); return || owned.len(); } main() { fn() -> usize f; { var text=String.from("copy"); f=make(text); } usize n=f(); }

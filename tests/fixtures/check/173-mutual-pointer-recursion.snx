@@ -1,0 +1,4 @@
+// fixture: mutual pointer recursion
+// stage: check
+// expect: ok
+struct A { Box<B>? next; } struct B { Box<A>? next; }

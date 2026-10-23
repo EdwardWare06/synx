@@ -1,0 +1,4 @@
+// fixture: dyn reborrow
+// stage: check
+// expect: ok
+trait Shape { int area(&const self); void grow(&self, int n); } struct Sq { int side; } impl Shape for Sq { int area(&const self) { return self.side * self.side; } void grow(&self, int n) { self.side += n; } } main() { var s = Sq { side: 2 }; &dyn Shape r = &s; var q = &const r; int a = q.area(); r.grow(2); }

@@ -1,0 +1,4 @@
+// fixture: effect join retains both argument origins
+// stage: full
+// expect: error scope
+&const int choose(bool side,&const int left,&const int right) { var value=left; if(side) { value=right; } return value; } main() { int outer=1; &const int saved; { int inner=2; saved=choose(false,outer,inner); } print("{*saved}"); }

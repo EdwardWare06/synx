@@ -1,0 +1,4 @@
+// fixture: option
+// stage: check
+// expect: ok
+main() { int? a = Some(5); int? b = None; var c = a ?? 0; bool s = a.is_some(); }

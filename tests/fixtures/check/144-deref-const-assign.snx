@@ -1,0 +1,4 @@
+// fixture: deref const assign
+// stage: check
+// expect: error read only
+main() { int a = 1; var r = &const a; *r = 2; }

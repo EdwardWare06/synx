@@ -1,0 +1,4 @@
+// fixture: str_from_raw unsafe
+// stage: check
+// expect: error str_from_raw requires an unsafe block
+main() { var s = str_from_raw(0 as *const byte, 0); }

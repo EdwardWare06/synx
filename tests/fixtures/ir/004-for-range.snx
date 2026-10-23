@@ -1,0 +1,4 @@
+// fixture: for range
+// stage: full
+// expect: ir has Range<int> {const 0_int, const 10_int}
+main() { int s = 0; for (i in 0..10) { s += i; } }

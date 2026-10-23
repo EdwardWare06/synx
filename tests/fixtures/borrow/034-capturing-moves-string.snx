@@ -1,0 +1,4 @@
+// fixture: capturing moves string
+// stage: full
+// expect: error use of moved value
+main() { String text = String.from("x"); var f = || text.len(); print(text); }

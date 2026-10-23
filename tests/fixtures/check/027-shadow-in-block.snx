@@ -1,0 +1,4 @@
+// fixture: shadow in block
+// stage: check
+// expect: ok
+main() { int x = 1; { int x = 2; } x = 3; }

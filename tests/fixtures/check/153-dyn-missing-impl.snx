@@ -1,0 +1,4 @@
+// fixture: dyn missing impl
+// stage: check
+// expect: error does not implement
+trait Shape { int area(&const self); void grow(&self, int n); } struct Sq { int side; } impl Shape for Sq { int area(&const self) { return self.side * self.side; } void grow(&self, int n) { self.side += n; } } main() { int x = 1; &const dyn Shape d = &const x; }

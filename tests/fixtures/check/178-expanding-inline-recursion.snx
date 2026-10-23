@@ -1,0 +1,4 @@
+// fixture: expanding inline recursion
+// stage: check
+// expect: error inline layout
+struct A<T> { A<Vec<T>> a; }

@@ -1,0 +1,4 @@
+// fixture: unsized reference pointer cast
+// stage: check
+// expect: error cannot cast
+void f(&const int[] x) { var p=x as *const int; }

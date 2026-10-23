@@ -1,0 +1,4 @@
+// fixture: moved field is named
+// stage: full
+// expect: error use of moved value `a.bpm`
+struct S { String name; int bpm; } main() { var a = S { name: String.from("x"), bpm: 5 }; var b = a; print("{a.bpm}"); }

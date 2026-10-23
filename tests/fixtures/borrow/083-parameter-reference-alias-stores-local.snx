@@ -1,0 +1,4 @@
+// fixture: parameter reference alias stores local
+// stage: full
+// expect: error does not live past
+void f(&Vec<&const int> v) { var w=v; int n=1; w.push(&const n); }

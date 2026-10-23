@@ -1,5 +1,5 @@
 /// Type interning, predicates, formatting, and substitution parity.
-/// Oracle: tests/selfhost_types_test.cpp. Includes the full identity matrix.
+/// Includes the full identity matrix.
 import types.{TypeContext, TypeKind, InferKind, Subst};
 import ids.{TypeId, DefId, DefKind};
 import ast.{PrimKind, CallMode};

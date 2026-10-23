@@ -1,0 +1,4 @@
+// fixture: shared cell reference rejected
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void transfer<T: Send>() {} main() { transfer<&const Cell<int>>(); }

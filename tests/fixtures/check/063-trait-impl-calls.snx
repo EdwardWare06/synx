@@ -1,0 +1,9 @@
+// fixture: trait impl calls
+// stage: check
+// expect: ok
+trait Shape { double area(&const self); &const str name(&const self) { return "shape"; } }
+struct Circle { double r; }
+struct Sq { double s; }
+impl Shape for Circle { double area(&const self) { return 3.0 * self.r * self.r; } }
+impl Shape for Sq { double area(&const self) { return self.s * self.s; } &const str name(&const self) { return "sq"; } }
+main() { var c = Circle { r: 1.0 }; var a = c.area(); var n = c.name(); var s = Sq { s: 2.0 }; var m = s.name(); }

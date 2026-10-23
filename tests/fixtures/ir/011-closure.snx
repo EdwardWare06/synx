@@ -1,0 +1,4 @@
+// fixture: closure
+// stage: full
+// expect: ok
+main() { var f = |int a| a + 1; }

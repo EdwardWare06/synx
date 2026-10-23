@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (unary - 1)
+f() { match x { -1 => { } } }

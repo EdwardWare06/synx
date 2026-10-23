@@ -1,0 +1,4 @@
+// fixture: bounded struct signature
+// stage: check
+// expect: error does not implement 'Eq'
+struct S<T: Eq> {} void f(S<fn()> value) {}

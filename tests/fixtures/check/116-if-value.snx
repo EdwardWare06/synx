@@ -1,0 +1,4 @@
+// fixture: if value
+// stage: check
+// expect: ok
+main() { int x = 5; var sign = if (x < 0) { -1 } else { 1 }; }

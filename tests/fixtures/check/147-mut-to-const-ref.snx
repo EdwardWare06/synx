@@ -1,0 +1,5 @@
+// fixture: mut to const ref
+// stage: check
+// expect: ok
+f(&const int x) { }
+main() { int a = 1; var r = &a; f(r); }

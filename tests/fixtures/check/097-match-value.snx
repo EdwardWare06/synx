@@ -1,0 +1,5 @@
+// fixture: match value
+// stage: check
+// expect: ok
+enum Token { Number(int), Plus, End }
+int f(Token t) { return match t { Token.Number(n) => n, _ => 0 }; }

@@ -1,5 +1,5 @@
-/// Lexer state machine. Source: compiler/src/lexer.cpp.
-/// Parity: tests/selfhost_lexer_test.cpp. Preserves recovery and token payloads.
+/// Lexer state machine. Ported from compiler/src/lexer.cpp.
+/// Preserves recovery and token payloads.
 import bytes;
 import source.{SourceFile, Span};
 import diagnostics.{DiagnosticSink, Severity};

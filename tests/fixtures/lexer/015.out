@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+59-60 string start
+60-61 interpolation start
+61-62 Ident x
+62-63 interpolation end
+63-64 string end
+65-65 end of file
+--- stderr

@@ -1,0 +1,4 @@
+// fixture: local reference alias preserves returned argument
+// stage: full
+// expect: error scope
+&const int relay(&const int value) { Option<&const int> owner=None; var alias=&owner; *alias=Some(value); return owner.unwrap(); } main() { &const int saved; { int inner=5; saved=relay(inner); } print("{*saved}"); }

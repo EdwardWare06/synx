@@ -1,0 +1,6 @@
+// fixture: copy impl enum
+// stage: check
+// expect: ok
+enum E { A(int), B }
+impl Copy for E { }
+main() { }

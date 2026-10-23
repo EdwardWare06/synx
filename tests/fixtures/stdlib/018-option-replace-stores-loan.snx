@@ -1,0 +1,4 @@
+// fixture: option replace stores loan
+// stage: full
+// expect: error scope
+import std.fs.File; main() { int outer=1; var option=Some(&const outer); { int inner=2; var old=option.replace(&const inner); } int n=*option.unwrap(); }

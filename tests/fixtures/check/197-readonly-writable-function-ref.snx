@@ -1,0 +1,4 @@
+// fixture: readonly writable function ref
+// stage: check
+// expect: error writable access
+int call(&const fn() -> int f) { return f(); }

@@ -1,0 +1,4 @@
+// fixture: borrow ends
+// stage: full
+// expect: ok
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m=HashMap<int,int>.new(); m.insert(1,1); { var r=m.get(1); r.is_some(); } m.insert(2,2); }

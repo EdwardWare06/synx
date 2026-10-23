@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (while (< i 10) (block (+= i 1)))
+f() { while (i < 10) { i += 1; } }

@@ -1,0 +1,4 @@
+// fixture: parameter call-result alias stores local
+// stage: full
+// expect: error does not live past
+T id<T>(T value) { return value; } void f(&Vec<&const int> v) { var w=id(v); int n=1; w.push(&const n); }

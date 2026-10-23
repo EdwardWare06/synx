@@ -1,0 +1,6 @@
+// fixture: not struct
+// stage: check
+// expect: ok
+struct Flag { bool value; }
+impl Not for Flag { Flag not(self) { return Flag { value: !self.value }; } }
+main() { Flag value = !Flag { value: true }; }

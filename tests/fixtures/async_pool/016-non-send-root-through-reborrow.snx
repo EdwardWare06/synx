@@ -1,0 +1,4 @@
+// fixture: non-send root through reborrow
+// stage: full
+// expect: error SNX0420
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send int job() { var c = Arc.new(Cell.new(3)); var a = c.get(); var r = &const *a; await yield_now(); return r.get(); }

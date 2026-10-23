@@ -1,0 +1,4 @@
+// fixture: box shared loan
+// stage: full
+// expect: error borrowed
+main() { var b = Box<int>.new(1); var r = b.as_ref(); *b.as_mut() = 2; int n = *r; }

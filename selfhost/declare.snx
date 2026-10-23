@@ -1,5 +1,4 @@
-/// Declaration pass. Source: Resolver::declare_items in compiler/src/resolve.cpp.
-/// Parity: tests/selfhost_modules_test.cpp.
+/// Declaration pass. Ported from Resolver::declare_items in compiler/src/resolve.cpp.
 /// Register builtins once, declare prelude, then user modules before signatures.
 /// Duplicate records remain in arenas; only the first global binding is kept.
 import ast;

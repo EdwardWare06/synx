@@ -1,0 +1,4 @@
+// fixture: private destructuring
+// stage: full
+// expect: error private to module
+import private; main() { var s = private.make(); match s { private.Hidden { n } => { int value = n; } } }

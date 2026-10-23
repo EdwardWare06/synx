@@ -1,0 +1,4 @@
+// fixture: closure retained in struct
+// stage: full
+// expect: error scope
+struct Holder { fn() -> int f; } main() { Holder h; { int x=1; h=Holder { f:[&const x] || x }; } int n=h.f(); }

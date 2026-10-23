@@ -1,0 +1,5 @@
+// fixture: vec to slice
+// stage: check
+// expect: ok
+f(&const int[] s) { }
+main() { Vec<int> v = Vec.new(); f(v); }

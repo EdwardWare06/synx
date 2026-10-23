@@ -1,0 +1,4 @@
+// fixture: str_from_raw in unsafe
+// stage: check
+// expect: ok
+main() { var s = unsafe { str_from_raw(0 as *const byte, 0) }; }

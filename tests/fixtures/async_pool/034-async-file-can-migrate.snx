@@ -1,0 +1,4 @@
+// fixture: async file can migrate
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; import std.asyncio.AsyncFile; void allowed<T: Send + Sync + Owned>() {} main() { allowed<AsyncFile>(); }

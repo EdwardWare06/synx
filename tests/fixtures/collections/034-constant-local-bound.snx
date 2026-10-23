@@ -1,0 +1,4 @@
+// fixture: constant local bound
+// stage: full
+// expect: error does not implement
+import std.collections.{HashMap, sort}; import std.hash.Hash; const VALUE={ HashMap<double,int> m; 1 }; main() {}

@@ -1,0 +1,4 @@
+// fixture: not primitive operands
+// stage: check
+// expect: ok
+main() { bool b = !true; int bits = 1; int other = !bits; }

@@ -137,9 +137,10 @@ project:
   startup, memory, I/O, threads, and clocks.
 
 The compiler is self-hosted. I started with a compiler in C++, then moved
-the whole compiler over to Synx. The C++ compiler builds the Synx compiler, that
-compiler builds itself, and the output has to match byte for byte between
-stages. The packages ship the compiler that was compiled by itself.
+the whole compiler over to Synx and retired the C++ version after 0.1.0. Now
+the previous Synx release builds the compiler, that compiler builds itself,
+and the output has to match byte for byte between stages. The packages ship
+the compiler that was compiled by itself.
 
 The component names come from my interest in neuroscience. A dendrite takes
 in signals for a neuron and an axon sends them out, so Dendrite is where the
@@ -151,7 +152,11 @@ and gym math in pounds: sets, reps, plates, and adding weight each set. There ar
 
 ## Building from source
 
-You only need this if you want to change the compiler.
+You only need this if you want to change the compiler. The build downloads
+the Synx 0.1.0 release to compile the compiler with. To use a Synx you
+already have, pass `-DSYNX_SEED=<path to the synx executable>` to CMake. A C
+compiler builds the runtime and a C++ compiler builds the test programs, and
+Python 3 runs the tests.
 
 - Windows: Visual Studio Build Tools with the C++ workload, then
   `scripts\build-win.cmd Release`

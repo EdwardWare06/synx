@@ -1,0 +1,4 @@
+// fixture: shared borrowed mutation
+// stage: full
+// expect: error shared reference
+main() { int x=1; var r=&x; var f=const || { *r=2; }; }

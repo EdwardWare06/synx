@@ -1,5 +1,4 @@
-/// Dendrite intermediate representation. Source: compiler/include/synx/ir.hpp.
-/// Parity: tests/selfhost_modules_test.cpp (lower, borrow, async stages).
+/// Dendrite intermediate representation. Ported from compiler/include/synx/ir.hpp.
 /// Functions and vtables are arena indexes into Module; NONE is absent.
 /// Enum orders match C++ because the strict dump prints ordinals.
 import ids.{TypeId, DefId, NONE};

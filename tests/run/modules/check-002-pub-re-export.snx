@@ -1,0 +1,4 @@
+// fixture: pub re-export
+// stage: full
+// expect: ok
+import facade; main() { var a = facade.make(); var t = facade.Token.End; }

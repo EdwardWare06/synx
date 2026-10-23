@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (interp (call (. p len)))
+f() { var e = "{p.len()}"; }

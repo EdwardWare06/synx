@@ -1,0 +1,4 @@
+// fixture: writable capture blocks read
+// stage: full
+// expect: error borrowed
+main() { int x=1; var f=[&x] || { x+=1; x }; int n=x; int m=f(); }

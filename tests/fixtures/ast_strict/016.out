@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+(Module [(Enum @75-92:0 "" f "E" [] [(Variant @84-85:0 "" "A" unit [] []) (Variant @87-90:0 "" "B" tuple [] [])] [])])
+--- stderr

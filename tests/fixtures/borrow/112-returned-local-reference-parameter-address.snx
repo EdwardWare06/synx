@@ -1,0 +1,4 @@
+// fixture: returned local reference parameter address
+// stage: full
+// expect: error does not live past the function
+&const (&const int) f(&const int p) { return &const p; }

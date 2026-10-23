@@ -1,0 +1,4 @@
+// fixture: async borrows local across await
+// stage: full
+// expect: ok
+import std.task.yield_now; async int f() { int n=1; var r=&const n; await yield_now(); return *r; }

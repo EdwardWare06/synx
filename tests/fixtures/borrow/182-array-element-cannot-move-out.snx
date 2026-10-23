@@ -1,0 +1,4 @@
+// fixture: array element cannot move out
+// stage: full
+// expect: error cannot move an element out of `a`
+struct D { int id; } impl Drop for D { void drop(&self) {} } main() { D[2] a = [D { id: 1 }, D { id: 2 }]; var n = a[0]; }

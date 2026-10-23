@@ -1,0 +1,4 @@
+// fixture: nested source declaration
+// stage: full
+// expect: ok
+import nested_user; main() { var p = nested_user.make(); int x = p.x; }

@@ -1,0 +1,4 @@
+// fixture: reassigned alias keeps provenance
+// stage: full
+// expect: error same owner
+struct S { int x; (&const int)? r; } void init(&S owner, &const S other) { var alias=&const *owner; var r=&const alias.x; alias=other; owner.r=Some(r); }

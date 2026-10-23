@@ -1,0 +1,4 @@
+// fixture: shared ownership excludes borrowed payloads
+// stage: full
+// expect: error does not implement 'Owned'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var a = Arc.new(Mutex.new(Vec<&const int>.new())); var b = a.clone(); }

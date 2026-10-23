@@ -1,0 +1,6 @@
+// fixture: copy impl bounded param
+// stage: check
+// expect: ok
+struct W<T> { T v; }
+impl<T: Copy> Copy for W<T> { }
+main() { var w = W { v: 1 }; var a = w; var b = w; }

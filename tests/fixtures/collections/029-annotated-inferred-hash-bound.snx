@@ -1,0 +1,4 @@
+// fixture: annotated inferred Hash bound
+// stage: full
+// expect: error does not implement
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { HashMap<double,int> m=HashMap.new(); }

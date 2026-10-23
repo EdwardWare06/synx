@@ -1,0 +1,4 @@
+// fixture: literal minima and explicit casts
+// stage: full
+// expect: ok
+import std.fs.File; main() { byte b=256 as byte; int i=-2147483648; short s=-32768; long l=-9223372036854775808; ulong u=18446744073709551615; }

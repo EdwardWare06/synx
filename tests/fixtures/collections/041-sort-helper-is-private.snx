@@ -1,0 +1,4 @@
+// fixture: sort helper is private
+// stage: full
+// expect: error private to module
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var v=Vec<int>.new(); std.collections.sift_down(&v,0,1); }

@@ -1,0 +1,4 @@
+// fixture: parent namespace stays private
+// stage: full
+// expect: error private to module
+import export_child; main() { int n = export_child.bundle.base(); }

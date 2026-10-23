@@ -1,5 +1,5 @@
-/// Source bytes and positions. Source: compiler/src/source.cpp.
-/// Parity: tests/selfhost_lexer_test.cpp. Positions count bytes.
+/// Source bytes and positions. Ported from compiler/src/source.cpp.
+/// Positions count bytes.
 import bytes;
 import std.fs;
 

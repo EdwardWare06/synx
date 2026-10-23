@@ -1,0 +1,5 @@
+// fixture: copy twice
+// stage: full
+// expect: ok
+f(int x) { }
+main() { int x = 1; f(x); f(x); }

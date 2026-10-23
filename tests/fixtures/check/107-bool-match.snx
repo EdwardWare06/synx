@@ -1,0 +1,4 @@
+// fixture: bool match
+// stage: check
+// expect: ok
+int f(bool b) { match b { true => return 1, false => return 0 } }

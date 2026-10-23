@@ -1,6 +1,5 @@
 /// Borrow checking and drop elaboration over Dendrite. Source:
 /// compiler/src/borrow.cpp, a function-by-function port.
-/// Parity: tests/selfhost_modules_test.cpp (borrow stage).
 /// Runs move analysis, drop elaboration, liveness, and loan checking per
 /// lowered function. Sets are sorted vectors so iteration order, and with it
 /// the first reported conflict, matches std::set in C++.

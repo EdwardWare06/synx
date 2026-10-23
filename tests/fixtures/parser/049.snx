@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (match t (arm (Some v) v) (arm None 0))
+f() { var e = match t { Some(v) => v, None => 0 }; }

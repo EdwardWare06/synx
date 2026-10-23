@@ -1,0 +1,4 @@
+// fixture: init on one path
+// stage: full
+// expect: error may not be assigned on every path
+main() { int x; if (true) { x = 1; } int y = x; }

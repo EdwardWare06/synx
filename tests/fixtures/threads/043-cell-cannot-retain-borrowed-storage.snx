@@ -1,0 +1,4 @@
+// fixture: cell cannot retain borrowed storage
+// stage: full
+// expect: error does not implement 'Owned'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { int n = 1; var c = Cell.new(&const n); }

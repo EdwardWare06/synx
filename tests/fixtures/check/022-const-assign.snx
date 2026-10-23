@@ -1,0 +1,4 @@
+// fixture: const assign
+// stage: check
+// expect: error read only
+main() { const x = 5; x = 6; }

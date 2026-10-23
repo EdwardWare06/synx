@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (>> a 2)
+f() { var e = a >> 2; }

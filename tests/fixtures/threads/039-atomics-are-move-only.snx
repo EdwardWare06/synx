@@ -1,0 +1,4 @@
+// fixture: atomics are move only
+// stage: full
+// expect: error moved value
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var a = AtomicUsize.new(0); var b = a; a.load(); }

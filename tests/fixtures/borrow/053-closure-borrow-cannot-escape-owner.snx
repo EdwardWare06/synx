@@ -1,0 +1,4 @@
+// fixture: closure borrow cannot escape owner
+// stage: full
+// expect: error does not live past the function
+&const int make() { int x = 1; var f = || &const x; return f(); }

@@ -1,0 +1,5 @@
+// fixture: fn ends in loop
+// stage: check
+// expect: ok
+int f() { loop { return 1; } }
+main() { f(); }

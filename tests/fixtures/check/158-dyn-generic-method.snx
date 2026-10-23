@@ -1,0 +1,4 @@
+// fixture: dyn generic method
+// stage: check
+// expect: error cannot be used as dyn
+trait T { int f<U>(&const self, U v); } f(&const dyn T t) {}

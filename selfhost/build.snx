@@ -1,4 +1,4 @@
-/// Source-to-executable orchestration. Source: compiler/src/build.cpp.
+/// Source-to-executable orchestration. Ported from compiler/src/build.cpp.
 /// Compilation owns every source, semantic record and IR value until Axon ends.
 /// The system linker inherits standard streams; no shell parses path arguments.
 import driver_options.BuildOptions;

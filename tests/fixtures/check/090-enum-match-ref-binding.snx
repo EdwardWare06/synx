@@ -1,0 +1,5 @@
+// fixture: enum match ref binding
+// stage: check
+// expect: error found '&const int'
+enum Token { Number(int), Plus, End }
+int f(&const Token t) { match t { Token.Number(n) => return n, _ => return 1 } }

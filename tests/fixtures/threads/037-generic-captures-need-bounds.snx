@@ -1,0 +1,4 @@
+// fixture: generic captures need bounds
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void launch<T>(T x) { thread.spawn(send once || x); }

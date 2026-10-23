@@ -1,0 +1,4 @@
+// fixture: bounded map parameter
+// stage: full
+// expect: ok
+import std.collections.{HashMap, sort}; import std.hash.Hash; void f<K:Hash+Eq,V>(HashMap<K,V> m) {}

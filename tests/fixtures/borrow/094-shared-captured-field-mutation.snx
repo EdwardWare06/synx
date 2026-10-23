@@ -1,0 +1,4 @@
+// fixture: shared captured field mutation
+// stage: full
+// expect: error shared reference
+struct S { &int r; } main() { int x=1; var s=S { r:&x }; var f=[&const s] || { *s.r=2; }; }

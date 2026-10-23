@@ -1,0 +1,6 @@
+// fixture: not inferred result
+// stage: check
+// expect: ok
+struct Flag { bool value; }
+impl Not for Flag { Flag not(self) { return Flag { value: !self.value }; } }
+main() { var value = !Flag { value: true }; bool b = value.value; }

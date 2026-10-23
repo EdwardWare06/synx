@@ -1,5 +1,5 @@
 /// Checker results. Source: CheckResult, NameRef, Coercion, LocalVar in
-/// compiler/include/synx/check.hpp. Parity: tests/selfhost_check_test.cpp.
+/// compiler/include/synx/check.hpp.
 /// Tables iterate in first-insertion order, matching InsertionMap in C++.
 /// Keys identify syntax nodes by file and arena index (see node keys below);
 /// records hold IDs only and no references into syntax or semantic arenas.

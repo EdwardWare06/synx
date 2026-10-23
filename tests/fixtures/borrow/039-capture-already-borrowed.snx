@@ -1,0 +1,4 @@
+// fixture: capture already borrowed
+// stage: full
+// expect: error while it is borrowed
+main() { String text = String.from("x"); var r = &const text; var f = || text.len(); print(r); }

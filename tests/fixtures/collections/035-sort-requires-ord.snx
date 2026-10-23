@@ -1,0 +1,4 @@
+// fixture: sort requires Ord
+// stage: full
+// expect: error does not implement
+import std.collections.{HashMap, sort}; import std.hash.Hash; struct Unordered {} main() { var v=Vec<Unordered>.new(); sort(&v); }

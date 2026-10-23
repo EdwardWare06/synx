@@ -1,0 +1,6 @@
+// fixture: result and try
+// stage: check
+// expect: ok
+enum E { Bad }
+Result<int, E> p(int n) { if (n < 0) { return Err(E.Bad); } return Ok(n); }
+Result<int, E> q() { int a = p(1)?; int b = p(2)?; return Ok(a + b); }

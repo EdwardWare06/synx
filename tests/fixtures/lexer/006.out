@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+59-60 IntLit 0
+60-62 ..
+62-64 IntLit 10
+65-65 end of file
+--- stderr

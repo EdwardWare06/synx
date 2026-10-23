@@ -1,0 +1,4 @@
+// fixture: missing wake receiver
+// stage: full
+// expect: error SNX0419
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct W {} impl Wake for W { void wake(&const W value) {} }

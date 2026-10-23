@@ -1,0 +1,4 @@
+// fixture: constant import cycle
+// stage: full
+// expect: error cyclic constant
+import const_a; main() {}

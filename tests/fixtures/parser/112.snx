@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (fn f (ret Result<int, E>) (params) (block))
+Result<int, E> f() { }

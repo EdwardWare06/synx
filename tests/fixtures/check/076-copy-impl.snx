@@ -1,0 +1,7 @@
+// fixture: copy impl
+// stage: check
+// expect: ok
+struct P { int a; }
+impl Copy for P { }
+f(P p) { }
+main() { var p = P { a: 1 }; f(p); f(p); }

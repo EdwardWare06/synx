@@ -1,0 +1,5 @@
+// fixture: empty dyn
+// stage: check
+// expect: ok
+trait T { }
+f(&const dyn T x) { }

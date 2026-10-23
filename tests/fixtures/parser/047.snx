@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (if (< x 0) (block (tail (unary - 1))) (block (tail 1)))
+f() { var e = if (x < 0) { -1 } else { 1 }; }

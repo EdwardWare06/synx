@@ -1,5 +1,4 @@
-/// Byte-buffer operations. Source: compiler/src/source.cpp and lexer.cpp.
-/// Parity: tests/selfhost_lexer_test.cpp.
+/// Byte-buffer operations. Ported from compiler/src/source.cpp and lexer.cpp.
 /// Returns zero outside the buffer. Embedded zero bytes remain source data.
 pub byte at(&const Vec<byte> data, usize index) {
     if (index >= data.len()) { return 0; }

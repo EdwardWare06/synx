@@ -1,0 +1,7 @@
+// fixture: use after move
+// stage: full
+// expect: error use of moved value `x`
+struct S { int a; }
+impl Drop for S { void drop(&self) { } }
+f(S s) { }
+main() { var x = S { a: 1 }; f(x); f(x); }

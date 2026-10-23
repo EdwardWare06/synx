@@ -1,0 +1,4 @@
+// fixture: forged non-sync reference
+// stage: full
+// expect: error SNX0420
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send int job() { &const Cell<int> r = unsafe { &const *(123 as *Cell<int>) }; await yield_now(); return r.get(); }

@@ -1,0 +1,5 @@
+// fixture: type args count
+// stage: check
+// expect: error expects 1 type argument
+struct S<T> { T a; }
+f(S x) { }

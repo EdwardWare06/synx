@@ -1,0 +1,4 @@
+// fixture: nested stored references
+// stage: full
+// expect: error does not live past this scope
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var outer=Vec<HashMap<int,&const int>>.new(); { int x=1; var m=HashMap<int,&const int>.new(); m.insert(1,&const x); outer.push(m); } outer.len(); }

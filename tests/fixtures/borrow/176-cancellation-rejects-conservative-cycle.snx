@@ -1,0 +1,4 @@
+// fixture: cancellation rejects conservative cycle
+// stage: full
+// expect: error destructors borrow each other
+import std.task.yield_now; async void f(bool side) { fn const()->int first=const || 1; fn const()->int second=const || 2; if (side) { second=[&const first] const || first(); } else { first=[&const second] const || second(); } loop { await yield_now(); } }

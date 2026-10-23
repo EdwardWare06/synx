@@ -1,0 +1,4 @@
+// fixture: raw pointer suspension
+// stage: full
+// expect: error SNX0420
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send usize job() { var p = 0 as *int; await yield_now(); return p as usize; }

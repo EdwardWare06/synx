@@ -1,0 +1,4 @@
+// fixture: nested reference cannot escape
+// stage: full
+// expect: error does not live past
+fn() -> fn() -> int make() { int x=1; var r=&const x; return || || *r; }

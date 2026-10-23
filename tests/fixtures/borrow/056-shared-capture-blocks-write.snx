@@ -1,0 +1,4 @@
+// fixture: shared capture blocks write
+// stage: full
+// expect: error borrowed
+main() { int x=1; var f=[&const x] || x; x=2; int n=f(); }

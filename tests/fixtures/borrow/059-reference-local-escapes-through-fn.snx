@@ -1,0 +1,4 @@
+// fixture: reference local escapes through fn
+// stage: full
+// expect: error does not live past
+fn() -> int make() { int x=1; var r=&const x; return || *r; }

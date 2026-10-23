@@ -1,0 +1,5 @@
+// fixture: shorthand
+// stage: check
+// expect: ok
+struct P { int a; }
+main() { int a = 1; var p = P { a }; }

@@ -1,0 +1,5 @@
+// fixture: if value
+// stage: full
+// expect: ir has -(const 1_int)
+// expect: ir has call @fmt_int(
+main() { int x = 5; var sign = if (x < 0) { -1 } else { 1 }; print("{sign}"); }

@@ -1,0 +1,4 @@
+// fixture: borrowed manual future output is external
+// stage: full
+// expect: ok
+struct F { int n; } impl Future<&const int> for F { Poll<&const int> poll(&self,Waker wake) { return Poll.Ready(&const self.n); } } async &const int f(&F future) { return await future; }

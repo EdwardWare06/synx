@@ -1,0 +1,4 @@
+// fixture: break outside
+// stage: check
+// expect: error break outside a loop
+main() { break; }

@@ -1,0 +1,4 @@
+// fixture: wake payload must own
+// stage: full
+// expect: error does not implement 'Owned'
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct W { &const int p; } impl Wake for W { void wake(&const self) {} } main() { int x = 0; var w = Waker.from(W { p: &const x }); }

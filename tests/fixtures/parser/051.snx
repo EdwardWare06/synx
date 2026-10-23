@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (match x (arm _ 1))
+f() { var e = match x { _ => 1 }; }

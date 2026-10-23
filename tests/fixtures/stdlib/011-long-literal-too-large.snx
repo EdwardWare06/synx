@@ -1,0 +1,4 @@
+// fixture: long literal too large
+// stage: full
+// expect: error SNX0413
+import std.fs.File; main() { long x=9223372036854775808; }

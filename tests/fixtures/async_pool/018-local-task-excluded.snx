@@ -1,0 +1,4 @@
+// fixture: local task excluded
+// stage: full
+// expect: error SNX0420
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async int local() { return 1; } async send int job() { return await local(); }

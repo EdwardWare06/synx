@@ -1,0 +1,4 @@
+// fixture: negative literal too small
+// stage: full
+// expect: error SNX0413
+import std.fs.File; main() { int x=-2147483649; }

@@ -1,0 +1,5 @@
+// fixture: if
+// stage: full
+// expect: ir has switch copy _1 [1: bb
+int f(bool b) { if (b) { return 1; } else { return 2; } }
+main() { f(true); }

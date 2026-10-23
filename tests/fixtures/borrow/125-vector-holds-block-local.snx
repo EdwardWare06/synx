@@ -1,0 +1,4 @@
+// fixture: vector holds block local
+// stage: full
+// expect: error does not live past this scope
+main() { Vec<&const int> refs = Vec.new(); { int n = 1; refs.push(&const n); } int n = *refs[0]; }

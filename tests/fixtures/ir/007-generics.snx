@@ -1,0 +1,13 @@
+// fixture: generics
+// stage: full
+// expect: ir has fn twice<Sq>(
+// expect: ir has fn id<int>(
+// expect: ir has fn id<bool>(
+// expect: ir has fn Sq.Shape.area(
+// expect: ir has call Sq.Shape.area(
+trait Shape { double area(&const self); }
+struct Sq { double s; }
+impl Shape for Sq { double area(&const self) { return self.s * self.s; } }
+double twice<T: Shape>(&const T a) { return a.area() * 2.0; }
+T id<T>(T x) { return x; }
+main() { var q = Sq { s: 2.0 }; double t = twice(&const q); int i = id(1); bool b = id(true); }

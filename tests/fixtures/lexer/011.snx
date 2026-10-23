@@ -1,0 +1,4 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+"hello" "a\tb\n" "{{x}}" "\u{48}i" ""

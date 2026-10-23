@@ -1,0 +1,5 @@
+// fixture: extern unsafe
+// stage: check
+// expect: ok
+extern "C" { int puts(*const byte s); }
+main() { unsafe { puts(0 as *const byte); } }

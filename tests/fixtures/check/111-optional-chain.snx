@@ -1,0 +1,5 @@
+// fixture: optional chain
+// stage: check
+// expect: ok
+struct P { int a; }
+main() { P? p = Some(P { a: 1 }); int? a = p?.a; }

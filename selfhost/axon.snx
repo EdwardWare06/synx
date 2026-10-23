@@ -1,6 +1,5 @@
-/// Axon: x86-64 instruction selection. Source: compiler/src/axon.cpp, a
+/// Axon: x86-64 instruction selection. Ported from compiler/src/axon.cpp, a
 /// function-by-function port.
-/// Parity: tests/selfhost_modules_test.cpp (all stage, object section).
 /// Synx to Synx calls copy arguments into an outgoing area at the bottom of
 /// the caller's frame, each rounded up to 8 bytes; the callee reads them at
 /// [rbp + 16 + offset]. Results up to 8 bytes return in rax, up to 16 in

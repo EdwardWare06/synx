@@ -1,0 +1,4 @@
+// fixture: async cannot return closure borrowing frame
+// stage: full
+// expect: error does not live past
+async fn const() -> int f() { int n=1; return [&const n] const || n; }

@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+(Module [(FunctionItem @84-96:0 "note" f (Function @84-96:0 "note" f f f (PrimitiveType @84-88:0 void) "f" @89-90:0 [] [] (Block @93-96:0 [] nil)))])
+--- stderr

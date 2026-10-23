@@ -1,0 +1,4 @@
+// fixture: capture list is complete
+// stage: full
+// expect: error not in the capture list
+main() { int x=1; int y=2; var f=[x] || x+y; }

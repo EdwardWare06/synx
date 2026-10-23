@@ -1,0 +1,5 @@
+// fixture: examples style
+// stage: full
+// expect: ok
+struct Inv { Vec<String> items; void add(&self, String n) { self.items.push(n); } }
+main() { var inv = Inv { items: Vec.new() }; inv.add(String.from("a")); var r = &inv; r.add(String.from("b")); print("{r.items.len()}"); print("{inv.items.len()}"); }

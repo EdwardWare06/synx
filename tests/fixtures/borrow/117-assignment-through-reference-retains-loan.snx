@@ -1,0 +1,4 @@
+// fixture: assignment through reference retains loan
+// stage: full
+// expect: error while it is borrowed
+main() { int x = 1; int y = 2; var a = Some(&const x); var p = &a; *p = Some(&const y); y = 3; bool b = a.is_some(); }

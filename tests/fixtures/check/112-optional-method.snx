@@ -1,0 +1,5 @@
+// fixture: optional method
+// stage: check
+// expect: ok
+struct P { int a; int get(&const self) { return self.a; } }
+main() { P? p = None; int? a = p?.get(); }

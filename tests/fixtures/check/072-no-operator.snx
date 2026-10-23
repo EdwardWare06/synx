@@ -1,0 +1,5 @@
+// fixture: no operator
+// stage: check
+// expect: error implement the trait 'Add'
+struct V { int x; }
+main() { var a = V { x: 1 }; var c = a + a; }

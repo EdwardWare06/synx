@@ -1,0 +1,10 @@
+exit 0
+--- stdout
+59-66 StringLit "hello"
+67-75 StringLit "a	b
+"
+76-83 StringLit "{x}"
+84-93 StringLit "Hi"
+94-96 StringLit ""
+97-97 end of file
+--- stderr

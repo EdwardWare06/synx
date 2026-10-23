@@ -1,0 +1,4 @@
+// fixture: dyn unsized return
+// stage: check
+// expect: error unsized
+trait T {} dyn T f() { panic("no"); }

@@ -1,0 +1,4 @@
+// fixture: deref assign
+// stage: check
+// expect: ok
+main() { int a = 1; var r = &a; *r = 2; }

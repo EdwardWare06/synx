@@ -1,0 +1,4 @@
+// fixture: declared ret
+// stage: check
+// expect: ok
+int add(int a, int b) { return a + b; }

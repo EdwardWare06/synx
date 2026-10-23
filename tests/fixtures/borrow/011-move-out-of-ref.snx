@@ -1,0 +1,7 @@
+// fixture: move out of ref
+// stage: full
+// expect: error cannot move
+struct S { int a; }
+impl Drop for S { void drop(&self) { } }
+f(S s) { }
+g(&const S r) { f(*r); }

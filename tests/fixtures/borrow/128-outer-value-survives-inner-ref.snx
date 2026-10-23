@@ -1,0 +1,4 @@
+// fixture: outer value survives inner ref
+// stage: full
+// expect: ok
+main() { int n = 1; { var r = &const n; int value = *r; } n = 2; }

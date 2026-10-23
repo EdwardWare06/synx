@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (enum Option (generics (T)) (variant None) (variant Some T))
+enum Option<T> { None, Some(T), }

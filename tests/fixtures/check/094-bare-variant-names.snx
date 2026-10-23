@@ -1,0 +1,5 @@
+// fixture: bare variant names
+// stage: check
+// expect: ok
+enum Token { Number(int), Plus, End }
+int f(Token t) { match t { Number(n) => return n, Plus => return 1, End => return 2 } }

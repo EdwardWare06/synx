@@ -1,0 +1,4 @@
+// fixture: explicit drop moves owner
+// stage: full
+// expect: error moved
+import std.fs.File; import std.mem; main() { var b=Box<int>.new(1); mem.drop(b); int n=*b.as_ref(); }

@@ -1,0 +1,4 @@
+// fixture: send function storage
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; fn once send() -> int make() { return send once || 7; } main() { var f = make(); thread.spawn(f); }

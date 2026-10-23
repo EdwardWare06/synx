@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has std.io.File
+void f(std.io.File x) { }

@@ -1,0 +1,5 @@
+// fixture: mut of temp
+// stage: check
+// expect: error temporary
+f(&int x) { }
+main() { f(&5); }

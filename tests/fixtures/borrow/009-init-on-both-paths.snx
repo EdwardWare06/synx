@@ -1,0 +1,4 @@
+// fixture: init on both paths
+// stage: full
+// expect: ok
+main() { int x; if (true) { x = 1; } else { x = 2; } int y = x; }

@@ -1,5 +1,4 @@
-/// Interned semantic types and substitution. Source: compiler/src/types.cpp.
-/// Parity: tests/selfhost_types_test.cpp.
+/// Interned semantic types and substitution. Ported from compiler/src/types.cpp.
 /// TypeId identity defines equality. Inference variables always get fresh IDs.
 /// Nominal names are copied at declaration; the definition ID defines identity.
 import ids.{TypeId, DefId, DefKind, NONE};

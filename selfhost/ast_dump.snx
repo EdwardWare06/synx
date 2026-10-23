@@ -1,5 +1,4 @@
-/// Strict AST serialization. Source: compiler/src/ast_strict.cpp.
-/// Parity: tests/selfhost_parser_test.cpp.
+/// Strict AST serialization. Ported from compiler/src/ast_strict.cpp.
 import ast;
 import bytes;
 import source.Span;

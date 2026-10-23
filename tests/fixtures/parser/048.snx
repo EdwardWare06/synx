@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (if a (block (tail 1)) (if b (block (tail 2)) (block (tail 3))))
+f() { var e = if (a) { 1 } else if (b) { 2 } else { 3 }; }

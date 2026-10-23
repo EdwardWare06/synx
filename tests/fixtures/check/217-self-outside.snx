@@ -1,0 +1,4 @@
+// fixture: self outside
+// stage: check
+// expect: error only allowed in a method
+f(&self) { }

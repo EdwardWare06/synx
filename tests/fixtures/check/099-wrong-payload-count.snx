@@ -1,0 +1,5 @@
+// fixture: wrong payload count
+// stage: check
+// expect: error has 1 fields
+enum Token { Number(int), Plus, End }
+main() { var t = Token.Plus; match t { Token.Number(a, b) => { } _ => { } } }

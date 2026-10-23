@@ -1,0 +1,4 @@
+// fixture: bounded struct field
+// stage: check
+// expect: error does not implement 'Eq'
+struct S<T: Eq> {} struct Outer { S<fn()> field; }

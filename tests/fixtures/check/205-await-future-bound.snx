@@ -1,0 +1,4 @@
+// fixture: await future bound
+// stage: check
+// expect: ok
+async T f<T,F:Future<T>>(F future) { return await future; }

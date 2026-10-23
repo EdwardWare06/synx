@@ -1,0 +1,4 @@
+// fixture: nested ownership capture
+// stage: full
+// expect: error cannot move
+main() { String text = String.from("x"); var f = || { var g = || text.len(); g() }; }

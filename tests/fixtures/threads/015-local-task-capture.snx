@@ -1,0 +1,4 @@
+// fixture: local task capture
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; async int job() { return 2; } main() { var task = job(); thread.spawn(send once || { var owned = task; }); }

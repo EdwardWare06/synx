@@ -1,0 +1,4 @@
+// fixture: send task cannot be shared
+// stage: full
+// expect: error does not implement 'Sync'
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; void allowed<T: Sync>() {} main() { allowed<SendTask<int>>(); }

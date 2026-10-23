@@ -1,0 +1,4 @@
+// fixture: self borrowed aggregate
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct Borrow { &const Cell<int> c; } async send int job() { var c = Cell.new(3); var r = Borrow { c: &const c }; await yield_now(); return r.c.get(); }

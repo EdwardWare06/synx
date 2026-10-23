@@ -1,0 +1,4 @@
+// fixture: cond not bool
+// stage: check
+// expect: error type mismatch in if condition
+main() { if (1) { } }

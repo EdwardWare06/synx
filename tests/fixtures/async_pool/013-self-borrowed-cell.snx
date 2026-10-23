@@ -1,0 +1,4 @@
+// fixture: self borrowed cell
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send int job() { var c = Cell.new(3); var r = &const c; await yield_now(); return r.get(); }

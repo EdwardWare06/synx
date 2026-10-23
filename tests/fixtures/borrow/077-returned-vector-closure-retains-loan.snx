@@ -1,0 +1,4 @@
+// fixture: returned vector closure retains loan
+// stage: full
+// expect: error scope
+Vec<fn() -> int> make(&const int x) { Vec<fn() -> int> out=Vec.new(); out.push(|| *x); return out; } main() { Vec<fn() -> int> out; { int n=1; out=make(&const n); } usize count=out.len(); }

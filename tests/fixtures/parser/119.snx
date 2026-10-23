@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (struct Point (field double x) (field double y))
+struct Point { double x; double y; }

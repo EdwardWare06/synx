@@ -1,0 +1,6 @@
+// fixture: read while mut
+// stage: full
+// expect: error while it is borrowed as writable
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+main() { var x = S { a: 1 }; var r = &x; int a = x.a; r.bump(); }

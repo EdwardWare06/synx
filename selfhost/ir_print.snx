@@ -1,4 +1,4 @@
-/// Human Dendrite output. Source: compiler/src/ir_print.cpp.
+/// Human Dendrite output. Ported from compiler/src/ir_print.cpp.
 /// Strict pass-oracle output stays in module_dump.snx.
 import ir;
 import ids.{TypeId, NONE};

@@ -1,0 +1,4 @@
+// fixture: parameter reference alias reads
+// stage: full
+// expect: ok
+usize f(&Vec<&const int> v) { var w=v; return w.len(); }

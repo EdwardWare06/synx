@@ -1,0 +1,4 @@
+// fixture: vector holds loop local
+// stage: full
+// expect: error scope
+main() { Vec<&const int> refs = Vec.new(); for (n in 0..3) { refs.push(&const n); } int n = *refs[0]; }

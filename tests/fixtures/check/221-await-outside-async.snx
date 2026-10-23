@@ -1,0 +1,5 @@
+// fixture: await outside async
+// stage: check
+// expect: error requires an async
+f() { await g(); }
+g() { }

@@ -1,0 +1,4 @@
+// fixture: async output signature mismatch
+// stage: full
+// expect: error does not match
+struct S {} impl Future<int> for S { int poll(&self,Waker wake) { return 1; } } async void f() { await S {}; }

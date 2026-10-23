@@ -1,5 +1,4 @@
-/// Body checker. Source: compiler/src/check.cpp, a function-by-function port.
-/// Parity: tests/selfhost_check_test.cpp.
+/// Body checker. Ported from compiler/src/check.cpp, a function-by-function port.
 /// Inference variables bind through a trail so snapshots can roll back.
 /// Function contexts are frames in a stack; closures name their enclosing
 /// frame and share the locals of the root frame, as FnCtx does in C++.

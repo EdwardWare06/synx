@@ -1,0 +1,4 @@
+// fixture: canonical file aliases
+// stage: full
+// expect: ok
+import utils; import utils.mod; int use(utils.Tag t) { return t.n; } main() { var t = mod.Tag { n: 2 }; int n = use(t); }

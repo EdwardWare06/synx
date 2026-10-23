@@ -1,0 +1,5 @@
+// fixture: arm types
+// stage: check
+// expect: error different types
+enum Token { Number(int), Plus, End }
+main() { var t = Token.Plus; var x = match t { Token.Plus => 1, _ => "a" }; }

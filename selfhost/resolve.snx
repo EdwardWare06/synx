@@ -1,6 +1,5 @@
 /// Signature resolution. Source: Resolver::resolve_signatures, resolve_type,
 /// resolve_bound, lookup_path, and resolve_function_signature in compiler/src/resolve.cpp.
-/// Parity: tests/selfhost_modules_test.cpp (signatures mode).
 /// Runs once after declaration and import binding succeed. Order: struct fields,
 /// enum payloads, trait bounds, impl headers, function signatures, impl/trait
 /// method sets, then const types. Each definition resolves in its own module.

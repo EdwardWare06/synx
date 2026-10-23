@@ -1,0 +1,4 @@
+// fixture: moved function cannot be called
+// stage: full
+// expect: error use of moved value
+main() { var f = || 1; var g = f; int x = f(); }

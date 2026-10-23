@@ -1,0 +1,4 @@
+// fixture: send closure retained
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send int job() { var f = send once || 3; await yield_now(); return f(); }

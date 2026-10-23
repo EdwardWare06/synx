@@ -1,0 +1,4 @@
+// fixture: file transfer
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; import std.fs.File; void valid<T: Send + Owned>() {} main() { valid<File>(); }

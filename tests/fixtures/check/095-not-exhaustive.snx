@@ -1,0 +1,5 @@
+// fixture: not exhaustive
+// stage: check
+// expect: error missing: Number
+enum Token { Number(int), Plus, End }
+int f(Token t) { match t { Token.Plus => return 1, Token.End => return 2 } }

@@ -1,0 +1,4 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+"a {x} b {p.len()} c"

@@ -1,0 +1,9 @@
+// fixture: assoc as method
+// stage: check
+// expect: error associated function
+struct Point { double x; double y;
+  double len(&const self) { return self.x * self.x + self.y * self.y; }
+  void scale(&self, double k) { self.x *= k; self.y *= k; }
+  Point origin() { return Point { x: 0.0, y: 0.0 }; }
+}
+main() { var p = Point.origin(); var q = p.origin(); }

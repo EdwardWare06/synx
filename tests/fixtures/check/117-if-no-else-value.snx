@@ -1,0 +1,4 @@
+// fixture: if no else value
+// stage: check
+// expect: error cannot produce a value
+main() { var s = if (true) { 1 }; }

@@ -1,0 +1,4 @@
+// fixture: return own field
+// stage: full
+// expect: ok
+struct S { int x; (&const int)? r; } &const int view(&const S owner) { return &const owner.x; }

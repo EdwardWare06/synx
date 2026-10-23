@@ -1,0 +1,4 @@
+// fixture: assigned local cannot escape parameter
+// stage: full
+// expect: error does not live past the function
+void fill(&(&const int) p) { int n = 1; *p = &const n; }

@@ -1,0 +1,4 @@
+// fixture: task cannot escape block local
+// stage: full
+// expect: error does not live past
+async int f(&const int r) { return *r; } Task<int> g() { int n=1; return f(&const n); }

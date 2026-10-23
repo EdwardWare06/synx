@@ -1,0 +1,4 @@
+// fixture: option mutable loan
+// stage: full
+// expect: error borrowed
+import std.fs.File; main() { int? x=Some(1); var r=x.as_mut(); var old=x.take(); int n=*r.unwrap(); }

@@ -1,0 +1,4 @@
+// fixture: raw pointer needs unsafe
+// stage: full
+// expect: error unsafe
+import std.fs.File; main() { var v=Vec<int>.new(); var p=v.as_mut_ptr(); *p=1; }

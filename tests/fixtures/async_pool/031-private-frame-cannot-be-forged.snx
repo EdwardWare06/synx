@@ -1,0 +1,4 @@
+// fixture: private frame cannot be forged
+// stage: full
+// expect: error private to module
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; main() { SendTask<int> task = SendTask { frame: 0 as *byte }; }

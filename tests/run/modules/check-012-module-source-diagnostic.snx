@@ -1,0 +1,4 @@
+// fixture: module source diagnostic
+// stage: full
+// expect: error broken.snx:2:12
+import broken; main() {}

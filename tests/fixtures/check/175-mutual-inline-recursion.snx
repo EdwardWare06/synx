@@ -1,0 +1,4 @@
+// fixture: mutual inline recursion
+// stage: check
+// expect: error inline layout
+struct A { B b; } struct B { A a; }

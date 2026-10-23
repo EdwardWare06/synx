@@ -1,0 +1,4 @@
+// fixture: bad cast
+// stage: check
+// expect: error cannot cast
+main() { var s = "a" as int; }

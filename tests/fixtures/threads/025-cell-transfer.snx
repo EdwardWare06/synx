@@ -1,0 +1,4 @@
+// fixture: cell transfer
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var c = Cell.new(2); thread.spawn(send once || c.get()); }

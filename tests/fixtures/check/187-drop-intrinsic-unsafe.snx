@@ -1,0 +1,4 @@
+// fixture: drop intrinsic unsafe
+// stage: check
+// expect: error requires an unsafe block
+main() { drop_in_place<int>(0 as *int); }

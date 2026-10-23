@@ -1,0 +1,11 @@
+exit 1
+--- stdout
+59-64 Error unterminated string literal
+65-68 Kw int
+69-70 Ident x
+70-71 ;
+72-72 end of file
+--- stderr
+<file>:4:1: error[SNX0102]: unterminated string literal
+4 | "open
+  | ^^^^^

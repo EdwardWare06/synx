@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (if a (block (call b)))
+f() { if (a) { b(); } }

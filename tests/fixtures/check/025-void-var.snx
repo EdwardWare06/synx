@@ -1,0 +1,5 @@
+// fixture: void var
+// stage: check
+// expect: error void value
+f() { }
+main() { var x = f(); }

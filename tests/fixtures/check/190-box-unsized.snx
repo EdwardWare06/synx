@@ -1,0 +1,4 @@
+// fixture: box unsized
+// stage: check
+// expect: error unsized
+trait T {} main() { var b = Box<dyn T>.new(1); }

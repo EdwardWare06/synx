@@ -1,0 +1,4 @@
+// fixture: inferred literal too large
+// stage: full
+// expect: error SNX0413
+import std.fs.File; main() { var x=4294967295; }

@@ -1,0 +1,4 @@
+// fixture: mutex tracks stored loans
+// stage: full
+// expect: error does not live past this scope
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { int anchor = 1; var m = Mutex.new(&const anchor); { int local = 2; var g = m.lock(); *g.get_mut() = &const local; } { var g = m.lock(); print("{**g.get()}"); } }

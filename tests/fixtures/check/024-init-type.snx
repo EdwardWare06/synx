@@ -1,0 +1,4 @@
+// fixture: init type
+// stage: check
+// expect: error type mismatch in variable initializer
+main() { int x = "s"; }

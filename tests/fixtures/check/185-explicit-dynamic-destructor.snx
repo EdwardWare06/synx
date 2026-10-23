@@ -1,0 +1,4 @@
+// fixture: explicit dynamic destructor
+// stage: check
+// expect: error cannot be called explicitly
+void f(&dyn Drop value) { value.drop(); }

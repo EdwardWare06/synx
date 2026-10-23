@@ -1,0 +1,4 @@
+// fixture: alias receiver does not store itself
+// stage: full
+// expect: ok
+struct S { Vec<&const int> refs; void add(&self, &const int value) { var refs=&self.refs; refs.push(value); refs.clear(); } }

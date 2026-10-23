@@ -1,0 +1,9 @@
+// fixture: assign through const ref
+// stage: check
+// expect: error read only
+struct Point { double x; double y;
+  double len(&const self) { return self.x * self.x + self.y * self.y; }
+  void scale(&self, double k) { self.x *= k; self.y *= k; }
+  Point origin() { return Point { x: 0.0, y: 0.0 }; }
+}
+f(&const Point p) { p.x = 1.0; }

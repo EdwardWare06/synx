@@ -1,0 +1,4 @@
+// fixture: unsafe deref
+// stage: check
+// expect: error requires an unsafe block
+main() { *int p = 0 as *int; int x = *p; }

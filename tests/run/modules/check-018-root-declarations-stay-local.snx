@@ -1,0 +1,4 @@
+// fixture: root declarations stay local
+// stage: full
+// expect: error unknown name 'only_root'
+import foreign_root; int only_root() { return 1; } main() {}

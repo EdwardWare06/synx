@@ -1,0 +1,4 @@
+// fixture: nested borrow of outer capture
+// stage: full
+// expect: error borrowed
+fn() -> int make() { int x=1; var outer=|| [&const x] || x; return outer(); }

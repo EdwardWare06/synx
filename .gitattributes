@@ -8,4 +8,11 @@
 *.stdin binary
 scripts/synx text eol=lf
 # Preserve the exact bytes of the former embedded bootstrap prelude.
-compiler/prelude.snx whitespace=-blank-at-eof
+selfhost/prelude.snx whitespace=-blank-at-eof
+
+# Fixture snapshots compare exact bytes; the CRLF fixture keeps its line ends.
+tests/fixtures/**/*.out text eol=lf
+tests/fixtures/lexer/crlf-*.snx -text
+tests/fixtures/lexer/crlf-*.out -text
+tests/cli/snapshots/*.txt text eol=lf
+tests/cli/driver_core.bin binary

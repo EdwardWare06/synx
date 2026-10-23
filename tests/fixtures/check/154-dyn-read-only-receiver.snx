@@ -1,0 +1,4 @@
+// fixture: dyn read only receiver
+// stage: check
+// expect: error read only
+trait Shape { int area(&const self); void grow(&self, int n); } struct Sq { int side; } impl Shape for Sq { int area(&const self) { return self.side * self.side; } void grow(&self, int n) { self.side += n; } } f(&const dyn Shape s) { s.grow(2); }

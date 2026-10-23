@@ -1,0 +1,4 @@
+// fixture: explicit unsized reference impl
+// stage: check
+// expect: ok
+trait Marker {} impl<T> Marker for &const T {} impl Marker for &const str {} void take<X:Marker>(X value) {} main() { take("text"); }

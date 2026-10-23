@@ -1,5 +1,4 @@
-/// Diagnostic storage and byte rendering. Source: compiler/src/diagnostics.cpp.
-/// Parity: tests/selfhost_lexer_test.cpp.
+/// Diagnostic storage and byte rendering. Ported from compiler/src/diagnostics.cpp.
 import source.{Span, SourceFile};
 import bytes;
 

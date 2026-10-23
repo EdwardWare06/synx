@@ -1,0 +1,4 @@
+// fixture: returned reference parameter capture
+// stage: full
+// expect: ok
+fn() -> int make(&const int x) { return || *x; } main() { int x=1; var f=make(&const x); int n=f(); }

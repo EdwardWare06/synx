@@ -1,0 +1,4 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+0..10

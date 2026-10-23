@@ -1,0 +1,4 @@
+// fixture: async cannot use consumed task
+// stage: full
+// expect: error moved
+async int f() { return 1; } async void g() { var task=f(); await task; await task; }

@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (..= 0 9)
+f() { match x { 0..=9 => { } } }

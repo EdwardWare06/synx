@@ -1,0 +1,4 @@
+// fixture: return type of main
+// stage: check
+// expect: type main void
+main() { panic("x"); }

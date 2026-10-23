@@ -1,0 +1,4 @@
+// fixture: shared cell rejected
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var c = Arc.new(Cell.new(2)); thread.spawn(send once || c.get().get()); }

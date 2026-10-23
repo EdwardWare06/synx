@@ -1,0 +1,4 @@
+// fixture: dyn mismatched impl ABI
+// stage: full
+// expect: error does not match its trait signature
+trait T { int f(&const self, int n); } struct S {} impl T for S { int f(&const self, long n) { return 1; } } main() { var s = S {}; &const dyn T t = s; }

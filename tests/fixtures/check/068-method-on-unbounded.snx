@@ -1,0 +1,4 @@
+// fixture: method on unbounded
+// stage: check
+// expect: error no method 'area'
+void f<T>(&const T x) { x.area(); }

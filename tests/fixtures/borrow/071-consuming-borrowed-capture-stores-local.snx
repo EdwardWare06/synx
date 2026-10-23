@@ -1,0 +1,4 @@
+// fixture: consuming borrowed capture stores local
+// stage: full
+// expect: error does not live past
+main() { Vec<&const int> refs=Vec.new(); var f=[&refs] once || { int local=1; refs.push(&const local); }; f(); usize n=refs.len(); }

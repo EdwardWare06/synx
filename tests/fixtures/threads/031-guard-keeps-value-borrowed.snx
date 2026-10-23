@@ -1,0 +1,4 @@
+// fixture: guard keeps value borrowed
+// stage: full
+// expect: error while it is borrowed
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void discard<T>(T value) {} main() { var mutex = Mutex.new(1); var guard = mutex.lock(); var value = guard.get_mut(); discard(guard); *value = 2; }

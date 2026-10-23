@@ -1,0 +1,4 @@
+// fixture: generic owned captures
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void launch<T: Send + Owned>(T x) { thread.spawn(send once || x); }

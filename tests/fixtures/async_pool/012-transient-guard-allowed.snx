@@ -1,0 +1,4 @@
+// fixture: transient guard allowed
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send int job() { var m = Mutex.new(3); int n = 0; { var g = m.lock(); n = *g.get(); } await yield_now(); return n; }

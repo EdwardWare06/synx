@@ -1,0 +1,4 @@
+// fixture: copied self-reference cannot outlive original
+// stage: full
+// expect: error scope
+struct S { int x; (&const int)? r; } main() { S outer; { var inner=S { x:1,r:None }; inner.r=Some(&const inner.x); outer=inner; } match outer.r { Some(r) => print("{*r}"), None => {} } }

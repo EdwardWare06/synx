@@ -1,0 +1,6 @@
+// fixture: conditional drop flag
+// stage: full
+// expect: ir main has drop _1 if _
+struct S { String s; }
+f(S s) { }
+main() { var x = S { s: String.from("a") }; if (true) { f(x); } }

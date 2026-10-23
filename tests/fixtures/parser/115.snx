@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (import std.io)
+import std.io;

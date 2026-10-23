@@ -1,0 +1,4 @@
+// fixture: const closure call
+// stage: check
+// expect: error requires writable access
+main() { const f = || 1; int x = f(); }

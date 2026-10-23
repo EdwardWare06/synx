@@ -1,5 +1,5 @@
-/// Stable declaration serialization. Source: compiler/src/module_dump.cpp.
-/// Parity: tests/selfhost_modules_test.cpp. ASCII byte escaping, creation-order IDs.
+/// Stable declaration serialization. Ported from compiler/src/module_dump.cpp.
+/// ASCII byte escaping, creation-order IDs.
 import ids.{DefId, DefKind, ModuleId, TypeId, NONE};
 import defs;
 import types;

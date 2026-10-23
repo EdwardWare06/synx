@@ -1,0 +1,10 @@
+exit 1
+--- stdout
+85-87 Ident ab
+89-91 Ident cd
+93-94 Error unexpected character '@'
+96-96 end of file
+--- stderr
+<file>:6:1: error[SNX0101]: unexpected character '@'
+6 | @
+  | ^

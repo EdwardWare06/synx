@@ -1,0 +1,4 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+"{ if (c) { "in" } else { 2 } }"

@@ -1,6 +1,5 @@
-/// Async frame conversion over Dendrite. Source: compiler/src/async.cpp, a
+/// Async frame conversion over Dendrite. Ported from compiler/src/async.cpp, a
 /// function-by-function port.
-/// Parity: tests/selfhost_modules_test.cpp (all stage, IR after convert).
 /// Runs after ownership checks. Each async factory allocates a heap frame
 /// tuple (state word, then every poll local except the waker) and returns the
 /// task handle. The poll function becomes a state machine over the frame; the

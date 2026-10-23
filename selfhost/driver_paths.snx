@@ -1,4 +1,4 @@
-/// Executable, runtime and linker paths. Source: compiler/src/build.cpp.
+/// Executable, runtime and linker paths. Ported from compiler/src/build.cpp.
 /// Link arguments remain separate through std.process.Command.
 import target.{Target, TargetOs};
 import driver_options.BuildOptions;

@@ -1,0 +1,4 @@
+// fixture: inferred context
+// stage: full
+// expect: ok
+import infer_a; import infer_b; main() { int n = infer_a.first() + infer_b.second(); }

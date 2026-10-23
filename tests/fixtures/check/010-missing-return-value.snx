@@ -1,0 +1,4 @@
+// fixture: missing return value
+// stage: check
+// expect: error missing return value
+int f() { }

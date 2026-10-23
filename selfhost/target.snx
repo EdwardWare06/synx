@@ -1,5 +1,4 @@
 /// Axon target settings and symbol naming. Sources: axon.hpp and axon.cpp.
-/// Parity: tests/selfhost_backend_test.cpp, selfhost_backend_0..3.
 /// The driver selects the target OS. Arithmetic and allocation default on.
 import objfile.ObjectFormat;
 import bytes;

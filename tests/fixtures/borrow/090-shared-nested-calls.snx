@@ -1,0 +1,4 @@
+// fixture: shared nested calls
+// stage: full
+// expect: ok
+main() { const f=const |int x| x+1; int n=f(f(1)); }

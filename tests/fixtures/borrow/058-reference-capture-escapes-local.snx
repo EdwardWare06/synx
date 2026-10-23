@@ -1,0 +1,4 @@
+// fixture: reference capture escapes local
+// stage: full
+// expect: error does not live past
+fn() -> int make() { int x=1; return [&const x] || x; }

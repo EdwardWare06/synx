@@ -1,0 +1,4 @@
+// fixture: private through path
+// stage: full
+// expect: error private to module
+import private; main() { int n = private.secret(); }

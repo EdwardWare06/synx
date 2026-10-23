@@ -1,0 +1,4 @@
+// fixture: await task
+// stage: check
+// expect: ok
+async int f() { return 1; } async int g() { return await f(); }

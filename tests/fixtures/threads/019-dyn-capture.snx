@@ -1,0 +1,4 @@
+// fixture: dyn capture
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; trait A {} struct S {} impl A for S {} main() { var s = S {}; &const dyn A a = s; thread.spawn(send once || { var moved = a; }); }

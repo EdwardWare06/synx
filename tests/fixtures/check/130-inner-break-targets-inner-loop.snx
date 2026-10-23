@@ -1,0 +1,5 @@
+// fixture: inner break targets inner loop
+// stage: check
+// expect: ok
+int f() { loop { while (true) { break; } return 2; } }
+main() { f(); }

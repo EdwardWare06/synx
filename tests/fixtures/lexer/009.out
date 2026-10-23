@@ -1,0 +1,8 @@
+exit 0
+--- stdout
+59-62 CharLit U+61
+63-67 CharLit U+a
+68-79 CharLit U+1f600
+80-84 CharLit U+e9
+85-85 end of file
+--- stderr

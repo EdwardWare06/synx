@@ -1,0 +1,4 @@
+// fixture: private length field
+// stage: full
+// expect: error private to module
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m=HashMap<int,int>.new(); var n=m.len; }

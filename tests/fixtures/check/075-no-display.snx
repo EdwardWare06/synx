@@ -1,0 +1,5 @@
+// fixture: no display
+// stage: check
+// expect: error does not implement 'Display'
+struct V { int x; }
+main() { var v = V { x: 1 }; print("{v}"); }

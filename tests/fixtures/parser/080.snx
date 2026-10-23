@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (tuple a b)
+f() { match x { (a, b) => { } } }

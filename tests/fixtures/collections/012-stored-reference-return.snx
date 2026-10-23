@@ -1,0 +1,4 @@
+// fixture: stored reference return
+// stage: full
+// expect: error returns a reference
+import std.collections.{HashMap, sort}; import std.hash.Hash; HashMap<int,&const int> f() { int x=1; var m=HashMap<int,&const int>.new(); m.insert(1,&const x); return m; }

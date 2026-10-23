@@ -1,0 +1,4 @@
+// fixture: explicit shared capture
+// stage: full
+// expect: ok
+main() { int x=1; var f=[&const x] || x; int n=f(); }

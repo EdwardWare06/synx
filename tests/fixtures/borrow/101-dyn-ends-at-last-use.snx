@@ -1,0 +1,4 @@
+// fixture: dyn ends at last use
+// stage: full
+// expect: ok
+trait Read { int read(&const self); &const int view(&const self); } struct S { int n; } impl Read for S { int read(&const self) { return self.n; } &const int view(&const self) { return &const self.n; } } main() { var x = S { n: 1 }; &const dyn Read r = x; int n = r.read(); x.n = 2; }

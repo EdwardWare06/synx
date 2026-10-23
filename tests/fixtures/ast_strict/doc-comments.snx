@@ -1,0 +1,6 @@
+// fixture: doc comments attach to the next item
+// stage: parse
+// expect: output parse --strict
+/// Adds one.
+/// Really.
+int inc(int a) { a + 1 }

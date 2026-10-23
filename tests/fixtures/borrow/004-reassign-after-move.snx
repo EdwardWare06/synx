@@ -1,0 +1,7 @@
+// fixture: reassign after move
+// stage: full
+// expect: ok
+struct S { int a; }
+impl Drop for S { void drop(&self) { } }
+f(S s) { }
+main() { var x = S { a: 1 }; f(x); x = S { a: 2 }; f(x); }

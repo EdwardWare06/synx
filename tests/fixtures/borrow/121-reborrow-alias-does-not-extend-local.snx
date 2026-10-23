@@ -1,0 +1,4 @@
+// fixture: reborrow alias does not extend local
+// stage: full
+// expect: error scope
+main() { &const int result; { int n=1; var alias=&const n; result=&const *alias; } int value=*result; }

@@ -1,0 +1,6 @@
+// fixture: struct variant
+// stage: check
+// expect: ok
+enum S { Rect { double w; double h; }, Dot }
+double f(S s) { match s { S.Rect { w, h } => return w * h, S.Dot => return 0.0 } }
+main() { var r = S.Rect { w: 1.0, h: 2.0 }; }

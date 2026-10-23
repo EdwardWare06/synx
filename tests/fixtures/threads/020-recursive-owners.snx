@@ -1,0 +1,4 @@
+// fixture: recursive owners
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; enum List { End, Link(int, Box<List>) } void sendable<T: Send + Sync + Owned>() {} main() { sendable<List>(); }

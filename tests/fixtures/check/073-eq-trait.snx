@@ -1,0 +1,6 @@
+// fixture: eq trait
+// stage: check
+// expect: ok
+struct V { int x; }
+impl Eq for V { bool eq(&const self, &const V o) { return self.x == o.x; } }
+main() { var a = V { x: 1 }; bool b = a == a; }

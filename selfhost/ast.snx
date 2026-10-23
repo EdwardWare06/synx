@@ -1,5 +1,4 @@
-/// Syntax tree storage. Source: compiler/include/synx/ast.hpp.
-/// Parity: tests/selfhost_parser_test.cpp.
+/// Syntax tree storage. Ported from compiler/include/synx/ast.hpp.
 ///
 /// Nodes live in arenas inside Ast and refer to each other by uint index.
 /// NONE marks an absent child. Each node family is one struct with a kind

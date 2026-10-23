@@ -1,0 +1,4 @@
+// fixture: store returned own field
+// stage: full
+// expect: error same owner
+struct S { int x; (&const int)? r; } &const int view(&const S owner) { return &const owner.x; } void init(&S owner) { owner.r=Some(view(&const *owner)); }

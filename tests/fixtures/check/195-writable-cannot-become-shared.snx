@@ -1,0 +1,4 @@
+// fixture: writable cannot become shared
+// stage: check
+// expect: error type mismatch
+main() { fn const() -> int f=|| 1; }

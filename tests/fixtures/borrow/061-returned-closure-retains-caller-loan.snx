@@ -1,0 +1,4 @@
+// fixture: returned closure retains caller loan
+// stage: full
+// expect: error borrowed
+fn() -> int make(&const int x) { return || *x; } main() { int x=1; var f=make(&const x); x=2; int n=f(); }

@@ -1,0 +1,4 @@
+// fixture: reference output
+// stage: full
+// expect: error does not implement 'Owned'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { thread.spawn(send once || "borrowed"); }

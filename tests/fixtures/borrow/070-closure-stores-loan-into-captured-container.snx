@@ -1,0 +1,4 @@
+// fixture: closure stores loan into captured container
+// stage: full
+// expect: error scope
+main() { Vec<&const int> refs=Vec.new(); var f=[&refs] |&const int r| { refs.push(r); }; { int inner=2; f(&const inner); } usize count=refs.len(); }

@@ -1,0 +1,4 @@
+// fixture: popped callback borrow stays local
+// stage: full
+// expect: ok
+main() { Vec<fn(int) -> int> v=Vec.new(); v.push(|int n| n+1); match v.pop() { Some(callback) => { int n=callback(1); } None => {} } }

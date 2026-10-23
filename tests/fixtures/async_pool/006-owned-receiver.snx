@@ -1,0 +1,4 @@
+// fixture: owned receiver
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct Job { int n; async send int run(self) { await yield_now(); return self.n; } } main() { var j = Job { n: 2 }; var t = j.run(); }

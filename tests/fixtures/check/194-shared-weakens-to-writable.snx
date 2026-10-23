@@ -1,0 +1,4 @@
+// fixture: shared weakens to writable
+// stage: check
+// expect: ok
+main() { fn() -> int f=const || 1; int n=f(); }

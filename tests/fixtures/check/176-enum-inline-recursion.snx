@@ -1,0 +1,4 @@
+// fixture: enum inline recursion
+// stage: check
+// expect: error inline layout
+enum E { End, Next(E) }

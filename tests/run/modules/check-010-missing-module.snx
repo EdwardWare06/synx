@@ -1,0 +1,4 @@
+// fixture: missing module
+// stage: full
+// expect: error cannot find imported module
+import absent; main() {}

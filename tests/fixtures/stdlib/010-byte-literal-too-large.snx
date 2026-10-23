@@ -1,0 +1,4 @@
+// fixture: byte literal too large
+// stage: full
+// expect: error SNX0413
+import std.fs.File; main() { byte x=256; }

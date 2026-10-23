@@ -1,0 +1,4 @@
+// fixture: int match needs wildcard
+// stage: check
+// expect: error add a '_' arm
+int f(int n) { match n { 0 => return 1, 1 => return 2 } }

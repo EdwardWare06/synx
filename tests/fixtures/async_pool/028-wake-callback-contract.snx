@@ -1,0 +1,4 @@
+// fixture: wake callback contract
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct W {} impl Wake for W { void wake(&const self) {} } main() { var w = Waker.from(W {}); }

@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (= (unary * p) 1)
+f() { *p = 1; }

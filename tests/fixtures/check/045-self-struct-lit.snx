@@ -1,0 +1,4 @@
+// fixture: self struct lit
+// stage: check
+// expect: ok
+struct P { int a; P make() { return Self { a: 1 }; } P copy(&const self) { return P { a: self.a }; } }

@@ -116,7 +116,20 @@ library to the same folder. The other computer does not need Synx installed.
 ## Building from source
 
 Building the compiler from source is necessary only to change the compiler.
-The source build uses CMake 3.20 or later and a C and C++ compiler:
+The source build uses CMake 3.20 or later, a C and C++ compiler, and
+Python 3. The compiler is written in Synx, so the build also needs a Synx
+compiler to start from (the seed). By default, CMake downloads the release
+named in `scripts/seed.json` and checks its SHA-256. To use a Synx compiler
+that you already have, pass its executable to CMake:
+
+```text
+cmake -S . -B build -DSYNX_SEED=/path/to/synx
+```
+
+On Windows, give `libexec\synx.exe` from the installation, not
+`bin\synx.cmd`.
+
+The tools for each host:
 
 - Windows: Visual Studio Build Tools with the C++ workload. Run
   `scripts\build-win.cmd Release`.

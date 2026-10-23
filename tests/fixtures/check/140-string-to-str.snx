@@ -1,0 +1,5 @@
+// fixture: string to str
+// stage: check
+// expect: ok
+f(&const str s) { }
+main() { String s = String.from("x"); f(s); f(&const s); f("lit"); }

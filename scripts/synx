@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# Runs the Synx compiler from this source tree: bin/synx if present, else the
+# stage 2 compiler that scripts/build-linux.sh builds.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export SYNX_STD_PATH="${SYNX_STD_PATH:-$ROOT/std}"
 if [[ -x "$ROOT/bin/synx" ]]; then
   exec "$ROOT/bin/synx" "$@"
 fi
-exec "$ROOT/build-linux/compiler/synx" "$@"
+exec "$ROOT/build-linux/selfhost-stages/synx-stage2" "$@"

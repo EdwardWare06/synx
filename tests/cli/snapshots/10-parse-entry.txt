@@ -1,0 +1,6 @@
+exit 0
+--- stdout
+(import std.io)
+(struct Item (field int value))
+(fn main (ret int) (params) (block (var double x 1.23457) (var char c (char 955)) (call (. io print) "driver café") (return 7)))
+--- stderr

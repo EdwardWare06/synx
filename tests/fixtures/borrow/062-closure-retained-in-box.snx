@@ -1,0 +1,4 @@
+// fixture: closure retained in box
+// stage: full
+// expect: error scope
+main() { Box<fn() -> int> b; { int x=1; b=Box.new([&const x] || x); } var f=b.into_inner(); int n=f(); }

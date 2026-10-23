@@ -1,0 +1,5 @@
+// fixture: parser case
+// stage: parse
+// expect: parse errors 2
+a() { x = ; }
+b() { y = ; }

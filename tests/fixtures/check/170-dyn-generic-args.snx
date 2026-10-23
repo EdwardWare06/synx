@@ -1,0 +1,4 @@
+// fixture: dyn generic args
+// stage: check
+// expect: error does not implement
+trait T<U> {} struct S {} impl T<int> for S {} main() { var s = S {}; &const dyn T<bool> t = &const s; }

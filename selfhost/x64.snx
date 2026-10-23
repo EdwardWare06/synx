@@ -1,5 +1,4 @@
-/// x86-64 byte encoder. Source: compiler/src/x64.cpp.
-/// Parity: tests/selfhost_backend_test.cpp, selfhost_backend_0..3.
+/// x86-64 byte encoder. Ported from compiler/src/x64.cpp.
 /// Register, XMM, ALU and condition inputs are hardware codes: 0..15,
 /// 0..7, 0..7 and 0..15. Addresses use a stable disp32 encoding.
 /// Each Assembler owns code, relocations and label fixups for one function.

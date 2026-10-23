@@ -1,0 +1,4 @@
+// fixture: consuming closure stores borrowed owner field
+// stage: full
+// expect: error same owner
+struct S { int x; (&const int)? r; void init(&self) { var f=once || { self.r=Some(&const self.x); }; f(); } }

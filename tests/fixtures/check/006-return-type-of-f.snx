@@ -1,0 +1,4 @@
+// fixture: return type of f
+// stage: check
+// expect: type f double
+f() { 1.5 }

@@ -1,0 +1,5 @@
+// fixture: arg count
+// stage: check
+// expect: error expected 1 argument, got 2
+f(int a) { }
+main() { f(1, 2); }

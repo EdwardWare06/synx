@@ -1,0 +1,8 @@
+exit 1
+--- stdout
+59-66 Error 
+67-67 end of file
+--- stderr
+<file>:4:4: error: unmatched '}' in string, write '}}' for a literal brace
+4 | "a } b"
+  |    ^

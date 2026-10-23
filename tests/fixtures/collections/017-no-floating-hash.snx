@@ -1,0 +1,4 @@
+// fixture: no floating Hash
+// stage: full
+// expect: error does not implement
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m=HashMap<double,int>.new(); }

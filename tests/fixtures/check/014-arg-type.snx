@@ -1,0 +1,5 @@
+// fixture: arg type
+// stage: check
+// expect: error type mismatch in argument
+f(int a) { }
+main() { f("x"); }

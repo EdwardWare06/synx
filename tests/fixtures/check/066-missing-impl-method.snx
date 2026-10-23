@@ -1,0 +1,6 @@
+// fixture: missing impl method
+// stage: check
+// expect: error missing method 'f'
+trait T { void f(&const self); }
+struct S { }
+impl T for S { }

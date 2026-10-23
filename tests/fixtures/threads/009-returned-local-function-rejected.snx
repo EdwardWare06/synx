@@ -1,0 +1,4 @@
+// fixture: returned local function rejected
+// stage: full
+// expect: error type mismatch
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; fn once() -> int local() { return once || 1; } main() { thread.spawn(local()); }

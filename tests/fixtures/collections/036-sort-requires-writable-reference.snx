@@ -1,0 +1,4 @@
+// fixture: sort requires writable reference
+// stage: full
+// expect: error expected a writable reference
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var v=Vec<int>.new(); sort(&const v); }

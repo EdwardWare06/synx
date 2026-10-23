@@ -1,0 +1,4 @@
+// fixture: guard
+// stage: check
+// expect: ok
+int f(int n) { match n { x if x > 10 => return 1, _ => return 0 } }

@@ -1,0 +1,4 @@
+// fixture: seeded re-export cycle
+// stage: full
+// expect: ok
+import reexport_b; main() { int n = reexport_b.seed(); }

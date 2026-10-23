@@ -1,0 +1,4 @@
+// fixture: expanding owner cleanup
+// stage: full
+// expect: error nested type arguments
+struct Grow<T> { Box<Grow<Vec<T>>>? next; } main() { Grow<int> g = Grow { next: None }; }

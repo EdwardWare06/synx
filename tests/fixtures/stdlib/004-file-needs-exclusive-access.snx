@@ -1,0 +1,4 @@
+// fixture: file needs exclusive access
+// stage: full
+// expect: error read only
+import std.fs.File; void f(&const File file) { file.flush(); }

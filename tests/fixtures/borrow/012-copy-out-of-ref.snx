@@ -1,0 +1,4 @@
+// fixture: copy out of ref
+// stage: full
+// expect: ok
+g(&const int r) { int x = *r; }

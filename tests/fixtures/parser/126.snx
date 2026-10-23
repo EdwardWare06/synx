@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (impl Shape for Circle (fn area (ret double) (params (&const self)) (block (tail 1.0))))
+impl Shape for Circle { double area(&const self) { 1.0 } }

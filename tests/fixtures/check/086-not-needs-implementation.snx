@@ -1,0 +1,4 @@
+// fixture: not needs implementation
+// stage: check
+// expect: error operator '!'
+struct Plain {} main() { var value = !Plain {}; }

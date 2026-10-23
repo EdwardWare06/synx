@@ -1,0 +1,4 @@
+// fixture: slice index
+// stage: check
+// expect: ok
+f(&const int[] s) { int x = s[0]; usize n = 0; int y = s[n]; }

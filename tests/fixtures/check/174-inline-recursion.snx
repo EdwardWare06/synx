@@ -1,0 +1,4 @@
+// fixture: inline recursion
+// stage: check
+// expect: error inline layout
+struct A { A a; }

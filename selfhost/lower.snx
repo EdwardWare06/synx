@@ -1,5 +1,4 @@
-/// Dendrite lowering. Source: compiler/src/lower.cpp, a function-by-function port.
-/// Parity: tests/selfhost_modules_test.cpp (lower stage).
+/// Dendrite lowering. Ported from compiler/src/lower.cpp, a function-by-function port.
 /// Lowers every non-generic user function plus everything reachable from them,
 /// one concrete instantiation at a time from a worklist. Syntax nodes are node
 /// keys (file << 32 | index); the lowerer keeps no references into trees.

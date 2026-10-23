@@ -1,0 +1,4 @@
+// fixture: parent source stays unimported
+// stage: full
+// expect: error no public item 'base'
+import parent_only; import bundle.child; main() { int n = bundle.base(); }

@@ -1,0 +1,4 @@
+// fixture: private literal
+// stage: full
+// expect: error private to module
+import private; main() { var s = private.Hidden { n: 1 }; }

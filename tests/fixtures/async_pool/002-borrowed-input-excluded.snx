@@ -1,0 +1,4 @@
+// fixture: borrowed input excluded
+// stage: full
+// expect: error send async input
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send int job(&const int input) { await yield_now(); return *input; }

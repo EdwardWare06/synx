@@ -1,0 +1,4 @@
+// fixture: nested cleanup
+// stage: full
+// expect: ok
+struct Guard {} impl Drop for Guard { void drop(&self) {} } struct Pair { String first; Guard second; } void unused(Pair p) {} main() {}

@@ -1,0 +1,4 @@
+// fixture: map retains borrowed type
+// stage: full
+// expect: error does not implement 'Owned'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; import std.collections.HashMap; void valid<T: Owned>() {} main() { valid<HashMap<int,&const int>>(); }

@@ -1,0 +1,4 @@
+// fixture: recursive value capture
+// stage: full
+// expect: ok
+struct Node { Vec<Node> children; } main() { var n = Node { children: Vec<Node>.new() }; var f = || n.children.len(); usize count = f(); }

@@ -1,0 +1,4 @@
+// fixture: mem swap alias
+// stage: full
+// expect: error borrowed
+import std.fs.File; import std.mem; main() { int x=1; mem.swap(&x, &x); }

@@ -1,5 +1,4 @@
-/// Semantic definition arenas. Source: compiler/include/synx/defs.hpp.
-/// Parity: tests/selfhost_modules_test.cpp.
+/// Semantic definition arenas. Ported from compiler/include/synx/defs.hpp.
 /// Program owns records. DefId and ModuleId survive vector growth.
 /// Definitions retain AST file/node indexes, with no references into syntax arenas.
 import ids.{TypeId, DefId, DefKind, ModuleId, NONE};

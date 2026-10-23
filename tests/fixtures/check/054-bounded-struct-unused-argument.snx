@@ -1,0 +1,4 @@
+// fixture: bounded struct unused argument
+// stage: check
+// expect: error does not implement 'Eq'
+struct Bad {} struct S<T: Eq> { void f() {} } main() { S<Bad>.f(); }

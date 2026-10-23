@@ -1,0 +1,6 @@
+// fixture: assign while shared
+// stage: full
+// expect: error cannot assign to `x` while it is borrowed
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+main() { var x = S { a: 1 }; var r = &const x; x.a = 2; int b = r.get(); }

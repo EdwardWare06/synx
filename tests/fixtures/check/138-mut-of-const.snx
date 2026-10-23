@@ -1,0 +1,5 @@
+// fixture: mut of const
+// stage: check
+// expect: error read only
+f(&int x) { }
+main() { const int a = 1; f(&a); }

@@ -1,0 +1,4 @@
+// fixture: consuming opaque callback stores local
+// stage: full
+// expect: error does not live past
+main() { Vec<&const int> refs=Vec.new(); var inner=[&refs] |&const int r| { refs.push(r); }; var outer=once || { int n=1; inner(&const n); }; outer(); usize count=refs.len(); }

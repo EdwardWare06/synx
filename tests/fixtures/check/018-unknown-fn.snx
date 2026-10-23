@@ -1,0 +1,4 @@
+// fixture: unknown fn
+// stage: check
+// expect: error unknown name 'nope'
+main() { nope(); }

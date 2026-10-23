@@ -1,0 +1,4 @@
+// fixture: consuming call through ref
+// stage: full
+// expect: error must be owned
+int apply(&fn once() -> int f) { return f(); }

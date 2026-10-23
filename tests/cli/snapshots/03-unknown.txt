@@ -1,0 +1,15 @@
+exit 1
+--- stdout
+usage: synx <command> [options]
+commands:
+  version            print the compiler version and host platform
+  about              describe this build of the compiler
+  lex <file.snx>     print the token stream of a file
+  parse <file.snx>   print the syntax tree (--strict adds spans and every field)
+  modules <file.snx> print declarations and bound module namespaces (--signatures, --check, --lower, --borrow, --async stop after that stage; --machine adds layouts and registers)
+  check <file.snx>   check names, types, and ownership without building
+  ir <file.snx>      print the Dendrite IR of a program
+  build <file.snx>   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, -v)
+  run <file.snx>     build and run
+--- stderr
+unknown command: unknown

@@ -1,0 +1,4 @@
+// fixture: stored local cannot escape parameter
+// stage: full
+// expect: error does not live past the function
+void fill(&Vec<&const int> v) { int n = 1; v.push(&const n); }

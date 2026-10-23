@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (tuple 1 2)
+f() { var e = (1, 2); }

@@ -1,0 +1,4 @@
+// fixture: dyn Self argument
+// stage: check
+// expect: error cannot be used as dyn
+trait T { void f(&const self, &const Self other); } f(&const dyn T t) {}

@@ -1,0 +1,4 @@
+// fixture: writable callback replacement retains loan
+// stage: full
+// expect: error scope
+import std.mem; void store(&fn() -> int f, &const int r) { var previous=mem.replace(f, || *r); } main() { var f=|| 0; { int n=1; store(&f,&const n); } int value=f(); }

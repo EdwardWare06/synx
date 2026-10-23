@@ -1,0 +1,4 @@
+// fixture: nested blocks
+// stage: check
+// expect: ok
+int f() { var x = { int a = 1; a + 1 }; return x; }

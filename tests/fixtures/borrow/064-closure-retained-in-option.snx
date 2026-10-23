@@ -1,0 +1,4 @@
+// fixture: closure retained in option
+// stage: full
+// expect: error scope
+main() { Option<fn() -> int> v=None; { int x=1; v=Some([&const x] || x); } var f=v.unwrap(); int n=f(); }

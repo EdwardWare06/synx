@@ -1,5 +1,5 @@
-/// Recursive descent parser. Source: compiler/src/parser.cpp.
-/// Parity: tests/selfhost_parser_test.cpp. Preserves recovery, speculation,
+/// Recursive descent parser. Ported from compiler/src/parser.cpp.
+/// Preserves recovery, speculation,
 /// span rules, and evaluation order of the bootstrap parser.
 ///
 /// The parser owns its tokens, syntax tree, and diagnostic sink. Callers lex

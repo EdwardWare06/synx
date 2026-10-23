@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (call (name first (targs int)) items)
+f() { var e = first<int>(items); }

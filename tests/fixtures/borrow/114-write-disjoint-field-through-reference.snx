@@ -1,0 +1,4 @@
+// fixture: write disjoint field through reference
+// stage: full
+// expect: ok
+struct P { int a; int b; } void f(&P p) { var r = &p.a; p.b = 2; int n = *r; }

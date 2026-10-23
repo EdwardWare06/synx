@@ -1,0 +1,4 @@
+// fixture: unused value stmt
+// stage: check
+// expect: error not used
+main() { if (true) { 1 } else { 2 } print("x"); }

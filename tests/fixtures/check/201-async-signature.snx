@@ -1,0 +1,4 @@
+// fixture: async signature
+// stage: check
+// expect: ok
+async int answer() { return 42; } main() { Task<int> t=answer(); }

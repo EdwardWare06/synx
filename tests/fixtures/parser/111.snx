@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (fn max (generics (T Ord)) (ret T) (params (T a) (T b)) (block (tail a)))
+T max<T: Ord>(T a, T b) { a }

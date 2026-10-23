@@ -1,0 +1,4 @@
+// fixture: tuple fields
+// stage: check
+// expect: ok
+main() { var t = (1, 2.5); int a = t.0; double b = t.1; }

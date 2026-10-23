@@ -1,0 +1,4 @@
+// fixture: equality must not guess a type
+// stage: check
+// expect: error cannot infer
+struct S {} impl Eq for S { bool eq(&const self,&const Self other) { return true; } } T unknown<T>() { panic("unknown"); } main() { var a=unknown(); var b=unknown(); bool same=(&const a)==(&const b); }

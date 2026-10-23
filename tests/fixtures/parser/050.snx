@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (match t (arm (Token.Number n) (if (> n 0)) (block (tail n))) (arm _ 0))
+f() { var e = match t { Token.Number(n) if n > 0 => { n } _ => 0, }; }

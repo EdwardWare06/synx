@@ -1,0 +1,6 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+a // line
+b /* block /* nested */ still */ c //// four
+d

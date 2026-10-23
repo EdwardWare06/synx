@@ -1,0 +1,5 @@
+// fixture: duplicate fn
+// stage: check
+// expect: error already defined
+f() { }
+f() { }

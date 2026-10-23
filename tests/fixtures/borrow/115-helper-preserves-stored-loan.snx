@@ -1,0 +1,4 @@
+// fixture: helper preserves stored loan
+// stage: full
+// expect: error while it is borrowed
+void fill(&Vec<&const int> v, &const int n) { v.push(n); } main() { int x = 1; Vec<&const int> v = Vec.new(); fill(&v, &const x); x = 2; int n = *v[0]; }

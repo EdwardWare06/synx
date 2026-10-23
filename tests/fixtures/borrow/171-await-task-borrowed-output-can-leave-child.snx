@@ -1,0 +1,4 @@
+// fixture: await Task borrowed output can leave child
+// stage: full
+// expect: ok
+import std.task.yield_now; async &const int f(&const int r) { await yield_now(); return r; } async &const int g(&const int r) { return await f(r); }

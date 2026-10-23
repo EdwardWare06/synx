@@ -1,0 +1,4 @@
+// fixture: timer future can migrate
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; import std.time.Sleep; void allowed<T: Send + Owned>() {} main() { allowed<Sleep>(); }

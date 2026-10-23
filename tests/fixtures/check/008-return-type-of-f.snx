@@ -1,0 +1,5 @@
+// fixture: return type of f
+// stage: check
+// expect: type f int
+g() { return 1; }
+f() { return g(); }

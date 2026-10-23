@@ -1,0 +1,4 @@
+// fixture: parameter wrapper alias stores local
+// stage: full
+// expect: error does not live past
+struct H { &Vec<&const int> value; } void f(&Vec<&const int> v) { var h=H { value:v }; int n=1; h.value.push(&const n); }

@@ -1,0 +1,4 @@
+// fixture: match by value moves
+// stage: full
+// expect: ok
+f(String? o) { match o { Some(s) => { String t = s; } None => { } } }

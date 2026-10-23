@@ -1,0 +1,4 @@
+// fixture: destructor stores own field externally
+// stage: full
+// expect: error same owner
+struct S { (&const int)? r; } struct Hold { int x; &S target; } impl Drop for Hold { void drop(&self) { self.target.r=Some(&const self.x); } }

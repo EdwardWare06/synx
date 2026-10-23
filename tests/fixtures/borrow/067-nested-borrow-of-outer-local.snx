@@ -1,0 +1,4 @@
+// fixture: nested borrow of outer local
+// stage: full
+// expect: error does not live past
+fn() -> int make() { var f=|| { int x=1; [&const x] || x }; return f(); }

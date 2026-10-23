@@ -1,0 +1,4 @@
+// fixture: capture read only mutable
+// stage: check
+// expect: error read only
+main() { const int n=1; var f=[&n] || n; }

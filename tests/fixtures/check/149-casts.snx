@@ -1,0 +1,4 @@
+// fixture: casts
+// stage: check
+// expect: ok
+main() { int a = 1; long b = a as long; double d = a as double; byte c = 65; char ch = c as char; }

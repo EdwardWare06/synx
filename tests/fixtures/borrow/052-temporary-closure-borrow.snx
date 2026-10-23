@@ -1,0 +1,4 @@
+// fixture: temporary closure borrow
+// stage: full
+// expect: error is dropped while it is still borrowed
+main() { int x = 1; var r = (|| &const x)(); int n = *r; }

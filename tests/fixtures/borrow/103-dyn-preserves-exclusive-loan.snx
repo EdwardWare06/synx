@@ -1,0 +1,4 @@
+// fixture: dyn preserves exclusive loan
+// stage: full
+// expect: error while it is borrowed as writable
+trait Read { int read(&const self); &const int view(&const self); } struct S { int n; } impl Read for S { int read(&const self) { return self.n; } &const int view(&const self) { return &const self.n; } } main() { var x = S { n: 1 }; &dyn Read r = &x; int n = x.n; int m = r.read(); }

@@ -1,5 +1,4 @@
-/// Memory layout of Synx types on x86-64. Source: compiler/src/layout.cpp.
-/// Parity: tests/selfhost_modules_test.cpp (all stage, machine section).
+/// Memory layout of Synx types on x86-64. Ported from compiler/src/layout.cpp.
 /// Primitives use their natural size and alignment; void is empty.
 /// References and raw pointers are 8 bytes, or 16 (pointer, length) when the
 /// pointee is unsized. Structs and tuples place fields in declaration order

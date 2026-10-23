@@ -1,0 +1,4 @@
+// fixture: dyn vector preserves loan
+// stage: full
+// expect: error while it is borrowed
+trait Read { int read(&const self); &const int view(&const self); } struct S { int n; } impl Read for S { int read(&const self) { return self.n; } &const int view(&const self) { return &const self.n; } } main() { var x = S { n: 1 }; Vec<&const dyn Read> v = Vec.new(); v.push(&const x); x.n = 2; int n = v[0].read(); }

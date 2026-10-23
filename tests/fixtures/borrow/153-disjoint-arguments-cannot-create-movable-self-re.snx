@@ -1,0 +1,4 @@
+// fixture: disjoint arguments cannot create movable self-reference
+// stage: full
+// expect: error borrowed
+struct S { int x; Vec<&const int> refs; } void save(&Vec<&const int> refs, &const int value) { refs.push(value); } main() { var s=S { x:1, refs:Vec.new() }; save(&s.refs,&const s.x); var moved=s; }

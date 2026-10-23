@@ -1,0 +1,4 @@
+// fixture: wrong future receiver
+// stage: full
+// expect: error SNX0419
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct F {} impl Future<int> for F { Poll<int> poll(&const self,Waker w) { return Poll.Ready(1); } }

@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (const w 5)
+f() { const w = 5; }

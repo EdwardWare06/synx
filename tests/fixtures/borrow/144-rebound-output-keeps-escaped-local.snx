@@ -1,0 +1,4 @@
+// fixture: rebound output keeps escaped local
+// stage: full
+// expect: error does not live past
+void save(&Vec<&const int> output, &Vec<&const int> other) { int n=1; output.push(&const n); output=other; }

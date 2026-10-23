@@ -1,0 +1,4 @@
+// fixture: nominal dependent bound
+// stage: check
+// expect: ok
+trait Pair<T> {} struct Good {} impl Pair<int> for Good {} struct S<A: Pair<B>, B> {} main() { S<Good,int> value; }

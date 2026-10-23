@@ -1,0 +1,6 @@
+// fixture: two mut
+// stage: full
+// expect: error as writable while it is already borrowed
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+main() { var x = S { a: 1 }; var r = &x; var q = &x; r.bump(); q.bump(); }

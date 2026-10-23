@@ -1,0 +1,6 @@
+// fixture: copy impl unbounded param
+// stage: check
+// expect: error cannot implement Copy
+struct W<T> { T v; }
+impl<T> Copy for W<T> { }
+main() { }

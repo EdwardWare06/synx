@@ -1,0 +1,19 @@
+exit 0
+--- stdout
+59-60 string start
+60-62 StringText "a "
+62-63 interpolation start
+63-64 Ident x
+64-65 interpolation end
+65-68 StringText " b "
+68-69 interpolation start
+69-70 Ident p
+70-71 .
+71-74 Ident len
+74-75 (
+75-76 )
+76-77 interpolation end
+77-79 StringText " c"
+79-80 string end
+81-81 end of file
+--- stderr

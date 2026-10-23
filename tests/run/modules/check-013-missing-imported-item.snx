@@ -1,0 +1,4 @@
+// fixture: missing imported item
+// stage: full
+// expect: error cannot resolve import
+import left.absent; main() {}

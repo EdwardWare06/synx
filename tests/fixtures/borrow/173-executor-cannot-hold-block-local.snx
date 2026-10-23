@@ -1,0 +1,4 @@
+// fixture: executor cannot hold block local
+// stage: full
+// expect: error scope
+import std.task.LocalExecutor; async void f(&const int r) { print("{*r}"); } main() { var executor=LocalExecutor.new(); { int n=1; executor.spawn(f(&const n)); } executor.run(); }

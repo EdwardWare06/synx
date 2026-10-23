@@ -1,0 +1,4 @@
+// fixture: await shared future
+// stage: check
+// expect: error writable access
+async int f(&const Task<int> task) { return await task; }

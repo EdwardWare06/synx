@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has Map<String, Vec<int>>
+void f(Map<String, Vec<int>> x) { }

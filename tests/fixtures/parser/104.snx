@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (for (tuple k v) map (block))
+f() { for ((k, v) in map) { } }

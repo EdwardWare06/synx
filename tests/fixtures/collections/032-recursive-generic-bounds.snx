@@ -1,0 +1,4 @@
+// fixture: recursive generic bounds
+// stage: full
+// expect: ok
+import std.collections.{HashMap, sort}; import std.hash.Hash; struct Node<T:Hash> { Vec<Node<T>> children; } main() {} 

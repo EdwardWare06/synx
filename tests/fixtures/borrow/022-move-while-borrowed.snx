@@ -1,0 +1,7 @@
+// fixture: move while borrowed
+// stage: full
+// expect: error cannot move `x` while it is borrowed
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+f(S s) { }
+main() { var x = S { a: 1 }; var r = &const x; f(x); int b = r.get(); }

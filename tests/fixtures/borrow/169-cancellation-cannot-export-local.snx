@@ -1,0 +1,4 @@
+// fixture: cancellation cannot export local
+// stage: full
+// expect: error does not live past
+import std.task.yield_now; struct H { &Vec<&const int> out; &const int value; } impl Drop for H { void drop(&self) { self.out.push(self.value); } } async void f(&Vec<&const int> out) { int n=1; var h=H { out:out,value:&const n }; await yield_now(); }

@@ -1,0 +1,4 @@
+// fixture: missing Hash
+// stage: full
+// expect: error does not implement
+import std.collections.{HashMap, sort}; import std.hash.Hash; struct K {} impl Eq for K { bool eq(&const self,&const Self other) { return true; } } main() { var m=HashMap<K,int>.new(); }

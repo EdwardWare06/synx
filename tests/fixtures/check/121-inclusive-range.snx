@@ -1,0 +1,4 @@
+// fixture: inclusive range
+// stage: check
+// expect: ok
+main() { for (i in 0..=10) { int x = i; } }

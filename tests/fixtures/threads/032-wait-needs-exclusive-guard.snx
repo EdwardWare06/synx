@@ -1,0 +1,4 @@
+// fixture: wait needs exclusive guard
+// stage: full
+// expect: error already borrowed
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var m = Mutex.new(1); var c = Condvar.new(); var g = m.lock(); var value = g.get(); c.wait(&g); print("{*value}"); }

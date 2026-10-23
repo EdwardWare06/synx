@@ -1,0 +1,4 @@
+// fixture: closure stores call argument loan
+// stage: full
+// expect: error scope
+main() { int outer=1; var r=&const outer; var f=|&const int next| { int previous=*r; r=next; }; { int inner=2; f(&const inner); } f(&const outer); }

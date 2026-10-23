@@ -1,0 +1,4 @@
+// fixture: await plain value
+// stage: check
+// expect: error implements Future
+async void f() { await 1; }

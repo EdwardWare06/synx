@@ -1,0 +1,4 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+42 0xFF 0b1010 1_000 42L 1.5f 1.5 2e10 3f 7E-2

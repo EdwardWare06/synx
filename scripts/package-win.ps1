@@ -1,11 +1,9 @@
 # Package steps for scripts\package-win.cmd, which loads the MSVC environment.
-param([ValidateSet('synx', 'cpp')][string]$Compiler = 'synx')
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $build = Join-Path $root 'build-package-win'
 $version = ([regex]::Match((Get-Content -Raw (Join-Path $root 'CMakeLists.txt')), 'project\(synx VERSION ([0-9.]+)')).Groups[1].Value
 $name = "synx-$version-windows-x86_64"
-if ($Compiler -eq 'cpp') { $name = "$name-cpp" }
 $stageRoot = Join-Path $build 'stage'
 $stage = Join-Path $stageRoot $name
 $out = Join-Path $root 'dist\packages'
@@ -22,22 +20,17 @@ function Invoke-WithoutToolchain([scriptblock]$Action) {
     } finally { $env:PATH = $previousPath }
 }
 
-Invoke-Checked cmake @('-S', $root, '-B', $build, '-G', 'NMake Makefiles', '-DCMAKE_BUILD_TYPE=Release', "-DSYNX_INSTALL_COMPILER=$Compiler")
-Invoke-Checked cmake @('--build', $build, '--target', 'synx', 'synx_rt', 'synx_rt_shared')
-if ($Compiler -eq 'synx') { Invoke-Checked cmake @('--build', $build, '--target', 'synx_selfhost') }
-else { Invoke-Checked cmake @('--build', $build, '--target', 'synx_linker') }
+Invoke-Checked cmake @('-S', $root, '-B', $build, '-G', 'NMake Makefiles', '-DCMAKE_BUILD_TYPE=Release')
+Invoke-Checked cmake @('--build', $build, '--target', 'synx_compiler', 'synx_rt', 'synx_rt_shared')
 if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
 Invoke-Checked cmake @('--install', $build, '--prefix', $stage)
 
 # The package holds only the launcher, compiler, runtime, standard library
 # sources, the workbench example, the installer, and the license files.
-$allowed = '^(bin/synx\.cmd|libexec/(synx\.exe|synx-link\.exe|synx_rt\.dll)|lib/(synx_rt\.lib|synx_rt\.dll)|install\.cmd|install\.ps1|LICENSE-(MIT|APACHE)|std/.+\.snx|examples/workbench/[a-z_]+\.snx)$'
+$allowed = '^(bin/synx\.cmd|libexec/(synx\.exe|synx_rt\.dll)|lib/(synx_rt\.lib|synx_rt\.dll)|install\.cmd|install\.ps1|LICENSE-(MIT|APACHE)|std/.+\.snx|examples/workbench/[a-z_]+\.snx)$'
 $unexpected = @(Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {
     $_.FullName.Substring($stage.Length + 1).Replace('\', '/') } | Where-Object { $_ -notmatch $allowed })
 if ($unexpected.Count -gt 0) { throw "unexpected package files: $($unexpected -join ', ')" }
-if ($Compiler -eq 'synx' -and (Test-Path -LiteralPath (Join-Path $stage 'libexec\synx-link.exe'))) {
-    throw 'default package contains an unused linker helper'
-}
 # Imported CRT DLLs would make the package depend on a Visual C++ install.
 # Inspect while the developer PATH still provides dumpbin.
 foreach ($binary in (Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll' })) {
@@ -66,9 +59,8 @@ $target = Join-Path $check 'installed Synx'
 Invoke-Checked (Join-Path $stage 'install.cmd') @('-Destination', $target, '-NoPath')
 Invoke-WithoutToolchain {
     $installedWorkbench = Join-Path $check 'workbench-installed.exe'
-    # The default package links with the built-in linker without a flag.
+    # The package links with the built-in linker without a flag.
     $installedArgs = @('build', (Join-Path $stage 'examples\workbench\main.snx'), '-o', $installedWorkbench)
-    if ($Compiler -eq 'cpp') { $installedArgs += '--linker=builtin' }
     Invoke-Checked (Join-Path $target 'bin\synx.cmd') $installedArgs
     $null | & $installedWorkbench > (Join-Path $check 'workbench-installed.out')
     if ($LASTEXITCODE -ne 0) { throw "installed workbench failed with exit code $LASTEXITCODE" }

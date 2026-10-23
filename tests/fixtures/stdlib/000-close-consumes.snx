@@ -1,0 +1,4 @@
+// fixture: close consumes
+// stage: full
+// expect: error use of moved value
+import std.fs.File; main() { match File.create("x") { Ok(f) => { f.close(); f.flush(); } Err(_) => {} } }

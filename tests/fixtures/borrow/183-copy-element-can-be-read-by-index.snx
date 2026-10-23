@@ -1,0 +1,4 @@
+// fixture: copy element can be read by index
+// stage: full
+// expect: ok
+main() { Vec<int> v = Vec.new(); v.push(1); int n = v[0]; int[2] a = [1, 2]; int m = a[1]; }

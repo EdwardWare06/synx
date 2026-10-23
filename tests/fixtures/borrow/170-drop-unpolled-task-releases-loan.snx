@@ -1,0 +1,4 @@
+// fixture: drop unpolled task releases loan
+// stage: full
+// expect: ok
+import std.mem; async int f(&const int r) { return *r; } main() { int n=1; var task=f(&const n); mem.drop(task); n=2; }

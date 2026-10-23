@@ -1,0 +1,5 @@
+// fixture: generic fn explicit
+// stage: check
+// expect: ok
+T first<T: Copy>(&const T[] items) { return items[0]; }
+main() { int[3] a = [1, 2, 3]; var x = first<int>(&const a); var y = first(&const a); }

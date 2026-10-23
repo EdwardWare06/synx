@@ -1,0 +1,4 @@
+// fixture: return type of add
+// stage: check
+// expect: type add int
+add(int a, int b) { return a + b; }

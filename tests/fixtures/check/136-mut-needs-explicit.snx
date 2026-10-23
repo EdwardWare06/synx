@@ -1,0 +1,5 @@
+// fixture: mut needs explicit
+// stage: check
+// expect: error expected a writable reference
+f(&int x) { }
+main() { int a = 1; f(a); }

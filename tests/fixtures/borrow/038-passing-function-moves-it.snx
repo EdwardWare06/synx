@@ -1,0 +1,4 @@
+// fixture: passing function moves it
+// stage: full
+// expect: error use of moved value
+use(fn() -> int f) { int x = f(); } main() { var f = || 1; use(f); int x = f(); }

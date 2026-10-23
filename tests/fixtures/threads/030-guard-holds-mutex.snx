@@ -1,0 +1,4 @@
+// fixture: guard holds mutex
+// stage: full
+// expect: error while it is borrowed
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var mutex = Mutex.new(1); var guard = mutex.lock(); var moved = mutex; print("{*guard.get()}"); }

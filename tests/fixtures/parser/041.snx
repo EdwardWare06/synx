@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (struct Shape.Rect (w 1.0) (h 2.0))
+f() { var e = Shape.Rect { w: 1.0, h: 2.0 }; }

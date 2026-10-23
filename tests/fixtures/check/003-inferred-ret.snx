@@ -1,0 +1,4 @@
+// fixture: inferred ret
+// stage: check
+// expect: ok
+add(int a, int b) { return a + b; }

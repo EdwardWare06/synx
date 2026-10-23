@@ -1,0 +1,4 @@
+// fixture: dyn generic requires sized
+// stage: check
+// expect: error unsized
+trait Shape { int area(&const self); void grow(&self, int n); } struct Sq { int side; } impl Shape for Sq { int area(&const self) { return self.side * self.side; } void grow(&self, int n) { self.side += n; } } int size<T: Shape>(&const T t) { return size_of<T>() as int; } main() { var s = Sq { side: 2 }; &const dyn Shape t = s; int n = size(t); }

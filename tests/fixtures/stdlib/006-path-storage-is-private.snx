@@ -1,0 +1,4 @@
+// fixture: path storage is private
+// stage: full
+// expect: error private to module
+import std.fs.File; import std.path.Path; main() { var p=Path.from("a"); var text=p.text; }

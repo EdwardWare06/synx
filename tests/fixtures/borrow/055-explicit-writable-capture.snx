@@ -1,0 +1,4 @@
+// fixture: explicit writable capture
+// stage: full
+// expect: ok
+main() { int x=1; { var f=[&x] || { x+=1; x }; int n=f(); } x=3; }

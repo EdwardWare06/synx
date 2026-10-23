@@ -1,0 +1,9 @@
+// fixture: struct basics
+// stage: check
+// expect: ok
+struct Point { double x; double y;
+  double len(&const self) { return self.x * self.x + self.y * self.y; }
+  void scale(&self, double k) { self.x *= k; self.y *= k; }
+  Point origin() { return Point { x: 0.0, y: 0.0 }; }
+}
+main() { var p = Point { x: 1.0, y: 2.0 }; var l = p.len(); p.scale(2.0); var o = Point.origin(); p.x = 3.0; }

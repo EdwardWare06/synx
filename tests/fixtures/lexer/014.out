@@ -1,0 +1,19 @@
+exit 0
+--- stdout
+59-60 string start
+60-61 interpolation start
+62-64 Kw if
+65-66 (
+66-67 Ident c
+67-68 )
+69-70 {
+71-75 StringLit "in"
+76-77 }
+78-82 Kw else
+83-84 {
+85-86 IntLit 2
+87-88 }
+89-90 interpolation end
+90-91 string end
+92-92 end of file
+--- stderr

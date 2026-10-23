@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (trait Shape (fn area (ret double) (params (&const self))) (fn name (ret &const str) (params (&const self)) (block (tail "shape"))))
+trait Shape { double area(&const self); &const str name(&const self) { "shape" } }

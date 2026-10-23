@@ -1,0 +1,4 @@
+// fixture: consuming returns owned capture ref
+// stage: full
+// expect: error does not live past
+main() { int x=1; var f=once || &const x; var r=f(); }

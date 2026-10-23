@@ -1,0 +1,4 @@
+// fixture: await through reference
+// stage: check
+// expect: ok
+async int f(&Task<int> t) { return await t; }

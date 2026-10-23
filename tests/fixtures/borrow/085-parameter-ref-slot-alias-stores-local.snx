@@ -1,0 +1,4 @@
+// fixture: parameter ref slot alias stores local
+// stage: full
+// expect: error does not live past
+void f(&(&const int) p) { var q=p; int n=1; *q=&const n; }

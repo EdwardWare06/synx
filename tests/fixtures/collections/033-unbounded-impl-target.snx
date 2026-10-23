@@ -1,0 +1,4 @@
+// fixture: unbounded impl target
+// stage: full
+// expect: error does not implement
+import std.collections.{HashMap, sort}; import std.hash.Hash; trait Marker {} impl<K,V> Marker for HashMap<K,V> {}

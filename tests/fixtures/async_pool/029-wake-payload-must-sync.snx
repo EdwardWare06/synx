@@ -1,0 +1,4 @@
+// fixture: wake payload must sync
+// stage: full
+// expect: error does not implement 'Sync'
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct W { Cell<int> c; } impl Wake for W { void wake(&const self) { self.c.set(1); } } main() { var w = Waker.from(W { c: Cell.new(0) }); }

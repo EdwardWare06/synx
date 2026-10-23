@@ -1,0 +1,4 @@
+// fixture: file is move only
+// stage: full
+// expect: error use of moved value
+import std.fs.File; main() { match File.open("x") { Ok(f) => { var other=f; f.position(); } Err(_) => {} } }

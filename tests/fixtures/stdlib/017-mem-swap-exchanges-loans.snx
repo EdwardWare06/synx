@@ -1,0 +1,4 @@
+// fixture: mem swap exchanges loans
+// stage: full
+// expect: error scope
+import std.fs.File; import std.mem; main() { int outer=1; var a=&const outer; { int inner=2; var b=&const inner; mem.swap(&a, &b); } int n=*a; }

@@ -1,0 +1,4 @@
+// fixture: grouped comparisons
+// stage: check
+// expect: ok
+void f(int a,int b,int c,int d) { bool first=a < (b+1) && c > (d); if (a < (b) && c > (d)) {} for (i in 0..(b)) {} bool last=a < (b); }

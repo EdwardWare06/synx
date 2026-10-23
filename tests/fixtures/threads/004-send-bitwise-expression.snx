@@ -1,0 +1,4 @@
+// fixture: send bitwise expression
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { int send = 1; int n = send | 2; }

@@ -1,0 +1,4 @@
+// fixture: consuming captured alias stores local
+// stage: full
+// expect: error does not live past
+main() { Vec<&const int> v=Vec.new(); var callback=[&v] once || { var w=&v; int n=1; w.push(&const n); }; callback(); }

@@ -1,0 +1,4 @@
+// fixture: store own field through alias
+// stage: full
+// expect: error same owner
+struct S { int x; (&const int)? r; } void init(&S owner) { var alias=owner; alias.r=Some(&const alias.x); }

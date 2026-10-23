@@ -1,0 +1,4 @@
+// fixture: writable parameter escape
+// stage: full
+// expect: error returns a reference
+import std.collections.{HashMap, sort}; import std.hash.Hash; void f(&HashMap<int,&const int> m) { int x=1; m.insert(1,&const x); }

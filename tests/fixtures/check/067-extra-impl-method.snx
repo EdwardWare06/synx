@@ -1,0 +1,6 @@
+// fixture: extra impl method
+// stage: check
+// expect: error not a member of trait
+trait T { }
+struct S { }
+impl T for S { void g(&const self) { } }

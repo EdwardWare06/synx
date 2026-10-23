@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+59-60 Ident t
+60-61 .
+61-62 IntLit 0
+63-63 end of file
+--- stderr

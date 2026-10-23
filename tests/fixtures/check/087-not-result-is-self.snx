@@ -1,0 +1,6 @@
+// fixture: not result is self
+// stage: check
+// expect: error type mismatch
+struct Flag { bool value; }
+impl Not for Flag { Flag not(self) { return Flag { value: !self.value }; } }
+main() { bool value = !Flag { value: true }; }

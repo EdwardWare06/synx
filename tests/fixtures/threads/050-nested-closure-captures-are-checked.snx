@@ -1,0 +1,4 @@
+// fixture: nested closure captures are checked
+// stage: full
+// expect: error does not implement 'Owned'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { int n = 1; var r = &const n; thread.spawn(send once || { var inner = once || *r; return inner(); }); }

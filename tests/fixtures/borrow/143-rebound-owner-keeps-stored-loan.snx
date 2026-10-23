@@ -1,0 +1,4 @@
+// fixture: rebound owner keeps stored loan
+// stage: full
+// expect: error same owner
+struct S { int x; (&const int)? r; } void init(&S owner, &S other) { owner.r=Some(&const owner.x); owner=other; }

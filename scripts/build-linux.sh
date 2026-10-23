@@ -9,4 +9,4 @@ BUILD="$ROOT/build-linux"
 cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE="$CONFIG"
 cmake --build "$BUILD"
 ctest --test-dir "$BUILD" --output-on-failure
-"$BUILD/compiler/synx" version
+"$BUILD/selfhost-stages/synx-stage2" version

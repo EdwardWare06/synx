@@ -1,0 +1,4 @@
+// fixture: named function modes
+// stage: check
+// expect: ok
+int id(int n) { return n; } main() { fn const(int) -> int a=id; fn once(int) -> int b=id; int x=a(1); int y=b(2); }

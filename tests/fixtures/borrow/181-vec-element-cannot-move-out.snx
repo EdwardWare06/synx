@@ -1,0 +1,4 @@
+// fixture: vec element cannot move out
+// stage: full
+// expect: error cannot move an element out of `v`
+struct D { int id; } impl Drop for D { void drop(&self) {} } main() { Vec<D> v = Vec.new(); v.push(D { id: 1 }); var n = v[0]; }

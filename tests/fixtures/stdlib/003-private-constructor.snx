@@ -1,0 +1,4 @@
+// fixture: private constructor
+// stage: full
+// expect: error private to module
+import std.fs.File; main() { File f=File { handle:0 as *byte, mode:0, direction:0 }; }

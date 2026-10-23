@@ -1,0 +1,4 @@
+// fixture: cleared optional result releases argument loan
+// stage: full
+// expect: ok
+Option<&const int> clear(&const int key) { Option<&const int> result=Some(key); result=None; return result; } main() { Option<&const int> saved=None; { int local=7; saved=clear(local); } match saved { Some(r)=>print("{*r}"), None=>{} } }

@@ -1,0 +1,5 @@
+// fixture: generic struct
+// stage: check
+// expect: ok
+struct Pair<A, B> { A a; B b; Pair<A, B> make(A a, B b) { return Pair { a: a, b: b }; } }
+main() { var p = Pair.make(1, "x"); int x = p.a; &const str s = p.b; Pair<int, bool> q = Pair { a: 1, b: true }; }

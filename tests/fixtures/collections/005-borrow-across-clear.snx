@@ -1,0 +1,4 @@
+// fixture: borrow across clear
+// stage: full
+// expect: error while it is already borrowed
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m=HashMap<int,int>.new(); m.insert(1,1); var r=m.get(1); m.clear(); r.is_some(); }

@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (return 0)
+f() { return 0; }

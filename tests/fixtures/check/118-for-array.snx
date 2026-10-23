@@ -1,0 +1,4 @@
+// fixture: for array
+// stage: check
+// expect: ok
+main() { int[3] a = [1, 2, 3]; for (x in a) { int y = x; } for (r in &const a) { int z = *r; } }

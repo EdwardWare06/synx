@@ -1,0 +1,5 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (fn add (ret int) (params (int a)) (block (tail a)))
+/// Adds.
+int add(int a) { a }

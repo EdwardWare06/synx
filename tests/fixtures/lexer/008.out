@@ -1,0 +1,20 @@
+exit 1
+--- stdout
+59-65 Error invalid suffix on number literal
+66-68 Error number has no digits
+69-89 Error integer literal too large
+90-94 Error L suffix is only valid on an integer literal
+95-95 end of file
+--- stderr
+<file>:4:1: error: invalid suffix on number literal
+4 | 123abc 0x 99999999999999999999 1.5L
+  | ^^^^^^
+<file>:4:8: error: number has no digits
+4 | 123abc 0x 99999999999999999999 1.5L
+  |        ^^
+<file>:4:11: error: integer literal too large
+4 | 123abc 0x 99999999999999999999 1.5L
+  |           ^^^^^^^^^^^^^^^^^^^^
+<file>:4:32: error: L suffix is only valid on an integer literal
+4 | 123abc 0x 99999999999999999999 1.5L
+  |                                ^^^^

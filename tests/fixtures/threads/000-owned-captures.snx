@@ -1,0 +1,4 @@
+// fixture: owned captures
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var text = String.from("x"); thread.spawn(send once || { print(text); }); }

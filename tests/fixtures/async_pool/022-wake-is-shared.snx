@@ -1,0 +1,4 @@
+// fixture: wake is shared
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; void allowed<T: Send + Sync + Owned>() {} main() { allowed<Waker>(); }

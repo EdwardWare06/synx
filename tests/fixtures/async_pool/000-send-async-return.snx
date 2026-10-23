@@ -1,0 +1,4 @@
+// fixture: send async return
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send int job() { await yield_now(); return 4; } main() { SendTask<int> task = job(); }

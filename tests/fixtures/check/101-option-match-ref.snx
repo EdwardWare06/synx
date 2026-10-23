@@ -1,0 +1,4 @@
+// fixture: option match ref
+// stage: check
+// expect: ok
+f(&const int? a) { match a { Some(v) => { int x = *v; } None => { } } }

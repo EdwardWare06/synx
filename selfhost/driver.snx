@@ -1,4 +1,4 @@
-/// Command-line compiler driver. Source: compiler/src/main.cpp.
+/// Command-line compiler driver. Ported from compiler/src/main.cpp.
 /// Passes own their inputs through Compilation; inspection commands retain
 /// partial results on errors. Native builds use build.snx.
 import driver_io;
@@ -24,7 +24,7 @@ void usage() {
 int about() {
     var version = driver_io.VERSION; var host = driver_io.host_name();
     driver_io.text(1, "  o--o--o   Synx {version}\n            Created by Edward Ware\n\n  This build\n    Target      {host} / x86-64\n");
-    driver_io.text(1, "    Compiler    Synx compiler port\n    Library     Synx\n    Runtime     C platform adapters\n\n  Origins and direction\n    Started with C and C++.\n    Compiler port written in Synx; bootstrap validation pending.\n    C remains for startup, allocation, I/O, number conversion/formatting,\n    threads, synchronization, clocks, and host services.\n\n  Toolchain\n    Front end   lexer, parser, modules, and type checking\n    Dendrite    typed IR, borrow and move checks\n    Axon        x86-64 code generation and register allocation\n    Objects     ELF / COFF / Mach-O\n    Linker      built-in (--linker=system uses the host toolchain)\n\n  Planned\n    Myelin package manager; ARM64 targets\n\n  This is not an Arasaka product choom\n");
+    driver_io.text(1, "    Compiler    Synx, self-hosted\n    Library     Synx\n    Runtime     C platform adapters\n\n  Origins and direction\n    Started with C and C++.\n    The compiler is written in Synx and builds itself.\n    C remains for startup, allocation, I/O, number conversion/formatting,\n    threads, synchronization, clocks, and host services.\n\n  Toolchain\n    Front end   lexer, parser, modules, and type checking\n    Dendrite    typed IR, borrow and move checks\n    Axon        x86-64 code generation and register allocation\n    Objects     ELF / COFF / Mach-O\n    Linker      built-in (--linker=system uses the host toolchain)\n\n  Planned\n    Myelin package manager; ARM64 targets\n\n  This is not an Arasaka product choom\n");
     return 0;
 }
 Vec<byte> token_text(&const token.Token item) {

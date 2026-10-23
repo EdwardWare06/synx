@@ -1,0 +1,4 @@
+// fixture: strict type
+// stage: parse
+// expect: output parse --strict
+void f(int? x) { }

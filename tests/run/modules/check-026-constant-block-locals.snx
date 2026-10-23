@@ -1,0 +1,4 @@
+// fixture: constant block locals
+// stage: full
+// expect: ok
+import constants; main() { int n = 99; int value = constants.BLOCK; print("{n} {value}"); }

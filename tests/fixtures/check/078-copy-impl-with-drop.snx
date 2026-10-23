@@ -1,0 +1,7 @@
+// fixture: copy impl with drop
+// stage: check
+// expect: error cannot implement Copy
+struct D { int a; }
+impl Drop for D { void drop(&self) { } }
+impl Copy for D { }
+main() { }

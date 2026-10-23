@@ -1,0 +1,4 @@
+// fixture: guard cannot transfer
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void valid<T: Send>() {} main() { valid<MutexGuard<int>>(); }

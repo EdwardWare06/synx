@@ -1,0 +1,7 @@
+// fixture: try wrong error
+// stage: check
+// expect: error error type mismatch
+enum E { Bad }
+enum F { Worse }
+Result<int, E> p() { return Ok(1); }
+Result<int, F> q() { int a = p()?; return Ok(a); }

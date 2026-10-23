@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+(Module [(FunctionItem @124-148:0 "Adds one.\x0aReally." f (Function @124-148:0 "Adds one.\x0aReally." f f f (PrimitiveType @124-127:0 int) "inc" @128-131:0 [] [(Param @132-137:0 none (PrimitiveType @132-135:0 int) "a")] (Block @139-148:0 [] (Binary @141-146:0 + (Name @141-142:0 "a" []) (IntLit @145-146:0 1 f)))))])
+--- stderr

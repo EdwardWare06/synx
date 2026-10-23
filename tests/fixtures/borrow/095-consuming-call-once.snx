@@ -1,0 +1,4 @@
+// fixture: consuming call once
+// stage: full
+// expect: error moved
+main() { var f=once || 1; int a=f(); int b=f(); }

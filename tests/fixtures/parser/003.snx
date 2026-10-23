@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (|| (&& (== a b) c) d)
+f() { var e = a == b && c || d; }

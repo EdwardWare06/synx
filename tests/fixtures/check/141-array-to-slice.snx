@@ -1,0 +1,5 @@
+// fixture: array to slice
+// stage: check
+// expect: ok
+f(&const int[] s) { }
+main() { int[2] a = [1, 2]; f(a); f(&const a); }

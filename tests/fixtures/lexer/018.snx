@@ -1,0 +1,6 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+/// First line
+///  second
+int x;

@@ -1,0 +1,57 @@
+// fixture: strict module
+// stage: parse
+// expect: output parse --strict
+/// Rich module.
+import std.io;
+import std.collections.{HashMap, Vec};
+pub import std.mem.drop;
+const int LIMIT = 10;
+extern "C" { void synx_rt_exit(int code); }
+/// A point.
+struct Point<T: Eq> { /// The x field.
+    pub T x; int y; int sum(&const self) { return 1; } }
+enum Shape { Unit, Pair(int, bool), /// Named.
+    Named { int w; int h; }, int id(self) { 1 } }
+trait Area<T> { int area(&const self); int twice(&const self) { 2 } }
+impl Area<int> for Point<int> { int area(&const self) { 1 } }
+unsafe impl Send for Point<int> {}
+pub async send int work(int n) { return await other(n); }
+void types(&const int a, *const byte b, int[4] c, int[] d, int? e, (int, bool) f,
+           fn once send(int) -> int g, &const dyn Area<int> h, Self i, &int j, *int k) { }
+int body(int a, int[] items) {
+    int x = 5; var y = 1; const int z = 3; int w;
+    x += 1; items[0] = 2; x <<= 1;
+    while (x < 10) { x += 1; continue; }
+    loop { break; }
+    for (i in 0..=3) { y = i; }
+    for (i in 0..3) { }
+    var f = |int n| -> int { n };
+    var g = [&x, y] const |int n| n + x;
+    var h = once || 1;
+    var s = "a{x + 1}b"; var plain = "text";
+    var c = 'c';
+    var fl = 1.5f + 2.25;
+    var big = 12L;
+    var t = (1, 2);
+    var unit = ();
+    var arr = [1, 2, 3];
+    var rep = [0; 4];
+    var cast = x as long;
+    var m = f()?;
+    var o = a?.b;
+    var d = a ?? 1;
+    var r = &x;
+    var cr = &const x;
+    var p = Point { x: 1, y };
+    var u = unsafe { *r };
+    var neg = -x + a * 2 - ~a;
+    var inv = !true;
+    var gen = make<int>(1);
+    var fld = p.x.y;
+    var idx = items[1];
+    match x { 1 => 2, 2..=3 => 4, Some(v) if v > 1 => v, Shape.Named { w, h: hh } => w,
+              (a, b) => a, 7 | 8 => 0, Shape.Unit => 1, name => 2, _ => 3 }
+    if (a == 1) { 1 } else if (a != 2) { 2 } else { 3 }
+    return x;
+}
+

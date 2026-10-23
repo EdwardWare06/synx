@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (fn run pub async (ret void) (params) (block))
+pub async void run() { }

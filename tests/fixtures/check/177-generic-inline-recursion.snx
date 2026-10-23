@@ -1,0 +1,4 @@
+// fixture: generic inline recursion
+// stage: check
+// expect: error inline layout
+struct Wrap<T> { T value; } struct A { Wrap<A> a; }

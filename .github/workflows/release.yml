@@ -1,9 +1,9 @@
 name: release
 
-# Started by hand from the Actions tab. Each host builds the C++ stage 0,
-# runs the full self-hosting bootstrap (stages 1, 2, and 3 must emit identical
-# objects), and builds its install package. With a tag, the packages are
-# attached to that existing release.
+# Started by hand from the Actions tab. Each host builds the compiler from
+# the seed release, runs the self-hosting fixed point (stages 2 and 3 must
+# emit identical objects), and builds its install package. With a tag, the
+# packages are attached to that existing release.
 on:
   workflow_dispatch:
     inputs:
@@ -37,24 +37,19 @@ jobs:
       - name: MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
-      - name: Stage 0 (Linux and macOS)
+      - name: Build and bootstrap (Linux and macOS)
         if: runner.os != 'Windows'
         run: |
           cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build-linux
-      - name: Stage 0 (Windows)
+          ctest --test-dir build-linux -R "^bootstrap$" --output-on-failure
+      - name: Build and bootstrap (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: |
           cmake -S . -B build-win -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release || exit /b 1
           cmake --build build-win || exit /b 1
-      - name: Bootstrap (Linux and macOS)
-        if: runner.os != 'Windows'
-        run: bash scripts/bootstrap-linux.sh
-      - name: Bootstrap (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: scripts\bootstrap-win.cmd
+          ctest --test-dir build-win -R "^bootstrap$" --output-on-failure || exit /b 1
       - name: Package (Linux and macOS)
         if: runner.os != 'Windows'
         run: bash scripts/package-linux.sh

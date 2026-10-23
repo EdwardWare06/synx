@@ -1,0 +1,4 @@
+// fixture: move value
+// stage: full
+// expect: error use of moved value
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m = HashMap<int,String>.new(); var v = String.from("value"); m.insert(1,v); print(v); }

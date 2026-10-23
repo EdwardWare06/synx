@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+(Module [(FunctionItem @79-106:0 "" f (Function @79-106:0 "" f f f nil "f" @79-80:0 [] [] (Block @83-106:0 [(VarDecl @85-104:0 nil f "e" @89-90:0 (StringLit @93-103:0 "a\x0a\x22b\x5c"))] nil)))])
+--- stderr

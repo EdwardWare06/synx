@@ -1,0 +1,4 @@
+// fixture: marker impl requires unsafe
+// stage: full
+// expect: error require unsafe impl
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; struct S { *byte raw; } impl Send for S {}

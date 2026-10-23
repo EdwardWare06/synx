@@ -1,0 +1,4 @@
+// fixture: exclusive array callback
+// stage: full
+// expect: ok
+main() { var fs = [|| 1]; var r = &fs; int n = r[0](); }

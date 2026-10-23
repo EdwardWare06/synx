@@ -1,0 +1,4 @@
+// fixture: guard cannot be owned
+// stage: full
+// expect: error does not implement 'Owned'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void valid<T: Owned>() {} main() { valid<MutexGuard<int>>(); }

@@ -1,0 +1,4 @@
+// fixture: task blocks caller mutation
+// stage: full
+// expect: error borrowed
+async int f(&const int r) { return *r; } main() { int n=1; var task=f(&const n); n=2; }

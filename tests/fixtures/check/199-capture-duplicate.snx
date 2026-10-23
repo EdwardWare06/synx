@@ -1,0 +1,4 @@
+// fixture: capture duplicate
+// stage: check
+// expect: error duplicate capture
+main() { int n=1; var f=[n,n] || n; }

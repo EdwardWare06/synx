@@ -1,0 +1,5 @@
+// fixture: while
+// stage: full
+// expect: ir has <(copy _
+// expect: ir has +(copy _
+main() { int i = 0; while (i < 3) { i += 1; } }

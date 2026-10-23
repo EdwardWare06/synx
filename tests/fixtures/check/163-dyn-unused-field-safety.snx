@@ -1,0 +1,4 @@
+// fixture: dyn unused field safety
+// stage: check
+// expect: error cannot be used as dyn
+trait Bad { Self f(&const self); } struct S { &const dyn Bad field; }

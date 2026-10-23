@@ -1,0 +1,4 @@
+// fixture: shared capture mutation
+// stage: full
+// expect: error read only
+main() { int x=1; var f=const || { x+=1; x }; }

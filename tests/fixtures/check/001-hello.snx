@@ -1,0 +1,4 @@
+// fixture: hello
+// stage: check
+// expect: ok
+main() { print("hi"); }

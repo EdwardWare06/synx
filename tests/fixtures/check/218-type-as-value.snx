@@ -1,0 +1,5 @@
+// fixture: type as value
+// stage: check
+// expect: error is a type, not a value
+struct S { int a; }
+main() { var x = S; }

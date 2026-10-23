@@ -1,0 +1,4 @@
+// fixture: pub needs ret
+// stage: check
+// expect: error pub function must write its return type
+pub f() { }

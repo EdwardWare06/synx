@@ -1,0 +1,19 @@
+exit 0
+--- stdout
+0-4 Ident main
+4-5 (
+5-6 )
+6-7 {
+8-11 Kw var
+12-13 Ident x
+14-15 =
+16-22 StringLit "a
+22-23 ;
+24-27 Kw var
+28-29 Ident �
+30-31 =
+32-33 IntLit 1
+33-34 ;
+35-36 }
+37-37 end of file
+--- stderr

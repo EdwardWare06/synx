@@ -1,0 +1,4 @@
+// fixture: element can move out through swap and pop
+// stage: full
+// expect: ok
+import std.mem; struct D { int id; } impl Drop for D { void drop(&self) {} } main() { Vec<D> v = Vec.new(); v.push(D { id: 1 }); var n = v.pop(); D[1] a = [D { id: 2 }]; var m = mem.replace(&a[0], D { id: 3 }); }

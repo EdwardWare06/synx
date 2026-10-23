@@ -1,0 +1,4 @@
+// fixture: reference capture
+// stage: full
+// expect: ok
+main() { int x = 1; var r = &const x; var f = || *r; }

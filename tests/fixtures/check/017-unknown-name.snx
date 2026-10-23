@@ -1,0 +1,4 @@
+// fixture: unknown name
+// stage: check
+// expect: error unknown name 'x'
+main() { x = 1; }

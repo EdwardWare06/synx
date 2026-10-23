@@ -1,0 +1,4 @@
+// fixture: const field callback
+// stage: full
+// expect: error requires writable access
+struct S { fn() -> int f; } main() { var s = S { f: || 1 }; var r = &const s; int n = r.f(); }

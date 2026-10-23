@@ -1,0 +1,4 @@
+// fixture: generic grouped arguments
+// stage: check
+// expect: ok
+T id<T>(T value) { return value; } main() { int n=1; var r=&const n; var rr=&const r; var same=id<&const (&const int)>(rr); var tuple=id<(int,bool)>((1,true)); var callback=id<fn(int)->int>(|int x| x+1); }

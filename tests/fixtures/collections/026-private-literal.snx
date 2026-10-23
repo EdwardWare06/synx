@@ -1,0 +1,4 @@
+// fixture: private literal
+// stage: full
+// expect: error private to module
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { HashMap<int,int> m=HashMap { states:0 as *byte, keys:0 as *int, values:0 as *int, len:0, used:0, cap:0 }; }

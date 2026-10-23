@@ -1,0 +1,19 @@
+exit 1
+--- stdout
+(Module [(Struct @0-34:0 "" f "Broken" [] [(FieldDecl @16-26:0 "" f (PrimitiveType @16-19:0 int) "value")] [(Function @27-34:0 "" f f f nil "main" @27-31:0 [] [(Param @33-34:0 none (PrimitiveType @33-34:0 void) "")] (Block @33-34:0 [] nil))])])
+--- stderr
+malformed.snx:2:7: error[SNX0201]: expected a type, found {
+2 | main( {
+  |       ^
+malformed.snx:2:7: error[SNX0201]: expected parameter name, found {
+2 | main( {
+  |       ^
+malformed.snx:2:7: error[SNX0201]: expected ')', found {
+2 | main( {
+  |       ^
+malformed.snx:3:1: error[SNX0201]: expected '}', found end of file
+3 | 
+  | ^
+malformed.snx:3:1: error[SNX0201]: expected '}', found end of file
+3 | 
+  | ^

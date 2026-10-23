@@ -1,0 +1,4 @@
+// fixture: recursive owners
+// stage: check
+// expect: ok
+struct Node { Vec<Node> children; } enum List { Nil, Cons(int, Box<List>) } main() { var n = Box<int>.new(1); int x = n.into_inner(); }

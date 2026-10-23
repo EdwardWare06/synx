@@ -1,0 +1,4 @@
+// fixture: consuming captured ownership
+// stage: full
+// expect: ok
+main() { var text=String.from("x"); var f=once || text; var result=f(); }

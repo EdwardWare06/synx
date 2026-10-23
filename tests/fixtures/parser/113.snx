@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (fn bigger (generics (T Shape)) (ret &const T) (params (&const T a) (&const T b)) (block (tail a)))
+&const T bigger<T: Shape>(&const T a, &const T b) { a }

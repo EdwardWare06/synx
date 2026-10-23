@@ -1,0 +1,4 @@
+// fixture: wrong return type
+// stage: check
+// expect: error type mismatch in return value
+int f() { return "x"; }

@@ -1,0 +1,4 @@
+// fixture: sort preserves active borrow
+// stage: full
+// expect: error while it is already borrowed
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var v=Vec<int>.new(); v.push(1); var r=v.get(0); sort(&v); r.is_some(); }

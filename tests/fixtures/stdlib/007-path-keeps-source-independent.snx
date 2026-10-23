@@ -1,0 +1,4 @@
+// fixture: path keeps source independent
+// stage: full
+// expect: ok
+import std.fs.File; import std.path.Path; main() { Path p; { var text=String.from("a"); p=Path.from(text); } p.is_absolute(); }

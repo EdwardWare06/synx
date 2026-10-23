@@ -1,0 +1,4 @@
+// fixture: private through import
+// stage: full
+// expect: error private to module
+import private.secret; main() {}

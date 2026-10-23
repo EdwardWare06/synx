@@ -1,0 +1,4 @@
+// fixture: guard output cannot escape
+// stage: full
+// expect: error this returns a reference
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; MutexGuard<int> bad() { var m = Mutex.new(1); return m.lock(); }

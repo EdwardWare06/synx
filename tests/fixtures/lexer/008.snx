@@ -1,0 +1,4 @@
+// fixture: lexer case
+// stage: lex
+// expect: output lex
+123abc 0x 99999999999999999999 1.5L

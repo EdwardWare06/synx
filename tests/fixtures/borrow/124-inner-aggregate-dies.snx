@@ -1,0 +1,4 @@
+// fixture: inner aggregate dies
+// stage: full
+// expect: error does not live past this scope
+struct S { int n; } main() { &const S r; { var s = S { n: 1 }; r = &const s; } int n = r.n; }

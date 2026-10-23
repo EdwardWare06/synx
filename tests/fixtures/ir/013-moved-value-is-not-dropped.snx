@@ -1,0 +1,6 @@
+// fixture: moved value is not dropped
+// stage: full
+// expect: ir main lacks drop _1
+struct S { String s; }
+f(S s) { }
+main() { var x = S { s: String.from("a") }; f(x); }

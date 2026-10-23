@@ -1,0 +1,4 @@
+// fixture: box contains local loan
+// stage: full
+// expect: error scope
+main() { Box<&const int> b; { int n = 1; b = Box.new(&const n); } int n = **b.as_ref(); }

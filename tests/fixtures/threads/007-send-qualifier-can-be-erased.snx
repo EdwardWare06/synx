@@ -1,0 +1,4 @@
+// fixture: send qualifier can be erased
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { fn once() -> int f = send once || 4; int n = f(); }

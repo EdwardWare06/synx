@@ -1,0 +1,4 @@
+// fixture: Copy cannot duplicate closure field
+// stage: full
+// expect: error cannot implement Copy
+struct S { fn() -> int f; } impl Copy for S {} main() { var s = S { f: || 1 }; var t = s; var u = s; }

@@ -1,0 +1,4 @@
+// fixture: tuple match
+// stage: check
+// expect: ok
+int f(bool a, bool b) { match (a, b) { (true, true) => return 1, (true, false) => return 2, (false, _) => return 3 } }

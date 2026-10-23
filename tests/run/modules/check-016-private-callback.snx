@@ -1,0 +1,4 @@
+// fixture: private callback
+// stage: full
+// expect: error private to module
+import private_callback; main() { var s = private_callback.make(); int n = s.callback(); }

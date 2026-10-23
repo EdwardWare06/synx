@@ -1,0 +1,14 @@
+// fixture: structs
+// stage: full
+// expect: ir has P {const 1_double, const 2_double}
+// expect: ir has call P.len(copy _
+// expect: ir has call P.bump(copy _
+// expect: ir has T::0(const 3_int)
+// expect: ir has T::1()
+// expect: ir has discriminant(_1)
+// expect: ir has (_1 as variant 0).0
+// expect: ir has (*_1).0
+struct P { double x; double y; double len(&const self) { return self.x * self.x; } void bump(&self) { self.x += 1.0; } }
+enum T { A(int), B }
+int g(T t) { match t { T.A(n) => return n, T.B => return 0 } }
+main() { var p = P { x: 1.0, y: 2.0 }; var l = p.len(); p.bump(); int v = g(T.A(3)); int w = g(T.B); }

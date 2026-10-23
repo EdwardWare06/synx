@@ -1,0 +1,5 @@
+// fixture: auto borrow const
+// stage: check
+// expect: ok
+f(&const int x) { }
+main() { int a = 1; f(a); f(&const a); }

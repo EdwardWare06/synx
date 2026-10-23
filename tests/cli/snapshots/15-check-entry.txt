@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+entry café λ.snx: ok
+--- stderr

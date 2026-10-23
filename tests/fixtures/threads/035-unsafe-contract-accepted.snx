@@ -1,0 +1,4 @@
+// fixture: unsafe contract accepted
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; struct S { *byte raw; } unsafe impl Send for S {} unsafe impl Owned for S {} main() { var s = S { raw: 0 as *byte }; thread.spawn(send once || s); }

@@ -1,0 +1,4 @@
+// fixture: option take keeps payload loan
+// stage: full
+// expect: error scope
+import std.fs.File; main() { Option<&const int> r; { int inner=2; var option=Some(&const inner); r=option.take(); } int n=*r.unwrap(); }

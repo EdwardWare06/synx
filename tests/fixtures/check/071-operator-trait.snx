@@ -1,0 +1,6 @@
+// fixture: operator trait
+// stage: check
+// expect: ok
+struct V { int x; }
+impl Add for V { V add(self, V o) { return V { x: self.x + o.x }; } }
+main() { var a = V { x: 1 }; var b = V { x: 2 }; var c = a + b; }

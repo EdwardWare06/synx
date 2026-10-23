@@ -1,0 +1,4 @@
+// fixture: optional explicit destructor
+// stage: check
+// expect: error cannot be called explicitly
+main() { var b=Some(Box<int>.new(1)); b?.drop(); }

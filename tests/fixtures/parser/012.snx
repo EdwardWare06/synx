@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (&const (. x y))
+f() { var e = &const x.y; }

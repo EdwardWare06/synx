@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (call (. (name Vec (targs int)) new))
+f() { var e = Vec<int>.new(); }

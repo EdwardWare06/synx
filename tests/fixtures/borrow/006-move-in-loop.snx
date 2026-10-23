@@ -1,0 +1,7 @@
+// fixture: move in loop
+// stage: full
+// expect: error moved
+struct S { int a; }
+impl Drop for S { void drop(&self) { } }
+f(S s) { }
+main(){ var x = S { a: 1 }; while (true) { f(x); } }

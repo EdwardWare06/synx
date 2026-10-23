@@ -1,0 +1,4 @@
+// fixture: writable and shared result
+// stage: full
+// expect: error while it is borrowed as writable
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m=HashMap<int,int>.new(); m.insert(1,1); var r=m.get_mut(1); var s=m.get(1); r.is_some(); s.is_some(); }

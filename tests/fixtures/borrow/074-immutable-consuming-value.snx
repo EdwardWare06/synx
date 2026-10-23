@@ -1,0 +1,4 @@
+// fixture: immutable consuming value
+// stage: full
+// expect: ok
+main() { const f=once || 1; int n=f(); }

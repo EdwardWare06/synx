@@ -1,0 +1,4 @@
+// fixture: blocking closure must own
+// stage: full
+// expect: error does not implement 'Owned'
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; import std.task.pool.BlockingPool; main() { int n = 1; var r = &const n; match BlockingPool.new(1) { Ok(pool) => { pool.spawn(send once || *r); }, Err(_) => {} } }

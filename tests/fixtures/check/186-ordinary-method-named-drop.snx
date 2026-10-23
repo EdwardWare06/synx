@@ -1,0 +1,4 @@
+// fixture: ordinary method named drop
+// stage: check
+// expect: ok
+struct S { void drop(&self) {} } main() { var s=S {}; s.drop(); }

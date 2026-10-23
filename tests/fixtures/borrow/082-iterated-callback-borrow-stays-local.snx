@@ -1,0 +1,4 @@
+// fixture: iterated callback borrow stays local
+// stage: full
+// expect: ok
+struct H { fn() -> int f; } main() { Vec<H> v=Vec.new(); v.push(H { f:|| 1 }); for (h in &v) { int n=h.f(); } }

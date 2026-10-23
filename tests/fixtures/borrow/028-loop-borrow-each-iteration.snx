@@ -1,0 +1,6 @@
+// fixture: loop borrow each iteration
+// stage: full
+// expect: ok
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+main() { var x = S { a: 1 }; for (i in 0..3) { var r = &x; r.bump(); } x.a = 0; }

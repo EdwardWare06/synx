@@ -1,0 +1,4 @@
+// fixture: typed
+// stage: check
+// expect: ok
+main() { int x = 5; x = x + 1; }

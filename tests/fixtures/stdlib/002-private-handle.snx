@@ -1,0 +1,4 @@
+// fixture: private handle
+// stage: full
+// expect: error private to module
+import std.fs.File; main() { match File.open("x") { Ok(f) => { var p=f.handle; } Err(_) => {} } }

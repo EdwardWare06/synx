@@ -1,0 +1,6 @@
+// fixture: not enum
+// stage: check
+// expect: ok
+enum Switch { On, Off }
+impl Not for Switch { Switch not(self) { return match self { On => Switch.Off, Off => Switch.On }; } }
+main() { Switch value = !Switch.On; }

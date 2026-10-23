@@ -25,11 +25,15 @@ jobs:
       - name: Ownership allocation check
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          SYNX_STD_PATH: ${{ github.workspace }}/std
+          SYNX_LINKER: system
+          SYNX_RUNTIME_LIB: ${{ github.workspace }}/build/runtime/libsynx_rt.a
         run: |
           asan="$(cc -print-file-name=libasan.so)"
           test -f "$asan"
           for case_name in recursive_owners recursive_mutation closure_modes async_core async_cancel async_executor async_futures async_outputs thread_core thread_sync thread_drop thread_channel pool_core pool_cancel pool_race pool_time pool_io host comparison_cleanup partial_move_cleanup; do
-            build/compiler/synx build "tests/run/$case_name.snx" -o "build/$case_name-memory"
+            build/selfhost-stages/synx-stage2 build "tests/run/$case_name.snx" -o "build/$case_name-memory"
             input=/dev/null
             if test -f "tests/run/$case_name.stdin"; then input="tests/run/$case_name.stdin"; fi
             LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 "build/$case_name-memory" < "$input"
@@ -37,44 +41,60 @@ jobs:
       - name: Failed thread creation cleanup
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          SYNX_STD_PATH: ${{ github.workspace }}/std
+          SYNX_LINKER: system
+          SYNX_RUNTIME_LIB: ${{ github.workspace }}/build/runtime/libsynx_rt.a
         run: |
           cc -shared -fPIC tests/faults/thread_create.c -o build/thread-failure.so
-          build/compiler/synx build tests/faults/thread_spawn.snx -o build/thread-failure
+          build/selfhost-stages/synx-stage2 build tests/faults/thread_spawn.snx -o build/thread-failure
           asan="$(cc -print-file-name=libasan.so)"
           LD_PRELOAD="$asan:$PWD/build/thread-failure.so" ASAN_OPTIONS=detect_leaks=1 build/thread-failure
       - name: Self-hosted lexer allocation check
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          SYNX_STD_PATH: ${{ github.workspace }}/std
+          SYNX_LINKER: system
+          SYNX_RUNTIME_LIB: ${{ github.workspace }}/build/runtime/libsynx_rt.a
         run: |
-          build/compiler/synx build selfhost/lexer_probe.snx -o build/selfhost-lexer-memory
+          build/selfhost-stages/synx-stage2 build selfhost/lexer_probe.snx -o build/selfhost-lexer-memory
           git ls-files -- 'selfhost/*.snx' 'std/*.snx' 'tests/*.snx' 'examples/*.snx' > build/selfhost-manifest.txt
           asan="$(cc -print-file-name=libasan.so)"
           LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-lexer-memory build/selfhost-manifest.txt build/selfhost-report.bin
       - name: Self-hosted parser allocation check
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          SYNX_STD_PATH: ${{ github.workspace }}/std
+          SYNX_LINKER: system
+          SYNX_RUNTIME_LIB: ${{ github.workspace }}/build/runtime/libsynx_rt.a
         run: |
-          build/compiler/synx build selfhost/parser_probe.snx -o build/selfhost-parser-memory
+          build/selfhost-stages/synx-stage2 build selfhost/parser_probe.snx -o build/selfhost-parser-memory
           git ls-files -- 'selfhost/*.snx' 'std/*.snx' 'tests/*.snx' 'examples/*.snx' | sed 's/^/M	/' > build/selfhost-parser-manifest.txt
           asan="$(cc -print-file-name=libasan.so)"
           LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-parser-memory build/selfhost-parser-manifest.txt build/selfhost-parser-report.bin
       - name: Self-hosted declaration allocation check
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          SYNX_STD_PATH: ${{ github.workspace }}/std
+          SYNX_LINKER: system
+          SYNX_RUNTIME_LIB: ${{ github.workspace }}/build/runtime/libsynx_rt.a
         run: |
-          build/compiler/synx build selfhost/types_probe.snx -o build/selfhost-types-memory
-          build/compiler/synx build selfhost/modules_probe.snx -o build/selfhost-modules-memory
+          build/selfhost-stages/synx-stage2 build selfhost/types_probe.snx -o build/selfhost-types-memory
+          build/selfhost-stages/synx-stage2 build selfhost/modules_probe.snx -o build/selfhost-modules-memory
           printf '%s\n' "$PWD/tests/run/modules/main.snx" "$PWD/tests/run/modules/reexport_bad_a.snx" "$PWD/examples/workbench/main.snx" > build/selfhost-modules-manifest.txt
           asan="$(cc -print-file-name=libasan.so)"
           LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-types-memory build/selfhost-types-report.bin
-          SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory compiler/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-modules-report.bin
-          SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory compiler/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-signatures-report.bin signatures
-          SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory compiler/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-all-report.bin all
+          SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory selfhost/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-modules-report.bin
+          SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory selfhost/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-signatures-report.bin signatures
+          SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory selfhost/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-all-report.bin all
       - name: Version
         shell: bash
         run: |
-          if [ -f build/compiler/Debug/synx.exe ]; then
-            build/compiler/Debug/synx.exe version
+          if [ -f build/selfhost-stages/synx-stage2.exe ]; then
+            build/selfhost-stages/synx-stage2.exe version
           else
-            build/compiler/synx version
+            build/selfhost-stages/synx-stage2 version
           fi

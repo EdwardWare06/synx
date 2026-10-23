@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (enum Shape (variant Circle double) (variant Rect (field double w) (field double h)))
+enum Shape { Circle(double), Rect { double w; double h; } }

@@ -1,0 +1,4 @@
+exit 0
+--- stdout
+(Module [(Import @0-14:0 "" f (Path @0-13:0 [(Segment @7-10:0 "std") (Segment @11-13:0 "io")]) []) (Struct @15-41:0 "" f "Item" [] [(FieldDecl @29-39:0 "" f (PrimitiveType @29-32:0 int) "value")] []) (FunctionItem @42-139:0 "" f (Function @42-139:0 "" f f f (PrimitiveType @42-45:0 int) "main" @46-50:0 [] [] (Block @53-139:0 [(VarDecl @55-81:0 (PrimitiveType @55-61:0 double) f "x" @62-63:0 (FloatLit @66-80:0 #3ff3c0ca428c51f2 f)) (VarDecl @82-101:0 (PrimitiveType @82-86:0 char) f "c" @87-88:0 (CharLit @91-100:0 955)) (ExprStmt @102-127:0 (Call @102-126:0 (Field @102-110:0 (Name @102-104:0 "io" []) "print" @105-110:0 []) [(StringLit @111-125:0 "driver caf\xc3\xa9")]) t) (ExprStmt @128-137:0 (Return @128-136:0 (IntLit @135-136:0 7 f)) t)] nil)))])
+--- stderr

@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (unsafe (block (tail (call f))))
+f() { var e = unsafe { f() }; }

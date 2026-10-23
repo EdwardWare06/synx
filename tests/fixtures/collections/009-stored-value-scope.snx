@@ -1,0 +1,4 @@
+// fixture: stored value scope
+// stage: full
+// expect: error does not live past this scope
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m=HashMap<int,&const int>.new(); { int x=1; m.insert(1,&const x); } m.len(); }

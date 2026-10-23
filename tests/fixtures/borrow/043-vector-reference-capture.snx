@@ -1,0 +1,4 @@
+// fixture: vector reference capture
+// stage: full
+// expect: ok
+main() { int x = 1; Vec<&const int> refs = Vec.new(); refs.push(&const x); var f = || refs.len(); }

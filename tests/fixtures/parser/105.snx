@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (for t (&const tokens) (block))
+f() { for (t in &const tokens) { } }

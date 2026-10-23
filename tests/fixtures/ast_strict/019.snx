@@ -1,0 +1,5 @@
+// fixture: strict module
+// stage: parse
+// expect: output parse --strict
+/// note
+void f() { }

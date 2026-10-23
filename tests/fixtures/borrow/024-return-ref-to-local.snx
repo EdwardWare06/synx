@@ -1,0 +1,6 @@
+// fixture: return ref to local
+// stage: full
+// expect: error returns a reference to `x`
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+&const S f() { var x = S { a: 1 }; return &const x; }

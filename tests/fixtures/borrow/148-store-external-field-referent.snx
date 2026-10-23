@@ -1,0 +1,4 @@
+// fixture: store external field referent
+// stage: full
+// expect: ok
+struct S { &const int external; (&const int)? r; void init(&self) { self.r=Some(&const *self.external); } }

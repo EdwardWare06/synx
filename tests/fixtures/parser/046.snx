@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (closure (params) 1)
+f() { var e = || 1; }

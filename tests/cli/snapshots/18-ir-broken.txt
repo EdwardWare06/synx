@@ -1,0 +1,7 @@
+exit 1
+--- stdout
+--- stderr
+broken.snx:1:22: error[SNX0402]: type mismatch in variable initializer: expected 'int', found 'bool'
+1 | int main() { int x = true; return x; }
+  |                      ^^^^
+1 error

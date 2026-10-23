@@ -1,0 +1,4 @@
+// fixture: returned borrow prevents call
+// stage: full
+// expect: error while it is already borrowed
+main() { int x = 1; var f = || &const x; var r = f(); var s = f(); int n = *r; }

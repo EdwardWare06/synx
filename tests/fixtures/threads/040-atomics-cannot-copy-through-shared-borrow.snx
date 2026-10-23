@@ -1,0 +1,4 @@
+// fixture: atomics cannot copy through shared borrow
+// stage: full
+// expect: error out of a reference
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var a = AtomicUsize.new(0); var r = &const a; var b = *r; }

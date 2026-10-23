@@ -1,0 +1,4 @@
+// fixture: sized reference pointer cast
+// stage: check
+// expect: ok
+main() { int x=1; var shared=(&const x) as *const int; var writable=(&x) as *int; }

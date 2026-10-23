@@ -1,0 +1,4 @@
+// fixture: uninit use
+// stage: full
+// expect: error used before it is assigned
+main() { int x; int y = x; }

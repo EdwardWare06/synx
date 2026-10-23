@@ -1,0 +1,4 @@
+// fixture: store own field through helper
+// stage: full
+// expect: error same owner
+struct S { int x; (&const int)? r; } void save(&S owner, &const int r) { owner.r=Some(r); } void init(&S owner) { var r=&const owner.x; save(&*owner,r); }

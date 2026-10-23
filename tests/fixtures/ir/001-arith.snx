@@ -1,0 +1,7 @@
+// fixture: arith
+// stage: full
+// expect: ir has +(copy _1, copy _2)
+// expect: ir has call add(const 1_int, const 2_int)
+// expect: ir has // x
+int add(int a, int b) { return a + b; }
+main() { int x = add(1, 2); }

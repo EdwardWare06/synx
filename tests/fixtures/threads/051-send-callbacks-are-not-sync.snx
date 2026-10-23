@@ -1,0 +1,4 @@
+// fixture: send callbacks are not Sync
+// stage: full
+// expect: error does not implement 'Sync'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; void shared<T: Sync>() {} main() { shared<fn const send()>(); }

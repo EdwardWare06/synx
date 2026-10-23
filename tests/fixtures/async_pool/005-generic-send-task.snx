@@ -1,0 +1,4 @@
+// fixture: generic send task
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send T job<T: Send + Owned>(T value) { await yield_now(); return value; } main() { var task = job(String.from("owned")); }

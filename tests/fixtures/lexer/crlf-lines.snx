@@ -1,0 +1,6 @@
+// fixture: line numbers after CRLF line ends
+// stage: lex
+// expect: output lex
+ab
+cd
+@

@@ -1,0 +1,4 @@
+// fixture: strict expression
+// stage: parse
+// expect: output parse --strict
+f() { var e = "é"; }

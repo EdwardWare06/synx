@@ -1,0 +1,4 @@
+// fixture: namespace isolation
+// stage: full
+// expect: error no public item 'child'
+import isolation; import bundle.child; main() {}

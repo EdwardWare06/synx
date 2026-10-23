@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+59-85 DocComment "First line
+ second"
+86-89 Kw int
+90-91 Ident x
+91-92 ;
+93-93 end of file
+--- stderr

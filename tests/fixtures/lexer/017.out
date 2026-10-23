@@ -1,0 +1,8 @@
+exit 0
+--- stdout
+59-60 Ident a
+69-70 Ident b
+102-103 Ident c
+114-115 Ident d
+116-116 end of file
+--- stderr

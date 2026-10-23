@@ -1,0 +1,4 @@
+// fixture: capture unknown
+// stage: check
+// expect: error unknown captured variable
+main() { var f=[&const missing] || 1; }

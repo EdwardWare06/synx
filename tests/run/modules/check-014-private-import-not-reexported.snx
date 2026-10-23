@@ -1,0 +1,4 @@
+// fixture: private import not reexported
+// stage: full
+// expect: error no public item
+import facade; main() { var x = facade.left.make(); }

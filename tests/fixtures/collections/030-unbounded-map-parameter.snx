@@ -1,0 +1,4 @@
+// fixture: unbounded map parameter
+// stage: full
+// expect: error does not implement
+import std.collections.{HashMap, sort}; import std.hash.Hash; void f<K,V>(HashMap<K,V> m) {}

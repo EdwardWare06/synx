@@ -1,0 +1,4 @@
+// fixture: bounded enum
+// stage: check
+// expect: error does not implement 'Eq'
+struct Bad {} enum E<T: Eq> { Empty } main() { var value=E<Bad>.Empty; }

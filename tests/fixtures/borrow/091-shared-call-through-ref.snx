@@ -1,0 +1,4 @@
+// fixture: shared call through ref
+// stage: full
+// expect: ok
+int apply(&const fn const(int) -> int f) { return f(1); } main() { const f=const |int x| x+1; int n=apply(f); }

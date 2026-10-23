@@ -1,0 +1,6 @@
+// fixture: return ref through param
+// stage: full
+// expect: ok
+struct S { int a; void bump(&self) { self.a += 1; } int get(&const self) { return self.a; } }
+impl Drop for S { void drop(&self) { } }
+&const int f(&const S s) { return &const s.a; }

@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (struct Point (x 1.0) (y))
+f() { var e = Point { x: 1.0, y }; }

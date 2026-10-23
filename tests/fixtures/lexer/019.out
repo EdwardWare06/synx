@@ -1,0 +1,7 @@
+exit 1
+--- stdout
+75-75 end of file
+--- stderr
+<file>:4:1: error: unterminated block comment
+4 | /* never closed
+  | ^^

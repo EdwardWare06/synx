@@ -1,0 +1,4 @@
+// fixture: unsafe non-marker impl rejected
+// stage: full
+// expect: error unsafe impl requires
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; struct S {} trait A {} unsafe impl A for S {}

@@ -1,10 +1,18 @@
-# Synx compiler port
+# Synx compiler
 
-The C++ compiler remains stage 0. These modules implement the source, lexer,
-parser, declaration, module-loading, signature-resolution, body-checking,
-Dendrite lowering, borrow-checking, and async frame conversion stages, plus
-type layout, register allocation, the x86-64 encoder, the object writers,
-and instruction selection. The driver remains in `compiler/`.
+The Synx compiler is written in Synx. These modules implement the source,
+lexer, parser, declaration, module-loading, signature-resolution,
+body-checking, Dendrite lowering, borrow-checking, and async frame conversion
+stages, plus type layout, register allocation, the x86-64 encoder, the object
+writers, instruction selection, the built-in linker (`link/`), and the driver
+(`main.snx`, `driver*.snx`, `build.snx`).
+
+The first compiler was written in C++ (stage 0). Each module here was ported
+from it and compared byte for byte against it before release 0.1.0. The C++
+compiler was retired after 0.1.0. A source build now starts from the
+previous Synx release (the seed, `scripts/seed.json`); see "Bootstrap" below.
+Sections that name a C++ file or stage 0 describe the behavior that the port
+preserves.
 
 ## Modules
 
@@ -94,19 +102,13 @@ NUL-terminated buffer and calls C `strtod`. It returns `0`, `EINVAL`, or
 
 The decimal point is a literal `.`. Separators and suffixes are removed by
 the lexer. Conversion uses the process C locale. Underflow errors follow
-the host C library. Comparisons run against stage 0 on the same host.
+the host C library. Before 0.1.0, results matched stage 0 on the same host.
 This native conversion remains part of the C runtime boundary.
 
-## Validation
+## Lexer probe
 
-CTest target: `selfhost_lexer`.
-
-The C++ harness builds the Synx probe in four modes: debug/release arithmetic
-and register/stack allocation. Each mode compares every `.snx` source under
-`selfhost`, `std`, `tests`, and `examples`, plus fixed and seeded malformed
-fixtures. Seed: `0x534e5801`.
-
-Compared fields:
+`lexer_probe.snx` writes the report below for a manifest of sources. CI runs
+it under the leak checker. The fields it reports:
 
 - Token kind names, keyword flags, primitive-type flags.
 - Token kind, file ID, span, decoded bytes, integer value, double bits.
@@ -129,8 +131,6 @@ kind's name blob and two u8 flags. Each source appends:
    plus one; line-text blobs for lines 0 through line count plus one.
 4. Merged span; source-selection diagnostic blob.
 
-Failed comparisons retain expected/actual reports and inputs in the test
-folder printed by the harness.
 
 ## Parser contract
 
@@ -160,11 +160,10 @@ type arguments; their qualified name is copied at declaration.
 `Subst.apply(ctx, id)` recursively replaces parameters and interns the result.
 An empty substitution preserves IDs. `TypeId.none()` propagates unchanged.
 
-`selfhost_types_0` through `selfhost_types_3` compare formatting, predicates,
-substitution, and the complete type identity matrix against C++ in all four
-arithmetic/allocation modes. The probe takes one report path. Reports contain
-sample count (u64), inference count (u32), then a name blob and thirteen u8
-predicate flags per sample, followed by the row-major u8 identity matrix.
+`types_probe.snx` takes one report path. Reports contain sample count (u64),
+inference count (u32), then a name blob and thirteen u8 predicate flags per
+sample, followed by the row-major u8 identity matrix. CI runs it under the
+leak checker.
 
 ## Declaration and module loading
 
@@ -174,9 +173,10 @@ arenas remain owned by the loader. `run()` is called once; it returns false
 when parsing, filesystem access, declaration, or import binding fails.
 Diagnostics and partial semantic state remain available through `resolver`.
 
-`compiler/prelude.snx` is the shared prelude. CMake embeds its bytes in the C++
-compiler through `prelude_embedded.hpp.in`; the Synx probe reads the same file.
-`run()` stops before signature resolution. The active compiler remains C++.
+`prelude.snx` is the prelude. `prelude_source.snx` embeds its bytes in the
+compiler; regenerate it with `embed_prelude.snx` after a prelude change. The
+`cli` test checks that the two agree. `run()` stops before signature
+resolution.
 
 `DefId`, `ModuleId`, and `TypeId` own no references. Definition IDs contain an
 arena kind and index. `Definition.ast_file` and `ast_index` identify the source
@@ -191,7 +191,7 @@ on host failure. Empty environment values disable the library on POSIX;
 Windows ignores an empty value. `std.prelude` remains available in either case.
 Filesystem operation failures report `SNX0303` at the first entry item span.
 
-`synx modules <file>` prints the C++ declaration oracle. IDs use `kind#index`.
+`synx modules <file>` prints the declaration dump. IDs use `kind#index`.
 Module and definition records use creation order; symbol tables use map order.
 Records include spans, visibility, namespace owners/bases, prelude links,
 function owners, generic parameters, declaration worklists, builtin str
@@ -200,15 +200,8 @@ and backslashes use `\xHH`. No pointer address appears in the report.
 
 `modules_probe <prelude> <std-fallback> <manifest> <report>` reads one UTF-8 entry
 path per manifest line. For each entry it writes two length-prefixed blobs:
-the declaration dump and rendered diagnostics. The C++ harness compares each
-byte and retains failed manifests, report offsets, and expected/actual reports.
-
-`selfhost_frontend_0` through `selfhost_frontend_3` compare every entry under
-`tests/run` and `examples`, generated cyclic and diamond graphs, re-exports,
-privacy/conflicts, enum variants, module directories, hard links, Unicode and
-relative paths, standard-library overrides/fallbacks, and token mutations.
-Symbolic links and denied reads are tested when host permissions allow them.
-Linux allocation checks cover both probes, successful imports, and failures.
+the declaration dump and rendered diagnostics. CI runs it under the leak
+checker for successful imports and failures.
 
 ## Signature resolution
 
@@ -227,7 +220,7 @@ parameters report during this stage. `Scope` lists generic owners innermost
 first; the innermost non-none `Self` applies. Parameter types intern by owner
 `DefId` and index.
 
-`synx modules <file> --signatures` prints the C++ oracle after
+`synx modules <file> --signatures` prints the dump for this stage after
 `Compilation::run_signatures()`. The dump adds struct fields, variant tuple
 types and fields, generic bounds `(trait type...)`, and impl trait references.
 Each type prints its `to_string` text followed by `{owner:index ...}` for the
@@ -259,7 +252,7 @@ references into syntax trees; each method takes the tree vector.
 
 `modules_probe ... check` checks bodies when signatures succeed and appends
 the checker tables to the declaration dump. `synx modules <file> --check`
-prints the C++ oracle.
+prints the dump for this stage.
 
 ## Dendrite lowering
 
@@ -276,7 +269,7 @@ vectors kept in key order. The drop tables keep insertion order for lookup;
 the dump prints them by type text, as C++ does for its pointer-keyed maps.
 
 `modules_probe ... lower` lowers when bodies check and appends the strict IR.
-`synx modules <file> --lower` prints the C++ oracle.
+`synx modules <file> --lower` prints the dump for this stage.
 
 ## Borrow checking
 
@@ -289,8 +282,7 @@ continuation block. The async tables (`async_live`, `async_borrows`) are
 merged per suspend point in key order.
 
 `modules_probe ... borrow` checks ownership when lowering succeeds and appends
-the strict IR after the pass. `synx modules <file> --borrow` prints the C++
-oracle.
+the strict IR after the pass. `synx modules <file> --borrow` prints the dump for this stage.
 
 ## Async frame conversion
 
@@ -309,7 +301,7 @@ Two C++ side effects are reproduced: `async_borrows[block]` inserts an empty
 set for each state block and for each live block of a send task, and after
 SNX0507 the poll function keeps empty locals and blocks.
 
-`synx modules <file> --async` prints the C++ oracle.
+`synx modules <file> --async` prints the dump for this stage.
 
 ## Layouts and register allocation
 
@@ -321,8 +313,8 @@ intervals that do not cross a call, then RBX and R12 to R15. Locals are
 pinned to the stack when their address is taken, when an rvalue writes
 through an address, or for float casts, drops, and projections.
 
-`module_dump.dump_machine(&checker, &module)` prints the C++ `dump_machine`
-text. `synx modules <file> --machine` prints the C++ oracle.
+`module_dump.dump_machine(&checker, &module)` prints layouts and register
+assignments. `synx modules <file> --machine` prints the dump for this stage.
 
 ## Instruction selection
 
@@ -339,15 +331,14 @@ borrow checker assume that reference arguments escape into it.
 `module_dump.dump_objects` prints one line per target: name, result, size,
 and FNV-1a 32 hash of the object file.
 
-## Combined comparison
+## Combined probe
 
 `modules_probe ... all` runs every pass for each entry and writes the
 declaration dump, the checker tables, the IR after lowering, the IR after
 borrow checking, the IR after async frame conversion, and the machine
-section (or `machine skipped` after a failed pass) as one blob. CTest
-targets `selfhost_frontend_0` through `selfhost_frontend_3` use this stage.
-They compare the module, signature, checker, and lowering corpora and every
-exported `tests/borrow_test.cpp` and `tests/async_pool_test.cpp` case. The single-stage modes stay available for local debugging.
+section (or `machine skipped` after a failed pass) as one blob. CI runs it
+under the leak checker. The single-stage modes stay available for local
+debugging.
 
 ## Driver and bootstrap
 
@@ -358,11 +349,21 @@ lowering (3), ownership (4), and async conversion (5). A failed pass prevents
 later passes. Sources remain available for diagnostic rendering.
 
 `build.program(options)` runs those passes, Axon, object serialization, and the
-system linker. `driver_paths.link_command` keeps executable and arguments
-separate. The embedded prelude, host discovery, inspection serializers, CLI
-transport adapters, and validation commands are in the `driver*.snx` modules
-and `bootstrap.snx`.
+built-in linker (or the system linker with `--linker=system`).
+`driver_paths.link_command` keeps executable and arguments separate. The
+embedded prelude (`prelude_source.snx`, generated from `prelude.snx` by
+`embed_prelude.snx`), host discovery, inspection serializers, and CLI
+transport adapters are in the `driver*.snx` modules.
 
-`bootstrap.snx` builds stages 1, 2, and 3 from the same absolute source and
-flags, compares complete object bytes, and retains artifacts. The C++
-bootstrap remains available until all platform and package checks pass.
+## Bootstrap
+
+CMake builds stage 1 with the seed release and stage 2 with stage 1. Both
+link with the built-in linker against the runtime capsule built from
+`runtime/`, so the compiler can call runtime functions that the seed's own
+runtime lacks. Stage 2 is the compiler that the tests use and that the
+packages install. The `bootstrap` test builds stage 3 with stage 2 and
+requires byte-identical compiler objects, then builds and runs the workbench.
+
+The compiler source must build with the seed. To use a language feature in
+the compiler that the seed does not have, release a compiler that has the
+feature first, then update `scripts/seed.json` to that release.

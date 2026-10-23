@@ -1,0 +1,4 @@
+// fixture: bounded struct nested
+// stage: check
+// expect: error does not implement 'Eq'
+struct S<T: Eq> {} void f(Vec<S<fn()>> value) {}

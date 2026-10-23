@@ -1,0 +1,4 @@
+// fixture: impl arguments require sized
+// stage: check
+// expect: error does not implement 'Marker'
+trait Marker {} impl<T> Marker for &const T {} void take<X:Marker>(X value) {} main() { take("text"); }

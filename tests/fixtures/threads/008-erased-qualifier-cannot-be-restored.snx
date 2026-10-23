@@ -1,0 +1,4 @@
+// fixture: erased qualifier cannot be restored
+// stage: full
+// expect: error type mismatch
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { fn once() -> int f = once || 4; thread.spawn(f); }

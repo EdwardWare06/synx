@@ -1,0 +1,4 @@
+// fixture: unknown type
+// stage: check
+// expect: error unknown type 'Foo'
+f(Foo x) { }

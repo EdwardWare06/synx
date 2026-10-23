@@ -1,0 +1,4 @@
+// fixture: guard retained for drop
+// stage: full
+// expect: error SNX0420
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send void job() { var m = Mutex.new(3); var g = m.lock(); await yield_now(); }

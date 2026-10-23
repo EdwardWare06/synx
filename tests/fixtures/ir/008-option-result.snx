@@ -1,0 +1,9 @@
+// fixture: option result
+// stage: full
+// expect: ir has switch copy _
+// expect: ir has Result<int, E>::1(
+// expect: ir has Option<int>
+enum E { Bad }
+Result<int, E> p(int n) { if (n < 0) { return Err(E.Bad); } return Ok(n); }
+Result<int, E> q() { int a = p(1)?; return Ok(a + 1); }
+main() { int? x = Some(5); int y = x ?? 0; var r = q(); }

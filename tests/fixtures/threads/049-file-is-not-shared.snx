@@ -1,0 +1,4 @@
+// fixture: file is not shared
+// stage: full
+// expect: error does not implement 'Sync'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; import std.fs.File; void valid<T: Sync>() {} main() { valid<File>(); }

@@ -1,4 +1,4 @@
-/// Human AST output. Source: compiler/src/ast_dump.cpp.
+/// Human AST output. Ported from compiler/src/ast_dump.cpp.
 /// Strict inspection stays in ast_dump.snx. Output retains decoded bytes.
 import ast;
 import bytes;

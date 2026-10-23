@@ -1,0 +1,4 @@
+// fixture: dyn bound generic args
+// stage: check
+// expect: error does not implement
+trait T<U> {} f<X: T<int>>(&const X x) { &const dyn T<bool> t = x; }

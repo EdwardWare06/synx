@@ -1,0 +1,5 @@
+// fixture: mut explicit
+// stage: check
+// expect: ok
+f(&int x) { *x = 2; }
+main() { int a = 1; f(&a); }

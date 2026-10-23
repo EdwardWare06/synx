@@ -1,0 +1,9 @@
+// fixture: strings
+// stage: full
+// expect: ir has call String.from(const "ab")
+// expect: ir has str_from_string(
+// expect: ir has call @string_push_str(
+// expect: ir has call @fmt_uint(
+// expect: ir has call @str_cmp(
+// expect: ir has drop _
+main() { String s = String.from("ab"); print(s); print("{s} has {s.len()} bytes"); bool e = "a" == "b"; }

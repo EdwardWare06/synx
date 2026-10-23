@@ -1,0 +1,6 @@
+// fixture: try inferred ret
+// stage: check
+// expect: ok
+enum E { Bad }
+Result<int, E> p() { return Ok(1); }
+q() { int a = p()?; return Ok(a); }

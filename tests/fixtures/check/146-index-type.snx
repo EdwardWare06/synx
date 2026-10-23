@@ -1,0 +1,4 @@
+// fixture: index type
+// stage: check
+// expect: error type mismatch in index
+f(&const int[] s) { int x = s["a"]; }

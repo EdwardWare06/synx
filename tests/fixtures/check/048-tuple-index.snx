@@ -1,0 +1,4 @@
+// fixture: tuple index
+// stage: check
+// expect: error no element 2
+main() { var t = (1, 2); var c = t.2; }

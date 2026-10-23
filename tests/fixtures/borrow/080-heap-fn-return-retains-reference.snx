@@ -1,0 +1,4 @@
+// fixture: heap fn return retains reference
+// stage: full
+// expect: error scope
+extern "C" { *byte malloc(usize size); } fn() -> int make(&const int x) { unsafe { var p=malloc(size_of<fn() -> int>()) as *fn() -> int; *p=|| *x; return *p; } } main() { fn() -> int f; { int n=1; f=make(&const n); } int value=f(); }

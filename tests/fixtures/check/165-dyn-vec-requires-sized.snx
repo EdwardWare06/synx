@@ -1,0 +1,4 @@
+// fixture: dyn vec requires sized
+// stage: check
+// expect: error unsized
+trait T {} main() { Vec<dyn T> v = Vec.new(); }

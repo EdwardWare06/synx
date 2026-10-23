@@ -1,0 +1,4 @@
+// fixture: dyn enum safety
+// stage: check
+// expect: error cannot be used as dyn
+trait Bad { Self f(&const self); } enum E { Ref(&const dyn Bad) }

@@ -1,0 +1,4 @@
+// fixture: borrowed output excluded
+// stage: full
+// expect: error send async output
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send &const str job() { return "text"; }

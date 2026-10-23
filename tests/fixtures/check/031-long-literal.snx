@@ -1,0 +1,4 @@
+// fixture: long literal
+// stage: check
+// expect: ok
+main() { long x = 42L; var y = 42L; y = x; }

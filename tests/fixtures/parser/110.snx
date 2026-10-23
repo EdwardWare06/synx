@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (fn main (params) (block (call print "hi")))
+main() { print("hi"); }

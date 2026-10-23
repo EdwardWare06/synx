@@ -1,0 +1,4 @@
+// fixture: bounded struct annotation
+// stage: check
+// expect: error does not implement 'Eq'
+struct S<T: Eq> {} main() { S<fn()> value; }

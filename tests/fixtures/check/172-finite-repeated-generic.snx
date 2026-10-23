@@ -1,0 +1,4 @@
+// fixture: finite repeated generic
+// stage: check
+// expect: ok
+struct Wrap<T> { T value; } main() { var w = Wrap { value: Wrap { value: 1 } }; }

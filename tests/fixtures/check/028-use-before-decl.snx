@@ -1,0 +1,4 @@
+// fixture: use before decl
+// stage: check
+// expect: error unknown name 'x'
+main() { x = 1; int x = 2; }

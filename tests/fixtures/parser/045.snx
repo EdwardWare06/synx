@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (closure (params (int a)) (ret int) (block (tail a)))
+f() { var e = |int a| -> int { a }; }

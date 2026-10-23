@@ -1,0 +1,4 @@
+// fixture: executor scope ends task loans
+// stage: full
+// expect: ok
+import std.task.LocalExecutor; async void f(&const int r) { print("{*r}"); } main() { int n=1; { var executor=LocalExecutor.new(); executor.spawn(f(&const n)); executor.run(); } n=2; }

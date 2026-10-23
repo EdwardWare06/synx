@@ -1,0 +1,4 @@
+// fixture: strict module
+// stage: parse
+// expect: output parse --strict
+main() { int x = ; }

@@ -1,0 +1,4 @@
+// fixture: write shared result
+// stage: full
+// expect: error read only
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var m=HashMap<int,int>.new(); m.insert(1,1); match m.get(1) { Some(r)=>{ *r=2; } None=>{} } }

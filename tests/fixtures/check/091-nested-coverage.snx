@@ -1,0 +1,6 @@
+// fixture: nested coverage
+// stage: check
+// expect: ok
+enum E { A, B }
+enum W { Ok(E), No }
+int f(W w) { match w { W.Ok(E.A) => return 1, W.Ok(E.B) => return 2, W.No => return 0 } }

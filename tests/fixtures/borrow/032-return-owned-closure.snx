@@ -1,0 +1,4 @@
+// fixture: return owned closure
+// stage: full
+// expect: ok
+fn() -> int make() { int x = 3; return || x; } main() { var f = make(); int x = f(); }

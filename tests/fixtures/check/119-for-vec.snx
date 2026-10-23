@@ -1,0 +1,4 @@
+// fixture: for vec
+// stage: check
+// expect: ok
+main() { Vec<int> v = Vec.new(); v.push(1); for (x in &const v) { int y = *x; } }

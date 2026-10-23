@@ -1,0 +1,4 @@
+// fixture: store own field in closure
+// stage: full
+// expect: error same owner
+struct S { int x; (fn const() -> int)? read; void init(&self) { var r=&const self.x; self.read=Some(const || *r); } }

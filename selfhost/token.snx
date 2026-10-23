@@ -1,5 +1,5 @@
-/// Token records. Source: compiler/include/synx/token.hpp.
-/// Parity: tests/selfhost_lexer_test.cpp. Text retains decoded bytes.
+/// Token records. Ported from compiler/include/synx/token.hpp.
+/// Text retains decoded bytes.
 import source.Span;
 import bytes;
 

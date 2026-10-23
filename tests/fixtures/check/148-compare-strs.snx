@@ -1,0 +1,4 @@
+// fixture: compare strs
+// stage: check
+// expect: ok
+main() { bool b = "a" == "b"; String s = String.from("x"); bool c = s == s; }

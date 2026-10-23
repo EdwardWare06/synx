@@ -1,0 +1,4 @@
+// fixture: destructor retains stored reference
+// stage: full
+// expect: error scope
+struct G { &Vec<&const int> refs; &const int value; } impl Drop for G { void drop(&self) { self.refs.push(self.value); } } main() { Vec<&const int> refs=Vec.new(); { int n=1; { var g=G { refs:&refs, value:&const n }; } } usize count=refs.len(); }

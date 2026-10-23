@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (call (. Point origin))
+f() { var e = Point.origin(); }

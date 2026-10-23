@@ -1,0 +1,4 @@
+// fixture: return copied dereference
+// stage: full
+// expect: ok
+int f() { int n = 1; var r = &const n; return *r; }

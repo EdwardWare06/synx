@@ -1,0 +1,4 @@
+// fixture: module namespace
+// stage: full
+// expect: ok
+import left; import right; main() { var a = left.make(); var b = right.make(); int n = a.read() + b.read(); }

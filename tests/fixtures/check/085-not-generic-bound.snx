@@ -1,0 +1,6 @@
+// fixture: not generic bound
+// stage: check
+// expect: ok
+struct Flag { bool value; }
+impl Not for Flag { Flag not(self) { return Flag { value: !self.value }; } }
+T invert<T: Not>(T value) { return !value; } main() { Flag value = invert(Flag { value: true }); }

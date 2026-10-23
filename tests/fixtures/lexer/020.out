@@ -1,0 +1,12 @@
+exit 1
+--- stdout
+59-62 Kw int
+64-65 Ident x
+66-67 =
+68-69 Error unexpected character '@'
+69-70 ;
+71-71 end of file
+--- stderr
+<file>:4:10: error[SNX0101]: unexpected character '@'
+4 | int  x = @;
+  |          ^

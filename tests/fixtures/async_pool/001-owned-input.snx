@@ -1,0 +1,4 @@
+// fixture: owned input
+// stage: full
+// expect: ok
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; async send String job(String text) { await yield_now(); return text; }

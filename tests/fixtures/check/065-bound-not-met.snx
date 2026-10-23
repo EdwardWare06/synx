@@ -1,0 +1,10 @@
+// fixture: bound not met
+// stage: check
+// expect: error does not implement 'Shape'
+trait Shape { double area(&const self); &const str name(&const self) { return "shape"; } }
+struct Circle { double r; }
+struct Sq { double s; }
+impl Shape for Circle { double area(&const self) { return 3.0 * self.r * self.r; } }
+impl Shape for Sq { double area(&const self) { return self.s * self.s; } &const str name(&const self) { return "sq"; } }
+double area<T: Shape>(&const T a) { return a.area(); }
+main() { var x = 5; var t = area(&const x); }

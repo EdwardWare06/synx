@@ -1,0 +1,5 @@
+// fixture: optional ref type
+// stage: check
+// expect: ok
+&const str? f(&const str s) { return Some(s); }
+main() { var x = f("a") ?? "b"; }

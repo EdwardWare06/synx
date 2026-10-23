@@ -1,0 +1,4 @@
+// fixture: for non iterable
+// stage: check
+// expect: error cannot iterate
+main() { for (x in 5) { } }

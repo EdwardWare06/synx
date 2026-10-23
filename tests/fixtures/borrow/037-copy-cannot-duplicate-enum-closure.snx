@@ -1,0 +1,4 @@
+// fixture: Copy cannot duplicate enum closure
+// stage: full
+// expect: error cannot implement Copy
+enum E { Callback(fn() -> int) } impl Copy for E {} main() { var e = E.Callback(|| 1); var f = e; var g = e; }

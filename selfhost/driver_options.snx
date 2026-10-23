@@ -1,4 +1,4 @@
-/// Build/run argument parsing. Source: compiler/src/main.cpp, cmd_build.
+/// Build/run argument parsing. Ported from compiler/src/main.cpp, cmd_build.
 /// Owned results retain input/output paths; parsing performs no host operations.
 import target.Target;
 

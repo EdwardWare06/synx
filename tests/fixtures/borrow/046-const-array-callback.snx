@@ -1,0 +1,4 @@
+// fixture: const array callback
+// stage: full
+// expect: error requires writable access
+main() { var fs = [|| 1]; var r = &const fs; int n = r[0](); }

@@ -1,0 +1,4 @@
+// fixture: recursive effects reach the full argument set
+// stage: full
+// expect: error scope
+&const int recurse(int n,&const int left,&const int right) { if(n==0) { return left; } return recurse(n-1,right,left); } main() { int outer=1; &const int saved; { int inner=2; saved=recurse(0,outer,inner); } print("{*saved}"); }

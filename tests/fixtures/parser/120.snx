@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (struct Point (field double x) (fn len (ret double) (params (&const self)) (block (tail 0.0))) (fn scale (ret void) (params (&self) (double k)) (block)) (fn origin (ret Point) (params) (block (tail (struct Point (x 0.0))))))
+struct Point { double x; double len(&const self) { 0.0 } void scale(&self, double k) { } Point origin() { Point { x: 0.0 } } }

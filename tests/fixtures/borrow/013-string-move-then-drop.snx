@@ -1,0 +1,4 @@
+// fixture: string move then drop
+// stage: full
+// expect: ok
+main() { String a = String.from("x"); String b = a; }

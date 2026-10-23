@@ -1,0 +1,4 @@
+// fixture: constant cannot propagate
+// stage: full
+// expect: error constant initializers cannot
+const VALUE = { int? n = None; n? }; main() {}

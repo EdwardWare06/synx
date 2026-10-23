@@ -1,0 +1,4 @@
+// fixture: sort requires explicit borrow
+// stage: full
+// expect: error Write &
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var v=Vec<int>.new(); sort(v); }

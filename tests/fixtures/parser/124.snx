@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (enum Token (variant Plus) (variant End) (fn describe (params (&const self)) (block (tail 1))) (fn value (ret int) (params (&const self)) (block (tail 2))))
+enum Token { Plus, End, describe(&const self) { 1 } int value(&const self) { 2 } }

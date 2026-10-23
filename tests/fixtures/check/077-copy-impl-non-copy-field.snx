@@ -1,0 +1,6 @@
+// fixture: copy impl non-copy field
+// stage: check
+// expect: error cannot implement Copy
+struct S { String s; }
+impl Copy for S { }
+main() { }

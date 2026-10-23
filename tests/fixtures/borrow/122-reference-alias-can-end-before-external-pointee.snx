@@ -1,0 +1,4 @@
+// fixture: reference alias can end before external pointee
+// stage: full
+// expect: ok
+&const int f(&const int value) { var alias=value; return &const *alias; }

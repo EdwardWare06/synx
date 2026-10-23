@@ -1,0 +1,4 @@
+// fixture: two phase method
+// stage: full
+// expect: ok
+main() { Vec<int> v = Vec.new(); v.push(v.len() as int); }

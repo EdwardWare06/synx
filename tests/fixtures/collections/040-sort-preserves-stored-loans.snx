@@ -1,0 +1,4 @@
+// fixture: sort preserves stored loans
+// stage: full
+// expect: error does not live past this scope
+import std.collections.{HashMap, sort}; import std.hash.Hash; main() { var v=Vec<&const int>.new(); { int x=1; v.push(&const x); } sort(&v); }

@@ -1,0 +1,4 @@
+// fixture: shared reference pointer strengthening
+// stage: check
+// expect: error cannot cast
+main() { int x=1; var p=(&const x) as *int; }

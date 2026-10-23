@@ -1,5 +1,4 @@
 /// Binary parser parity driver.
-/// Format: tests/selfhost_parser_test.cpp reference().
 import ast;
 import ast_dump;
 import parser.Parser;

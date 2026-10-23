@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has int[4]
+void f(int[4] x) { }

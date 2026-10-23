@@ -1,0 +1,4 @@
+// fixture: box move
+// stage: full
+// expect: error moved
+main() { var b = Box<int>.new(1); var c = b; int n = *b.as_ref(); }

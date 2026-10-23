@@ -1,0 +1,4 @@
+// fixture: closure does not inherit async
+// stage: check
+// expect: error requires an async
+async void f() { var g=|| { await 1; }; }

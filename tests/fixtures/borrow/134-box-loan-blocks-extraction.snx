@@ -1,0 +1,4 @@
+// fixture: box loan blocks extraction
+// stage: full
+// expect: error borrowed
+main() { var b = Box<int>.new(1); var r = b.as_ref(); int n = b.into_inner(); int m = *r; }

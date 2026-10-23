@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (extern "C" (fn puts (ret int) (params (*const byte s))))
+extern "C" { int puts(*const byte s); }

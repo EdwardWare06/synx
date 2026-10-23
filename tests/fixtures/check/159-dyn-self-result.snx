@@ -1,0 +1,4 @@
+// fixture: dyn Self result
+// stage: check
+// expect: error cannot be used as dyn
+trait T { Self f(&const self); } f(&const dyn T t) {}

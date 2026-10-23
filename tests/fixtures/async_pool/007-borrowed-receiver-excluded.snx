@@ -1,0 +1,4 @@
+// fixture: borrowed receiver excluded
+// stage: full
+// expect: error send async input
+import std.task.{yield_now,block_on_send}; import std.sync.{Arc,Mutex,Cell,AtomicUsize}; struct Job { int n; async send int run(&self) { await yield_now(); return self.n; } }

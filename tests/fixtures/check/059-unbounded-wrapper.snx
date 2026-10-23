@@ -1,0 +1,4 @@
+// fixture: unbounded wrapper
+// stage: check
+// expect: error does not implement 'Eq'
+struct S<T: Eq> {} struct Outer<T> { S<T> field; }

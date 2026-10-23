@@ -1,0 +1,4 @@
+// fixture: atomic wake capture
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var wake = Waker.new(); thread.spawn(send once || wake.wake()); }

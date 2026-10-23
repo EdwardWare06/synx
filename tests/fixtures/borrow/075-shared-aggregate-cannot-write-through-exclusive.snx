@@ -1,0 +1,4 @@
+// fixture: shared aggregate cannot write through exclusive field
+// stage: full
+// expect: error shared reference
+struct H { &int value; } void bad(&const H h) { *h.value=2; }

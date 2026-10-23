@@ -1,0 +1,4 @@
+// fixture: append transfers contents without source borrow
+// stage: full
+// expect: ok
+void append(&Vec<&const int> a, &Vec<&const int> b) { match b.pop() { Some(v) => { a.push(v); } None => {} } } main() { int x = 1; int y = 2; Vec<&const int> a = Vec.new(); Vec<&const int> b = Vec.new(); b.push(&const x); append(&a, &b); b.push(&const y); int n = *a[0]; }

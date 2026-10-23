@@ -1,0 +1,4 @@
+// fixture: dyn recursive impl bound
+// stage: check
+// expect: error does not implement
+trait A {} impl<T: A> A for T {} main() { int n = 1; &const dyn A a = n; }

@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (var int[3] a (array 1 2 3))
+f() { int[3] a = [1, 2, 3]; }

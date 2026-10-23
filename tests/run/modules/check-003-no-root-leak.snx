@@ -1,0 +1,4 @@
+// fixture: no root leak
+// stage: full
+// expect: ok
+import left; int secret() { return 1; } main() {}

@@ -1,0 +1,4 @@
+// fixture: return captured borrow
+// stage: full
+// expect: ok
+main() { int x = 3; var f = || &const x; var r = f(); int n = *r; }

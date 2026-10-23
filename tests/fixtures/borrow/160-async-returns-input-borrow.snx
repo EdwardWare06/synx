@@ -1,0 +1,4 @@
+// fixture: async returns input borrow
+// stage: full
+// expect: ok
+import std.task.yield_now; async &const int f(&const int r) { await yield_now(); return r; }

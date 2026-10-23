@@ -1,0 +1,7 @@
+exit 1
+--- stdout
+(Module [(FunctionItem @75-95:0 "" f (Function @75-95:0 "" f f f nil "main" @75-79:0 [] [] (Block @82-95:0 [(VarDecl @84-93:0 (PrimitiveType @84-87:0 int) f "x" @88-89:0 (Tuple @92-93:0 []))] nil)))])
+--- stderr
+<file>:4:18: error[SNX0201]: expected an expression, found ;
+4 | main() { int x = ; }
+  |                  ^

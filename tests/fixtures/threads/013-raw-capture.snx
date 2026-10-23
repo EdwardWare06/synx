@@ -1,0 +1,4 @@
+// fixture: raw capture
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { var p = 0 as *int; thread.spawn(send once || { usize n = p as usize; }); }

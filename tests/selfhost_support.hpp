@@ -1,6 +1,6 @@
 #pragma once
-// Helpers shared by the self-hosting parity tests: process launch, file reads,
-// and the little-endian report encoding.
+// Helpers for C++ test harnesses that start the compiler and its programs:
+// process launch, file reads, and the little-endian report encoding.
 
 #include <cerrno>
 #include <chrono>
@@ -14,7 +14,6 @@
 #include <string_view>
 #include <vector>
 
-#include "synx/source.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -169,12 +168,6 @@ inline void integer(std::string& out, uint64_t value, unsigned width) {
 inline void blob(std::string& out, std::string_view value) {
   integer(out, value.size(), 8);
   out.append(value);
-}
-
-inline void span(std::string& out, synx::Span value) {
-  integer(out, value.start, 4);
-  integer(out, value.end, 4);
-  integer(out, value.file, 4);
 }
 
 }  // namespace selfhost_test

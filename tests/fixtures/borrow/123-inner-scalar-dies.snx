@@ -1,0 +1,4 @@
+// fixture: inner scalar dies
+// stage: full
+// expect: error does not live past this scope
+main() { &const int r; { int n = 1; r = &const n; } int value = *r; }

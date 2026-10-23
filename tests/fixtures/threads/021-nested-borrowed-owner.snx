@@ -1,0 +1,4 @@
+// fixture: nested borrowed owner
+// stage: full
+// expect: error does not implement 'Owned'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; struct S { Vec<(&const int)?> refs; } void owned<T: Owned>() {} main() { owned<S>(); }

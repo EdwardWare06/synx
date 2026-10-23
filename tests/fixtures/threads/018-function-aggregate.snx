@@ -1,0 +1,4 @@
+// fixture: function aggregate
+// stage: full
+// expect: error does not implement 'Send'
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; struct S { fn once() callback; } main() { var s = S { callback: once || {} }; thread.spawn(send once || s); }

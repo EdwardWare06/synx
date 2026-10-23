@@ -1,0 +1,4 @@
+// fixture: call closure twice
+// stage: full
+// expect: ok
+main() { int x = 1; var f = |int n| { x += n; x }; int a = f(2); int b = f(3); }

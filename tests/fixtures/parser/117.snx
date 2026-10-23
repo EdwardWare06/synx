@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (import std.collections {Vec, Map})
+import std.collections.{Vec, Map};

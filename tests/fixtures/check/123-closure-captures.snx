@@ -1,0 +1,4 @@
+// fixture: closure captures
+// stage: check
+// expect: ok
+main() { int base = 10; var f = |int a| a + base; int c = f(1); }

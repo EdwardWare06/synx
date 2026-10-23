@@ -1,0 +1,4 @@
+// fixture: parser case
+// stage: parse
+// expect: parse has (impl (generics (T Copy)) Copy for Wrapper<T>)
+impl<T: Copy> Copy for Wrapper<T> { }

@@ -1,0 +1,6 @@
+// fixture: nested missing
+// stage: check
+// expect: error missing: Ok(B)
+enum E { A, B }
+enum W { Ok(E), No }
+int f(W w) { match w { W.Ok(E.A) => return 1, W.No => return 0 } }

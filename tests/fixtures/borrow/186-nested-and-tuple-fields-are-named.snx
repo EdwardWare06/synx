@@ -1,0 +1,4 @@
+// fixture: nested and tuple fields are named
+// stage: full
+// expect: error use of moved value `o.inner.s`
+struct I { String s; } struct O { I inner; } main() { var o = O { inner: I { s: String.from("a") } }; var x = o.inner.s; print(o.inner.s); }

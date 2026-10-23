@@ -1,0 +1,4 @@
+// fixture: owned reference aggregate stores loan
+// stage: full
+// expect: error scope
+struct H { &Vec<&const int> refs; } void store(H h, &const int r) { h.refs.push(r); } main() { Vec<&const int> refs=Vec.new(); { int n=1; store(H { refs:&refs }, &const n); } usize count=refs.len(); }

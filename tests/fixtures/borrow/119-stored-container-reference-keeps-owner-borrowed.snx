@@ -1,0 +1,4 @@
+// fixture: stored container reference keeps owner borrowed
+// stage: full
+// expect: error while it is already borrowed
+main() { int x = 1; Vec<&const int> b = Vec.new(); b.push(&const x); Vec<&const Vec<&const int>> a = Vec.new(); a.push(&const b); b.push(&const x); usize n = a.len(); }

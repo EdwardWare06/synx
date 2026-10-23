@@ -1,0 +1,4 @@
+// fixture: unresolved re-export cycle
+// stage: full
+// expect: error cyclic re-export
+import reexport_bad_a; main() {}

@@ -1,0 +1,4 @@
+// fixture: shared function type
+// stage: check
+// expect: ok
+int f(&const fn const(int) -> int value) { return value(1); } main() { const value=const |int n| n; int n=f(value); }

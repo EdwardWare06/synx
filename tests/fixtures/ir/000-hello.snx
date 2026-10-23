@@ -1,0 +1,5 @@
+// fixture: hello
+// stage: full
+// expect: ir has call @print(const "hi")
+// expect: ir has return
+main() { print("hi"); }

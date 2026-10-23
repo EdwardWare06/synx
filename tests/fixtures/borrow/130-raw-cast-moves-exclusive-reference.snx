@@ -1,0 +1,4 @@
+// fixture: raw cast moves exclusive reference
+// stage: full
+// expect: error moved
+main() { int x=1; var r=&x; var p=r as *int; int n=*r; }

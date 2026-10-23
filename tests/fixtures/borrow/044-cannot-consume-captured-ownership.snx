@@ -1,0 +1,4 @@
+// fixture: cannot consume captured ownership
+// stage: full
+// expect: error cannot move
+main() { String text = String.from("x"); var f = || text; }

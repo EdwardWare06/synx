@@ -1,0 +1,4 @@
+// fixture: send boolean expression
+// stage: full
+// expect: ok
+import std.thread; import std.sync.{Arc, Mutex, MutexGuard, Condvar, AtomicUsize, Cell}; import std.channel; main() { bool send = true; bool n = send || false; bool m = false || send || false; }

@@ -1,0 +1,4 @@
+// fixture: map passed by move
+// stage: full
+// expect: error use of moved value
+import std.collections.{HashMap, sort}; import std.hash.Hash; void take(HashMap<int,int> m) {} main() { var m=HashMap<int,int>.new(); take(m); m.len(); }

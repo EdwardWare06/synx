@@ -1,0 +1,4 @@
+// fixture: store other parameter
+// stage: full
+// expect: ok
+struct S { int x; (&const int)? r; } void save(&S owner, &const int other) { owner.r=Some(other); }

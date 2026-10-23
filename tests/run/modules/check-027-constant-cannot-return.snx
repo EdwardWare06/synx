@@ -1,0 +1,4 @@
+// fixture: constant cannot return
+// stage: full
+// expect: error constant initializers cannot
+const VALUE = { return; }; main() {}

@@ -1,0 +1,4 @@
+// fixture: temporary receiver scope
+// stage: full
+// expect: ok
+struct S { int n; &const int get(&const self) { return &const self.n; } } main() { var r = S { n: 1 }.get(); int n = *r; }
