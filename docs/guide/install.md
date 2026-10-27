@@ -169,8 +169,8 @@ Building the compiler from source is necessary only to change the compiler.
 The source build uses CMake 3.20 or later, a C and C++ compiler, and
 Python 3. The compiler is written in Synx, so the build also needs a Synx
 compiler to start from (the seed). By default, CMake downloads the release
-named in `scripts/seed.json` and checks its SHA-256. To use a Synx compiler
-that you already have, pass its executable to CMake:
+named in `scripts/seed.json` (0.2.0) and checks its SHA-256. To use a Synx
+0.2.0 or later compiler that you already have, pass its executable to CMake:
 
 ```text
 cmake -S . -B build -DSYNX_SEED=/path/to/synx

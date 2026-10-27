@@ -165,8 +165,8 @@ and gym math in pounds: sets, reps, plates, and adding weight each set. There ar
 ## Building from source
 
 You only need this if you want to change the compiler. The build downloads
-the Synx 0.1.0 release to compile the compiler with. To use a Synx you
-already have, pass `-DSYNX_SEED=<path to the synx executable>` to CMake. A C
+the Synx 0.2.0 release to compile the compiler with. To use a Synx 0.2.0 or
+later that you already have, pass `-DSYNX_SEED=<path to the synx executable>` to CMake. A C
 compiler builds the runtime and a C++ compiler builds the test programs, and
 Python 3 runs the tests.
 

@@ -46,7 +46,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DI
 
 # Stage 1 (built by the seed) and stage 2 (built by stage 1). Stage 2 is the
 # compiler that the tests use and that the packages install. Stage 1 uses
-# the shared capsule for seed compatibility; stage 2 embeds the runtime host.
+# the shared capsule for seed compatibility (--shared-runtime needs a 0.2.0
+# or later seed); stage 2 embeds the runtime host.
 # Both forms provide the runtime functions built from the current sources.
 file(GLOB_RECURSE SYNX_SELFHOST_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_SOURCE_DIR}/selfhost/*.snx ${CMAKE_SOURCE_DIR}/std/*.snx)
@@ -58,7 +59,7 @@ set(SYNX_STAGE_ENV ${CMAKE_COMMAND} -E env SYNX_STD_PATH=${CMAKE_SOURCE_DIR}/std
     SYNX_RUNTIME_LIB= SYNX_LINKER=builtin SYNX_RUNTIME_SHARED=$<TARGET_FILE:synx_rt_shared> SYNX_RUNTIME_HOST=$<TARGET_FILE:synx_rt_host>)
 add_custom_command(OUTPUT ${SYNX_STAGE1}
   COMMAND ${CMAKE_COMMAND} -E make_directory ${SYNX_STAGE_DIR}
-  COMMAND ${SYNX_STAGE_ENV} ${SYNX_SEED_COMPILER} build ${CMAKE_SOURCE_DIR}/selfhost/main.snx -o ${SYNX_STAGE1} --keep-obj --linker=builtin
+  COMMAND ${SYNX_STAGE_ENV} ${SYNX_SEED_COMPILER} build ${CMAKE_SOURCE_DIR}/selfhost/main.snx -o ${SYNX_STAGE1} --keep-obj --linker=builtin --shared-runtime
   DEPENDS synx_rt_shared ${SYNX_SELFHOST_SOURCES} ${CMAKE_SOURCE_DIR}/scripts/seed.json
   COMMENT "Building the Synx compiler with the seed release (stage 1)" VERBATIM)
 add_custom_command(OUTPUT ${SYNX_STAGE2}

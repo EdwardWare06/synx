@@ -1,21 +1,21 @@
 {
-  "version": "0.1.0",
-  "url": "https://github.com/EdwardWare06/synx/releases/download/v0.1.0/",
+  "version": "0.2.0",
+  "url": "https://github.com/EdwardWare06/synx/releases/download/v0.2.0/",
   "hosts": {
     "windows": {
-      "file": "synx-0.1.0-windows-x86_64.zip",
-      "sha256": "661119607a31ca34b00d3297b6bacb5c82ec9764311851a46a24b1e8a9f4b111",
-      "compiler": "synx-0.1.0-windows-x86_64/libexec/synx.exe"
+      "file": "synx-0.2.0-windows-x86_64.zip",
+      "sha256": "ae6fc68636a4326aa04e6ff379ac1ae19ce01b14580b687b80a42f69abb4aee8",
+      "compiler": "synx-0.2.0-windows-x86_64/libexec/synx.exe"
     },
     "linux": {
-      "file": "synx-0.1.0-linux-x86_64.tar.gz",
-      "sha256": "a839bd8f7b86ce387d7ce11c5e14c8e6f24f8a36a332d9bf94a6f3c178c8e2fa",
-      "compiler": "synx-0.1.0-linux-x86_64/bin/synx"
+      "file": "synx-0.2.0-linux-x86_64.tar.gz",
+      "sha256": "1fa7e354661f53ea105083964ade60998de9dbe37914293179af9fc97c15af1e",
+      "compiler": "synx-0.2.0-linux-x86_64/bin/synx"
     },
     "macos": {
-      "file": "synx-0.1.0-macos-x86_64.tar.gz",
-      "sha256": "60ea0caa79e8abc7e1fbf63393f655c333ce238a477a40c305b55c02c0ed1bb2",
-      "compiler": "synx-0.1.0-macos-x86_64/bin/synx"
+      "file": "synx-0.2.0-macos-x86_64.tar.gz",
+      "sha256": "b64bb64230a278dcad9ce50b46da435ac7c9d6c9c4161fbff4a372b3a55c8605",
+      "compiler": "synx-0.2.0-macos-x86_64/bin/synx"
     }
   }
 }
