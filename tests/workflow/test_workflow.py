@@ -84,7 +84,8 @@ def main():
     def compiled(flags=(), extra=()):
         result = run(['run', entry, '--verbose', *flags, *extra, '--', 'two words', '', 'café λ', '&|<>^%"$()'])
         check(result[0] == 7 and result[1].splitlines()[:-1] == ['two words', '', 'café λ', '&|<>^%"$()'], 'arguments and exit status', str(result))
-        check(Path(result[1].splitlines()[-1]) == src, 'working directory inherited')
+        # macOS temporary folders are under /var, a link to /private/var, and getcwd returns the real path.
+        check(os.path.realpath(result[1].splitlines()[-1]) == os.path.realpath(src), 'working directory inherited', result[1])
         check(set(p.name for p in src.iterdir()) == {'main.snx', 'helper.snx'}, 'source folder contains only sources')
         return result
     try:
