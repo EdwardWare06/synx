@@ -36,7 +36,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=yes
 UninstallDisplayName=Synx {#AppVersion}
-UninstallDisplayIcon={sys}\cmd.exe
+UninstallDisplayIcon={app}\synx.ico
+SetupIconFile=synx.ico
 OutputDir={#OutputDir}
 OutputBaseFilename=synx-{#AppVersion}-windows-x86_64-setup
 Compression=lzma2/max
@@ -59,10 +60,12 @@ Type: files; Name: "{app}\install.ps1"
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "\install.cmd,\install.ps1"; Flags: recursesubdirs ignoreversion
+; The Synx mark for Installed apps and the Start menu shortcuts.
+Source: "synx.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Synx Command Prompt"; Filename: "{cmd}"; Parameters: "/k ""set ""PATH={app}\bin;%PATH%"" && synx version"""; WorkingDir: "{userdocs}"
-Name: "{group}\Synx Documentation"; Filename: "https://github.com/EdwardWare06/synx/blob/main/docs/index.md"
+Name: "{group}\Synx Command Prompt"; Filename: "{cmd}"; Parameters: "/k ""set ""PATH={app}\bin;%PATH%"" && synx version"""; WorkingDir: "{userdocs}"; IconFilename: "{app}\synx.ico"
+Name: "{group}\Synx Documentation"; Filename: "https://github.com/EdwardWare06/synx/blob/main/docs/index.md"; IconFilename: "{app}\synx.ico"
 Name: "{group}\Uninstall Synx"; Filename: "{uninstallexe}"
 
 [Run]

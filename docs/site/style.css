@@ -25,6 +25,7 @@ header {
 header a { color: var(--paper); text-decoration: none; }
 header a:hover { color: #e9b48f; }
 header .home { font-weight: 700; font-size: 1.2rem; }
+header .home img { width: 1.5rem; height: 1.5rem; margin-right: 0.45rem; vertical-align: -0.3rem; }
 header .version { color: #a9a49a; font-size: 0.85rem; }
 header nav { display: flex; flex-wrap: wrap; gap: 1.1rem; }
 .layout {

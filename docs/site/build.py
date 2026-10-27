@@ -18,6 +18,8 @@ import sys
 DOCS = Path(__file__).resolve().parent.parent
 ROOT = DOCS.parent
 STYLE = Path(__file__).resolve().parent / "style.css"
+MARK = Path(__file__).resolve().parent / "synx-mark.svg"
+VERSION = re.search(r"project\(synx VERSION ([0-9.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")).group(1)
 
 # Pages in the site, relative to docs/. Folders include every .md file.
 SOURCES = [
@@ -225,9 +227,10 @@ def page(title, body, toc, depth):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)} - Synx</title>
 <link rel="stylesheet" href="{up}style.css">
+<link rel="icon" type="image/svg+xml" href="{up}synx-mark.svg">
 </head>
 <body>
-<header><a class="home" href="{up}index.html">Synx</a> <span class="version">0.1.0</span><nav>{nav}</nav></header>
+<header><a class="home" href="{up}index.html"><img src="{up}synx-mark.svg" alt="">Synx</a> <span class="version">{VERSION}</span><nav>{nav}</nav></header>
 <div class="layout">
 <main>
 {body}
@@ -263,6 +266,7 @@ def main():
         target.write_text(page(title or rel.stem, body, toc, len(rel.parts) - 1), encoding="utf-8")
         count += 1
     shutil.copyfile(STYLE, out_dir / "style.css")
+    shutil.copyfile(MARK, out_dir / "synx-mark.svg")
     for name in COPIES:
         shutil.copyfile(DOCS / name, out_dir / name)
     broken = check_links(out_dir)
