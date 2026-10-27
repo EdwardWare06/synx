@@ -91,7 +91,8 @@ def main():
 
 def driver_core(synx, work, env, update):
     expected_path = HERE / "driver_core.bin"
-    prelude = (ROOT / "selfhost" / "prelude.snx").read_bytes()
+    # A Windows checkout can have CRLF line ends; the embedded copy is always LF.
+    prelude = (ROOT / "selfhost" / "prelude.snx").read_bytes().replace(b"\r\n", b"\n")
     for mode, flags in enumerate(MODES):
         probe = work / f"driver-probe-{mode}{EXE}"
         code, out, err = run(synx, ["build", str(ROOT / "selfhost" / "driver_probe.snx"), "-o", str(probe), *flags], work, env)

@@ -1,5 +1,6 @@
 /// Regenerates prelude_source.snx from selfhost/prelude.snx.
 /// Run with the active compiler after changing the shared prelude.
+/// Carriage returns are dropped so a CRLF checkout embeds the same LF text.
 import bytes;
 import std.fs;
 import std.env;
@@ -12,7 +13,7 @@ main() {
         match *b {
             92 => bytes.text(&out, "\\\\"), 34 => bytes.text(&out, "\\\""),
             123 => bytes.text(&out, "\\\{"), 125 => bytes.text(&out, "\\\}"),
-            13 => bytes.text(&out, "\\r"), 10 => bytes.text(&out, "\\n"), 9 => bytes.text(&out, "\\t"),
+            13 => {}, 10 => bytes.text(&out, "\\n"), 9 => bytes.text(&out, "\\t"),
             _ => out.push(*b),
         }
     }
