@@ -10,6 +10,7 @@ Name<arguments>
 T[N]       T[]       (T, U)       (T,)
 &T         &const T  *T           *const T
 T?         fn(T) -> U            &const dyn Trait
+Box<dyn Trait>
 ```
 
 ## Explanation
@@ -28,6 +29,8 @@ a one-field tuple; `(T)` groups a type.
 `&const str?` is `Option<&const str>`. Use `&const Option<T>` to borrow
 an Option itself. Reference and pointer access qualifiers belong to the
 referenced type. Bare `str`, `T[]`, and `dyn Trait` are unsized.
+`Box<dyn Trait>` is a sized owner containing a data pointer and a vtable
+pointer. See [Traits](traits.md).
 
 ## Example
 

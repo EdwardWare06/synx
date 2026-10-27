@@ -1,0 +1,4 @@
+// fixture: refutable-for
+// stage: borrow
+// expect: error for pattern must match every element
+main() { bool[2] a = [true,false]; for (true in a) { } }

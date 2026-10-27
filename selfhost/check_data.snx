@@ -77,17 +77,19 @@ pub struct NameRef {
     pub DefId enum_def;
     pub uint field_index;
     pub int auto_derefs;
+    /// The trait receiver is the payload of an owning Box<dyn Trait>.
+    pub bool box_deref;
     pub Vec<TypeId> type_args;
     pub Vec<TypeId> owner_args;
     pub NameRef new() {
         return NameRef { kind: RefKind.Local, local_id: 0, fn_def: DefId.none(), impl_def: DefId.none(), trait_def: DefId.none(),
             variant_enum: DefId.none(), variant: NONE, const_def: DefId.none(), struct_def: DefId.none(), enum_def: DefId.none(),
-            field_index: 0, auto_derefs: 0, type_args: Vec.new(), owner_args: Vec.new() };
+            field_index: 0, auto_derefs: 0, box_deref: false, type_args: Vec.new(), owner_args: Vec.new() };
     }
     pub NameRef copy(&const self) {
         var out = NameRef { kind: self.kind, local_id: self.local_id, fn_def: self.fn_def, impl_def: self.impl_def, trait_def: self.trait_def,
             variant_enum: self.variant_enum, variant: self.variant, const_def: self.const_def, struct_def: self.struct_def, enum_def: self.enum_def,
-            field_index: self.field_index, auto_derefs: self.auto_derefs, type_args: Vec.new(), owner_args: Vec.new() };
+            field_index: self.field_index, auto_derefs: self.auto_derefs, box_deref: self.box_deref, type_args: Vec.new(), owner_args: Vec.new() };
         for (t in &const self.type_args) { out.type_args.push(*t); }
         for (t in &const self.owner_args) { out.owner_args.push(*t); }
         return out;
@@ -95,11 +97,11 @@ pub struct NameRef {
 }
 
 /// Order matches CoercionKind in check.hpp.
-pub enum CoercionKind { None, AutoBorrowConst, AutoBorrowMut, MutToConst, StringToStr, ArrayToSlice, VecToSlice, ToDyn, FnMode, NeverToAny }
+pub enum CoercionKind { None, AutoBorrowConst, AutoBorrowMut, MutToConst, StringToStr, ArrayToSlice, VecToSlice, ToDyn, FnMode, NeverToAny, BoxToDyn }
 pub uint coercion_index(CoercionKind kind) {
     match kind { CoercionKind.None => return 0, CoercionKind.AutoBorrowConst => return 1, CoercionKind.AutoBorrowMut => return 2,
         CoercionKind.MutToConst => return 3, CoercionKind.StringToStr => return 4, CoercionKind.ArrayToSlice => return 5,
-        CoercionKind.VecToSlice => return 6, CoercionKind.ToDyn => return 7, CoercionKind.FnMode => return 8, CoercionKind.NeverToAny => return 9 }
+        CoercionKind.VecToSlice => return 6, CoercionKind.ToDyn => return 7, CoercionKind.FnMode => return 8, CoercionKind.NeverToAny => return 9, CoercionKind.BoxToDyn => return 10 }
 }
 pub struct Coercion { pub CoercionKind kind; pub bool borrow_first; pub TypeId target; }
 pub Coercion coercion(CoercionKind kind) { return Coercion { kind: kind, borrow_first: false, target: TypeId.none() }; }
@@ -113,7 +115,16 @@ pub struct CheckResult {
     pub Table<Coercion> coercions;
     pub Table<uint> decl_locals;
     pub Table<uint> pattern_locals;
+    /// Shorthand pattern fields, keyed by file, pattern, and field position.
+    pub Table<uint> pattern_fields;
+    /// Or-patterns that bind names and need an alternative selector in IR.
+    pub Table<bool> pattern_or_bindings;
     pub Table<int> pattern_derefs;
+    /// Iterator protocol input and optional consuming Vec conversion, keyed by statement.
+    pub Table<TypeId> for_iters;
+    pub Table<TypeId> for_items;
+    pub Table<TypeId> for_bases;
+    pub Table<NameRef> for_convert;
     /// Keyed by function arena index.
     pub Table<Vec<LocalVar>> fn_locals;
     /// Keyed by const arena index.
@@ -125,7 +136,8 @@ pub struct CheckResult {
     pub Table<uint> shorthand_locals;
     pub CheckResult new() {
         return CheckResult { expr_types: Table.new(), refs: Table.new(), coercions: Table.new(), decl_locals: Table.new(),
-            pattern_locals: Table.new(), pattern_derefs: Table.new(), fn_locals: Table.new(), const_locals: Table.new(),
+            pattern_locals: Table.new(), pattern_fields: Table.new(), pattern_or_bindings: Table.new(),
+            pattern_derefs: Table.new(), for_iters: Table.new(), for_items: Table.new(), for_bases: Table.new(), for_convert: Table.new(), fn_locals: Table.new(), const_locals: Table.new(),
             closure_params: Table.new(), closure_captures: Table.new(), closure_capture_modes: Table.new(),
             closure_locals: Table.new(), shorthand_locals: Table.new() };
     }

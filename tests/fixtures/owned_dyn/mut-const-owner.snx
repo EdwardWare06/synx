@@ -1,0 +1,7 @@
+// fixture: mut-const-owner
+// stage: borrow
+// expect: error writable
+trait Change { void change(&self); }
+struct S {}
+impl Change for S { void change(&self) {} }
+main() { const Box<dyn Change> p = Box.new(S {}); p.change(); }

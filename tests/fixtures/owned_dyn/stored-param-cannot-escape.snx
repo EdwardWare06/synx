@@ -1,0 +1,7 @@
+// fixture: stored-param-cannot-escape
+// stage: borrow
+// expect: error SNX0502
+trait Store { void put(&self, &const int value); }
+struct S { Option<&const int> value; }
+impl Store for S { void put(&self, &const int value) { self.value = Some(value); } }
+void f(&Box<dyn Store> p) { int x = 1; p.put(x); }

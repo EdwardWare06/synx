@@ -90,6 +90,13 @@ pub struct RangeInclusive<T> {
 /// are Copy automatically; this trait documents it.
 pub trait Copy {}
 
+/// Each call advances the iterator and returns one item, or None.
+/// Borrowed results retain the receiver loan until their last use.
+pub trait Iterator<T> { T? next(&self); }
+/// Indexing borrows an element. Assignment additionally requires IndexMut.
+pub trait Index<I, T> { &const T index(&const self, I key); }
+pub trait IndexMut<I, T> { &T index_mut(&self, I key); }
+
 /// Values whose ownership can cross a thread boundary.
 pub trait Send {}
 /// Values that allow shared references on several threads.
@@ -402,6 +409,13 @@ pub struct Vec<T> {
         return Vec { data: 0 as *T, len: 0, cap: 0 };
     }
 
+    /// Consume the vector. The iterator owns and drops unread elements.
+    pub VecIter<T> into_iter(self) {
+        VecIter<T> result = VecIter { data: self.data, position: 0, end: self.len };
+        self.data = 0 as *T; self.len = 0; self.cap = 0;
+        return result;
+    }
+
     pub usize len(&const self) { return self.len; }
 
     pub bool is_empty(&const self) { return self.len == 0; }
@@ -478,3 +492,137 @@ unsafe impl<T: Send> Send for Box<T> {}
 unsafe impl<T: Sync> Sync for Box<T> {}
 unsafe impl<T: Owned> Owned for Box<T> {}
 
+
+/// Owning forward iteration. Only Vec.into_iter constructs this owner.
+pub struct VecIter<T> {
+    *T data;
+    usize position;
+    usize end;
+}
+impl<T> Iterator<T> for VecIter<T> {
+    T? next(&self) {
+        if (self.position == self.end) { return None; }
+        usize at = self.position; self.position += 1;
+        return unsafe { Some(*((self.data as usize + at * size_of<T>()) as *T)) };
+    }
+}
+impl<T> Drop for VecIter<T> {
+    void drop(&self) {
+        unsafe {
+            while (self.position < self.end) {
+                usize at = self.position; self.position += 1;
+                drop_in_place<T>((self.data as usize + at * size_of<T>()) as *T);
+            }
+            synx_rt_free(self.data as *byte);
+        }
+    }
+}
+
+unsafe impl<T: Send> Send for VecIter<T> {}
+unsafe impl<T: Sync> Sync for VecIter<T> {}
+unsafe impl<T: Owned> Owned for VecIter<T> {}
+
+impl Iterator<byte> for Range<byte> {
+    byte? next(&self) {
+        if (self.start >= self.end) { return None; }
+        byte value = self.start; self.start += 1; return Some(value);
+    }
+}
+impl Iterator<byte> for RangeInclusive<byte> {
+    byte? next(&self) {
+        if (self.start > self.end) { return None; }
+        byte value = self.start;
+        if (self.start == self.end) { self.start = 1; self.end = 0; } else { self.start += 1; }
+        return Some(value);
+    }
+}
+
+impl Iterator<short> for Range<short> {
+    short? next(&self) {
+        if (self.start >= self.end) { return None; }
+        short value = self.start; self.start += 1; return Some(value);
+    }
+}
+impl Iterator<short> for RangeInclusive<short> {
+    short? next(&self) {
+        if (self.start > self.end) { return None; }
+        short value = self.start;
+        if (self.start == self.end) { self.start = 1; self.end = 0; } else { self.start += 1; }
+        return Some(value);
+    }
+}
+
+impl Iterator<int> for Range<int> {
+    int? next(&self) {
+        if (self.start >= self.end) { return None; }
+        int value = self.start; self.start += 1; return Some(value);
+    }
+}
+impl Iterator<int> for RangeInclusive<int> {
+    int? next(&self) {
+        if (self.start > self.end) { return None; }
+        int value = self.start;
+        if (self.start == self.end) { self.start = 1; self.end = 0; } else { self.start += 1; }
+        return Some(value);
+    }
+}
+
+impl Iterator<long> for Range<long> {
+    long? next(&self) {
+        if (self.start >= self.end) { return None; }
+        long value = self.start; self.start += 1; return Some(value);
+    }
+}
+impl Iterator<long> for RangeInclusive<long> {
+    long? next(&self) {
+        if (self.start > self.end) { return None; }
+        long value = self.start;
+        if (self.start == self.end) { self.start = 1; self.end = 0; } else { self.start += 1; }
+        return Some(value);
+    }
+}
+
+impl Iterator<uint> for Range<uint> {
+    uint? next(&self) {
+        if (self.start >= self.end) { return None; }
+        uint value = self.start; self.start += 1; return Some(value);
+    }
+}
+impl Iterator<uint> for RangeInclusive<uint> {
+    uint? next(&self) {
+        if (self.start > self.end) { return None; }
+        uint value = self.start;
+        if (self.start == self.end) { self.start = 1; self.end = 0; } else { self.start += 1; }
+        return Some(value);
+    }
+}
+
+impl Iterator<ulong> for Range<ulong> {
+    ulong? next(&self) {
+        if (self.start >= self.end) { return None; }
+        ulong value = self.start; self.start += 1; return Some(value);
+    }
+}
+impl Iterator<ulong> for RangeInclusive<ulong> {
+    ulong? next(&self) {
+        if (self.start > self.end) { return None; }
+        ulong value = self.start;
+        if (self.start == self.end) { self.start = 1; self.end = 0; } else { self.start += 1; }
+        return Some(value);
+    }
+}
+
+impl Iterator<usize> for Range<usize> {
+    usize? next(&self) {
+        if (self.start >= self.end) { return None; }
+        usize value = self.start; self.start += 1; return Some(value);
+    }
+}
+impl Iterator<usize> for RangeInclusive<usize> {
+    usize? next(&self) {
+        if (self.start > self.end) { return None; }
+        usize value = self.start;
+        if (self.start == self.end) { self.start = 1; self.end = 0; } else { self.start += 1; }
+        return Some(value);
+    }
+}

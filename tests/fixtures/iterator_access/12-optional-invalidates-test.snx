@@ -1,0 +1,4 @@
+// fixture: optional-invalidates-test
+// stage: borrow
+// expect: error borrowed
+struct A { int n; int set(&self, int x) { self.n = x; return x; } } int reset(&Option<A> a) { *a = None; return 0; } void main() { Option<A> a = Some(A { n: 1 }); a?.set(reset(&a)); }

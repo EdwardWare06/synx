@@ -16,7 +16,7 @@
 extern void* synx_rt_alloc(uint64_t);
 extern void synx_rt_free(void*);
 extern void synx_rt_panic(const uint8_t*, uint64_t);
-#if defined(SYNX_SHARED_RUNTIME)
+#if (defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME))
 void (*synx_link_thread_entry)(void*);
 #else
 extern void synx_thread_entry(void*);
@@ -261,7 +261,7 @@ static unsigned __stdcall thread_boot(void* job) {
 #else
 static void* thread_boot(void* job) {
 #endif
-#if defined(SYNX_SHARED_RUNTIME)
+#if (defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME))
   if (!synx_link_thread_entry) fail("runtime thread entry is not initialized");
   synx_link_thread_entry(job);
 #else
@@ -319,3 +319,7 @@ void synx_rt_thread_sleep(uint64_t milliseconds) {
     milliseconds -= chunk;
   }
 }
+
+#if defined(SYNX_STANDALONE_RUNTIME)
+#include "exports_threads.inc"
+#endif

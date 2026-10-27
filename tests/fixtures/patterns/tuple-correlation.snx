@@ -1,0 +1,4 @@
+// fixture: tuple-correlation
+// stage: borrow
+// expect: error missing:
+int f(bool a, bool b) { return match (a, b) { (true, false) => 1, (false, true) => 2 }; }

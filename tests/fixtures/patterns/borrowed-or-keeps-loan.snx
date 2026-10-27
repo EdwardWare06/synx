@@ -1,0 +1,5 @@
+// fixture: borrowed-or-keeps-loan
+// stage: borrow
+// expect: error SNX0501
+enum E { A(int), B(int) }
+main() { var e = E.A(3); var r = match &const e { E.A(x) | E.B(x) => x }; e = E.B(4); print("{*r}"); }

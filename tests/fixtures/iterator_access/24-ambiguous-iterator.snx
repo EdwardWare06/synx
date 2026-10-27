@@ -1,0 +1,4 @@
+// fixture: ambiguous-iterator
+// stage: borrow
+// expect: error ambiguous
+struct I {} impl Iterator<int> for I { int? next(&self) { return None; } } impl Iterator<long> for I { long? next(&self) { return None; } } void main() { for (n in I {}) {} }

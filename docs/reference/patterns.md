@@ -23,9 +23,17 @@ Bindings have arm or loop scope. In a by-value match, bindings move or copy
 the selected part. In a reference match, bindings borrow that part.
 Read-only access anywhere on the reference path gives a shared binding.
 
-The current compiler rejects names bound within alternatives. Write
-separate arms when alternatives need payload bindings. Guard expressions
-use the bindings made by their own arm and must have type `bool`.
+Every alternative must bind the same names with the same types and reference
+access. For example, `Choice.A(value) | Choice.B(value)` binds one `value`.
+Names can occur at different field positions. The first matching alternative
+supplies the bindings. All tests on the arm pattern finish before bindings
+move or borrow fields. Each name can occur once on a path through the pattern.
+A named field can occur once in a struct or variant pattern.
+
+Guard expressions use the bindings made by their own arm and must have type
+`bool`. If a guard is false, testing continues with the next arm. By-value
+move bindings consume their fields before the guard. Later arms cannot read
+those fields. Match a reference when a later arm needs the payload.
 
 ## Example
 
@@ -38,13 +46,27 @@ int group(int value) {
     };
 }
 
-main() { print("{group(4)}"); }
+enum Input { Local(int), Remote(int) }
+
+int input_value(Input input) {
+    return match input { Input.Local(value) | Input.Remote(value) => value };
+}
+
+main() {
+    print("{group(4)}");
+    print("{input_value(Input.Remote(7))}");
+}
 ```
 
-Output: `2`.
+Output:
+
+```text
+2
+7
+```
 
 ## Notes
 
 Local declarations use a binding name; this page does not introduce tuple
-destructuring declarations. Match coverage has a current combination-check
-limit. See [match](match.md).
+destructuring declarations. A `for` pattern must match every possible element.
+See [match](match.md) for coverage rules.

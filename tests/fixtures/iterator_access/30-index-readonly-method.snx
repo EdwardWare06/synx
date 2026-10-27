@@ -1,0 +1,4 @@
+// fixture: index-readonly-method
+// stage: borrow
+// expect: error read only
+struct A { int n; } impl Index<int,int> for A { &const int index(&const self,int key) { return &const self.n; } } void main() { const A a = A { n: 1 }; var r = &a[0]; }

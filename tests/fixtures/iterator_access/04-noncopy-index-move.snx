@@ -1,0 +1,4 @@
+// fixture: noncopy-index-move
+// stage: borrow
+// expect: error cannot move
+struct A { String value; } impl Index<int, String> for A { &const String index(&const self, int i) { return &const self.value; } } void main() { var a = A { value: String.new() }; String text = a[0]; }

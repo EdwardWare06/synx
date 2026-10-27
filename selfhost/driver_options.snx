@@ -9,18 +9,29 @@ pub struct BuildOptions {
     pub bool verbose;
     pub Target target;
     pub int linker;
+    pub bool standalone;
+    pub bool no_cache;
+    pub bool cache_record;
+    pub Vec<String> program_args;
     pub BuildOptions new(Target target) {
-        return BuildOptions { input: String.new(), output: String.new(), keep_object: false, verbose: false, target: target, linker: -1 };
+        return BuildOptions { input: String.new(), output: String.new(), keep_object: false, verbose: false, target: target, linker: -1, standalone: true, no_cache: false, cache_record: false, program_args: Vec.new() };
     }
 }
 pub Result<BuildOptions, String> parse(&const Vec<String> args, Target target) {
     var options = BuildOptions.new(target); usize i = 2;
     while (i < args.len()) {
         var argument = args.get(i).unwrap();
+        if (*argument == String.from("--")) {
+            if (*args.get(1).unwrap() != String.from("run")) { return Err(String.from("program arguments require synx run\n")); }
+            i += 1; while (i < args.len()) { options.program_args.push(String.from(args.get(i).unwrap())); i += 1; } break;
+        }
         if (*argument == String.from("-o") && i + 1 < args.len()) {
             i += 1; options.output = String.from(args.get(i).unwrap());
         } else if (*argument == String.from("--keep-obj")) { options.keep_object = true; }
         else if (*argument == String.from("--no-regalloc")) { options.target.register_allocation = false; }
+        else if (*argument == String.from("--standalone")) { options.standalone = true; }
+        else if (*argument == String.from("--shared-runtime")) { options.standalone = false; }
+        else if (*argument == String.from("--no-cache")) { options.no_cache = true; }
         else if (*argument == String.from("--release")) { options.target.checked_arithmetic = false; }
         else if (*argument == String.from("--linker=builtin")) { options.linker = 0; }
         else if (*argument == String.from("--linker=system")) { options.linker = 1; }

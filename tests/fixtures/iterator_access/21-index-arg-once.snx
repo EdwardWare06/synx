@@ -1,0 +1,4 @@
+// fixture: index-arg-once
+// stage: borrow
+// expect: ok
+struct A { int n; } impl Index<int,int> for A { &const int index(&const self, int i) { return &const self.n; } } impl IndexMut<int,int> for A { &int index_mut(&self, int i) { return &self.n; } } void main() { var a = A { n: 1 }; a[0] += 1; }

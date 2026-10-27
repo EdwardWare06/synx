@@ -1,0 +1,4 @@
+// fixture: optional-borrowed-move
+// stage: borrow
+// expect: error cannot move
+struct A { String s; } void main() { Option<A> a = Some(A { s: String.new() }); var r = &const a; var s = r?.s; }

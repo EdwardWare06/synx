@@ -1,0 +1,7 @@
+// fixture: generic-impl-unsized
+// stage: borrow
+// expect: error does not implement
+trait Show { int show(&const self); }
+impl<T: Show> Show for Box<T> { int show(&const self) { return self.as_ref().show(); } }
+void f<T: Show>(T value) {}
+void bad(Box<dyn Show> value) { f(value); }

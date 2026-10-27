@@ -1,0 +1,4 @@
+// fixture: unit-coverage
+// stage: borrow
+// expect: ok
+int f() { return match () { () => 4 }; }

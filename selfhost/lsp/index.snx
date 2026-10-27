@@ -1,0 +1,241 @@
+import source;
+import std.text;
+/// Editor symbols are keyed by declaration path and byte range, never spelling.
+/// Occurrences retain compiler resolution. Scope spans bound local completion.
+import compile.Compilation;
+import ast;
+import ids.{DefId, DefKind, TypeId, ModuleId, NONE};
+import defs;
+import check_data.{NameRef, RefKind, LocalVar, node_key, key_file, key_index};
+import source.{SourceFile, Span};
+import types;
+import bytes;
+import lexer;
+import token;
+import diagnostics.DiagnosticSink;
+import lsp.wire;
+pub struct Symbol {
+    pub String key; pub String name; pub String detail; pub String documentation;
+    pub Span declaration; pub Span scope; pub int kind; pub TypeId type;
+    pub DefId definition; pub String member; pub bool editable; pub bool public;
+}
+pub struct Use { pub Span span; pub usize symbol; pub bool declaration; }
+pub Span empty() { return Span { file: NONE, start: 0, end: 0 }; }
+pub bool contains(Span outer, Span inner) { return outer.file == inner.file && outer.start <= inner.start && outer.end >= inner.end; }
+pub Span name_span(&const Compilation c, Span span, &const str name, bool last) {
+    if (span.file as usize >= c.sources.len()) { return empty(); }
+    var file = c.sources.get(span.file as usize).unwrap();
+    if (span.end as usize > file.data().len()) { return empty(); }
+    var part = SourceFile.new(String.from("<name>"), bytes.copy(file.data(), span.start as usize, span.end as usize), span.file);
+    var sink = DiagnosticSink.new(); var tokens = lexer.tokenize(part, &sink);
+    Span selected = empty();
+    for (t in &const tokens) {
+        if ((t.kind == token.Kind.Ident || t.kind == token.Kind.KwSelf) && bytes.equals(t.text, name)) { selected = Span { file: span.file, start: span.start + t.span.start, end: span.start + t.span.end }; if (!last) { break; } }
+    } return selected;
+}
+String key(&const Compilation c, Span span, &const str name) {
+    if (span.file as usize >= c.sources.len()) { return "builtin:{name}"; }
+    var path = source.path_key(c.sources.get(span.file as usize).unwrap().path()); return "{path}:{span.start}:{span.end}";
+}
+pub String def_key(&const Compilation c, DefId id) {
+    if (id.index == NONE) { return String.new(); }
+    var d = c.lowerer.ck.r.program.def(id);
+    match id.kind { DefKind.Function => {
+        if (d.owner_impl.index != NONE) { var tr = c.lowerer.ck.r.program.def(d.owner_impl).trait_ref.trait_def;
+            if (tr.index != NONE) { for (m in &const c.lowerer.ck.r.program.def(tr).methods) { if (c.lowerer.ck.r.program.def(*m).name == d.name) { return def_key(c, *m); } } }
+        }
+    }, _ => {} }
+    var span = name_span(c, d.span, d.name, false);
+    return key(c, span, d.name);
+}
+pub String type_name(&const Compilation c, TypeId type) {
+    if (type.index == NONE) { return String.from("?"); } return c.lowerer.ck.r.types.to_string(type);
+}
+String signature(&const Compilation c, &const defs.Definition d) {
+    var ret = type_name(c, d.ret); String out = "{ret} {d.name}";
+    if (!d.generics.is_empty()) { out.push('<'); for (i in 0..d.generics.len()) { if (i > 0) { out.push_str(", "); } out.push_str(d.generics.get(i).unwrap().name); } out.push('>'); }
+    out.push('('); for (i in 0..d.params.len()) { if (i > 0) { out.push_str(", "); } var p = d.params.get(i).unwrap(); var ty = type_name(c, p.type); out.push_str("{ty} {p.name}"); } out.push(')'); return out;
+}
+pub ModuleId module(&const Compilation c, uint file) {
+    for (i in 0..c.lowerer.ck.r.program.modules.len()) { var m = c.lowerer.ck.r.program.modules.get(i).unwrap(); if ((i as uint == c.lowerer.ck.r.program.root_module.index || !m.name.is_empty()) && !m.is_prelude && m.name != String.from("std.prelude") && m.file == file && m.namespace_owner.index == NONE && m.base_module.index == NONE) { return ModuleId { index: i as uint }; } } return ModuleId.none();
+}
+pub DefId symbol_def(defs.Symbol symbol) {
+    if (symbol.kind == 0) { return DefId { kind: DefKind.Struct, index: symbol.struct_def }; }
+    if (symbol.kind == 1 || symbol.kind == 5) { return DefId { kind: DefKind.Enum, index: symbol.enum_def }; }
+    if (symbol.kind == 2) { return DefId { kind: DefKind.Trait, index: symbol.trait_def }; }
+    if (symbol.kind == 3) { return DefId { kind: DefKind.Function, index: symbol.fn_def }; }
+    if (symbol.kind == 4) { return DefId { kind: DefKind.Const, index: symbol.const_def }; } return DefId.none();
+}
+pub defs.Symbol? lookup(&const Compilation c, ModuleId mod, &const ast.Path path, usize count) {
+    if (count == 0 || mod.index == NONE) { return None; }
+    var p = &const c.lowerer.ck.r.program; var first = defs.name(path.segments.get(0).unwrap().name);
+    defs.Symbol? current = None;
+    match p.module_find(mod, first) { Some(s) => { current = Some(s.symbol); }, None => { current = p.globals.get(first); } }
+    for (i in 1..count) {
+        var s = current?; var name = defs.name(path.segments.get(i).unwrap().name);
+        if (s.kind == 6) { match p.module_find(ModuleId { index: s.module_def }, name) { Some(f) => { current = Some(f.symbol); }, None => return None } }
+        else if (s.kind == 1) { bool found = false; for (v in &const p.def(symbol_def(s)).variants) { if (v.name == name) { var result = defs.Symbol.new(5); result.enum_def = s.enum_def; result.variant = v.index; current = Some(result); found = true; break; } } if (!found) { return None; } }
+        else { return None; }
+    } return current;
+}
+pub struct Index {
+    pub Vec<Symbol> symbols; pub Vec<Use> uses;
+    pub Index new() { return Index { symbols: Vec.new(), uses: Vec.new() }; }
+    pub usize find(&const self, &const str key) { for (i in 0..self.symbols.len()) { if (self.symbols.get(i).unwrap().key == String.from(key)) { return i; } } return NONE as usize; }
+    pub void occurrence(&self, Span span, usize symbol, bool declaration) {
+        if (span.file == NONE || span.start == span.end || symbol >= self.symbols.len()) { return; }
+        for (u in &const self.uses) { if (u.span.file == span.file && u.span.start == span.start && u.span.end == span.end && u.symbol == symbol) { return; } }
+        self.uses.push(Use { span: span, symbol: symbol, declaration: declaration });
+    }
+    usize add(&self, &const Compilation c, &const str name, String detail, String doc, Span span, Span scope, int kind, TypeId type, DefId definition, String member) {
+        var k = key(c, span, name); usize old = self.find(k); if (old != NONE as usize) { return old; }
+        usize id = self.symbols.len(); bool editable = span.file != NONE && span.file != 1 && name.len() != 0 && name != "self";
+        if (editable && std.text.starts_with(c.sources.get(span.file as usize).unwrap().path(), "<")) { editable = false; }
+        self.symbols.push(Symbol { key: k, name: String.from(name), detail: detail, documentation: doc, declaration: span, scope: scope, kind: kind, type: type, definition: definition, member: member, editable: editable, public: true });
+        self.occurrence(span, id, true); return id;
+    }
+    void definition(&self, &const Compilation c, DefId id, int kind) {
+        var d = c.lowerer.ck.r.program.def(id); if (d.name.is_empty()) { return; }
+        var span = name_span(c, d.span, d.name, false); var scope = empty(); String doc = String.new(); String member = String.new();
+        if (d.ast_file != NONE && d.ast_file as usize < c.trees.len()) {
+            scope = Span { file: d.ast_file, start: 0, end: c.sources.get(d.ast_file as usize).unwrap().data().len() as uint };
+            var tree = c.trees.get(d.ast_file as usize).unwrap();
+            if (kind == 3) { doc = defs.name(tree.function(d.ast_index).doc); }
+            else { doc = defs.name(tree.items.get(d.ast_index as usize).unwrap().doc); }
+        }
+        String detail = String.new(); TypeId type = d.self_type;
+        if (kind == 3) { detail = signature(c, d); type = TypeId.none();
+            if (d.self_type.index != NONE) { var t = c.lowerer.ck.r.types.get(d.self_type); if (t.def.index != NONE) { member = def_key(c, t.def); } match t.kind { types.TypeKind.Str => { member = String.from("builtin:str"); }, _ => {} } }
+            if (d.owner_trait.index != NONE) { member = def_key(c, d.owner_trait); }
+        } else if (kind == 0) { detail = "struct {d.name}"; } else if (kind == 1) { detail = "enum {d.name}"; } else if (kind == 2) { detail = "trait {d.name}"; } else { var t = type_name(c, d.ret); detail = "const {t} {d.name}"; type = d.ret; }
+        usize symbol = self.add(c, d.name, detail, doc, span, scope, if (kind == 3) { 3 } else if (kind == 4) { 21 } else { 7 }, type, id, member);
+        self.symbols.get_mut(symbol).unwrap().key = def_key(c, id);
+        self.symbols.get_mut(symbol).unwrap().public = d.is_pub || d.is_prelude || d.is_builtin;
+        for (g in &const d.generics) { var gs = name_span(c, g.span, g.name, false); var enclosing = scope;
+            if (kind == 3 && d.ast_file != NONE) { enclosing = c.trees.get(d.ast_file as usize).unwrap().function(d.ast_index).span; }
+            else if (d.ast_file != NONE) { enclosing = c.trees.get(d.ast_file as usize).unwrap().items.get(d.ast_index as usize).unwrap().span; }
+            self.add(c, g.name, "type parameter {g.name}", String.new(), gs, enclosing, 25, g.type, DefId.none(), String.new());
+        }
+        if (kind == 0 || kind == 1) {
+            for (f in &const d.fields) { var fs = name_span(c, f.span, f.name, true); var t = type_name(c, f.type); usize field = self.add(c, f.name, "{t} {f.name}", String.new(), fs, scope, 5, f.type, DefId.none(), def_key(c, id)); self.symbols.get_mut(field).unwrap().public = f.is_pub; }
+            for (v in &const d.variants) { var vs = name_span(c, v.span, v.name, false); self.add(c, v.name, "{d.name}.{v.name}", String.new(), vs, scope, 20, d.self_type, DefId.none(), def_key(c, id));
+                for (f in &const v.fields) { var fs = name_span(c, f.span, f.name, true); var t = type_name(c, f.type); self.add(c, f.name, "{t} {f.name}", String.new(), fs, scope, 5, f.type, DefId.none(), key(c, vs, v.name)); }
+            }
+        }
+    }
+    void locals(&self, &const Compilation c, &const Vec<LocalVar> locals, Span body) {
+        for (l in locals) {
+            Span span = name_span(c, l.span, l.name, true); if (span.file == NONE) { continue; }
+            Span scope = body; var tree = c.trees.get(span.file as usize).unwrap();
+            for (block in &const tree.blocks) { if (contains(block.span, span) && contains(scope, block.span)) { scope = block.span; } }
+            var t = type_name(c, l.type); self.add(c, l.name, "{t} {l.name}", String.new(), span, scope, 6, l.type, DefId.none(), String.new());
+        }
+    }
+    usize local(&const self, &const Compilation c, uint file, Span expr, uint local_id) {
+        var result = &const c.lowerer.ck.result; var tree = c.trees.get(file as usize).unwrap();
+        // The innermost closure table includes captures at their checker local IDs.
+        usize closure = NONE as usize; Span scope = Span { file: file, start: 0, end: 4294967295 };
+        for (i in 0..result.closure_locals.keys.len()) { ulong k = *result.closure_locals.keys.get(i).unwrap(); if (key_file(k) != file) { continue; }
+            var x = tree.expr(key_index(k)); var body = tree.expr(x.b).span;
+            if (contains(body, expr) && contains(scope, body)) { scope = body; closure = i; }
+        }
+        if (closure != NONE as usize) { match result.closure_locals.values.get(closure).unwrap().get(local_id as usize) { Some(l) => { var span = name_span(c, l.span, l.name, true); return self.find(key(c, span, l.name)); }, None => {} } }
+        for (i in 0..c.lowerer.ck.r.program.functions.len()) { var d = c.lowerer.ck.r.program.functions.get(i).unwrap();
+            if (d.ast_file != file || !contains(tree.function(d.ast_index).span, expr)) { continue; }
+            match result.fn_locals.get(i as ulong) { Some(locals) => { match locals.get(local_id as usize) { Some(l) => { var span = name_span(c, l.span, l.name, true); return self.find(key(c, span, l.name)); }, None => {} } }, None => {} }
+        }
+        for (i in 0..c.lowerer.ck.r.program.consts.len()) { var d = c.lowerer.ck.r.program.consts.get(i).unwrap(); if (d.ast_file != file || !contains(d.span, expr)) { continue; }
+            match result.const_locals.get(i as ulong) { Some(locals) => { match locals.get(local_id as usize) { Some(l) => { var span = name_span(c, l.span, l.name, true); return self.find(key(c, span, l.name)); }, None => {} } }, None => {} }
+        } return NONE as usize;
+    }
+    pub usize reference(&const self, &const Compilation c, &const NameRef ref, Span expr) {
+        DefId id = DefId.none();
+        match ref.kind {
+            RefKind.Local => return self.local(c, expr.file, expr, ref.local_id),
+            RefKind.Function => { id = ref.fn_def; }, RefKind.Method => { id = ref.fn_def; }, RefKind.AssocFn => { id = ref.fn_def; },
+            RefKind.Const => { id = ref.const_def; }, RefKind.TypeName => { id = if (ref.struct_def.index != NONE) { ref.struct_def } else { ref.enum_def }; },
+            RefKind.Variant => { if (ref.variant_enum.index == NONE) { return NONE as usize; } var d = c.lowerer.ck.r.program.def(ref.variant_enum); if (ref.variant as usize >= d.variants.len()) { return NONE as usize; } var v = d.variants.get(ref.variant as usize).unwrap(); return self.find(key(c, name_span(c, v.span, v.name, false), v.name)); },
+            RefKind.Field => { if (ref.struct_def.index == NONE) { return NONE as usize; } var d = c.lowerer.ck.r.program.def(ref.struct_def); if (ref.field_index as usize >= d.fields.len()) { return NONE as usize; } var f = d.fields.get(ref.field_index as usize).unwrap(); return self.find(key(c, name_span(c, f.span, f.name, true), f.name)); },
+            _ => return NONE as usize,
+        }
+        return if (id.index == NONE) { NONE as usize } else { self.find(def_key(c, id)) };
+    }
+    void path(&self, &const Compilation c, ModuleId mod, &const ast.Path path) {
+        for (i in 0..path.segments.len()) { var seg = path.segments.get(i).unwrap(); var name = defs.name(seg.name);
+            usize generic = NONE as usize; uint size = 4294967295;
+            for (s in 0..self.symbols.len()) { var sym = self.symbols.get(s).unwrap(); if (sym.kind == 25 && sym.name == name && contains(sym.scope, seg.span) && sym.scope.end - sym.scope.start < size) { generic = s; size = sym.scope.end - sym.scope.start; } }
+            if (generic != NONE as usize && i == 0) { self.occurrence(seg.span, generic, false); continue; }
+            match lookup(c, mod, path, i + 1) { Some(symbol) => { var id = symbol_def(symbol); if (id.index == NONE) { continue; }
+                usize found = self.find(def_key(c, id));
+                if (symbol.kind == 5) { var v = c.lowerer.ck.r.program.def(id).variants.get(symbol.variant as usize).unwrap(); found = self.find(key(c, name_span(c, v.span, v.name, false), v.name)); }
+                self.occurrence(seg.span, found, false);
+            }, None => {} }
+        }
+    }
+    void pattern_fields(&self, &const Compilation c, &const Vec<defs.FieldDef> definitions, &const ast.Pattern pattern) {
+        for (field in &const pattern.fields) { var name = defs.name(field.name); for (d in definitions) { if (d.name == name) { usize target = self.find(key(c, name_span(c, d.span, name, true), name)); self.occurrence(name_span(c, field.span, name, false), target, false); } } }
+    }
+    pub Index build(&const Compilation c) {
+        var out = Index.new(); var p = &const c.lowerer.ck.r.program;
+        for (i in 0..p.structs.len()) { out.definition(c, DefId { kind: DefKind.Struct, index: i as uint }, 0); }
+        for (i in 0..p.enums.len()) { out.definition(c, DefId { kind: DefKind.Enum, index: i as uint }, 1); }
+        for (i in 0..p.traits.len()) { out.definition(c, DefId { kind: DefKind.Trait, index: i as uint }, 2); }
+        for (i in 0..p.functions.len()) { out.definition(c, DefId { kind: DefKind.Function, index: i as uint }, 3); }
+        for (i in 0..p.consts.len()) { out.definition(c, DefId { kind: DefKind.Const, index: i as uint }, 4); }
+        for (d in &const p.impls) { if (d.ast_file == NONE) { continue; } var scope = c.trees.get(d.ast_file as usize).unwrap().items.get(d.ast_index as usize).unwrap().span;
+            for (g in &const d.generics) { out.add(c, g.name, "type parameter {g.name}", String.new(), name_span(c, g.span, g.name, false), scope, 25, g.type, DefId.none(), String.new()); }
+        }
+        var result = &const c.lowerer.ck.result;
+        for (i in 0..result.fn_locals.keys.len()) { uint id = *result.fn_locals.keys.get(i).unwrap() as uint; var d = p.functions.get(id as usize).unwrap(); out.locals(c, result.fn_locals.values.get(i).unwrap(), c.trees.get(d.ast_file as usize).unwrap().function(d.ast_index).span); }
+        for (i in 0..result.const_locals.keys.len()) { uint id = *result.const_locals.keys.get(i).unwrap() as uint; var d = p.consts.get(id as usize).unwrap(); out.locals(c, result.const_locals.values.get(i).unwrap(), d.span); }
+        for (i in 0..result.closure_locals.keys.len()) { ulong k = *result.closure_locals.keys.get(i).unwrap(); var tree = c.trees.get(key_file(k) as usize).unwrap(); out.locals(c, result.closure_locals.values.get(i).unwrap(), tree.expr(key_index(k)).span); }
+        for (i in 0..result.refs.keys.len()) {
+            ulong k = *result.refs.keys.get(i).unwrap(); uint f = key_file(k); uint node = key_index(k); if (f as usize >= c.trees.len()) { continue; }
+            var tree = c.trees.get(f as usize).unwrap(); if (node as usize >= tree.exprs.len()) { continue; } var x = tree.expr(node);
+            Span span = x.span; match x.kind { ast.ExprKind.Name => {}, ast.ExprKind.Field => { span = x.name_span; }, ast.ExprKind.OptChain => { span = name_span(c, x.span, defs.name(x.text), true); }, ast.ExprKind.Call => { var callee = tree.expr(x.a); match callee.kind { ast.ExprKind.Name => { span = callee.span; }, ast.ExprKind.Field => { span = callee.name_span; }, _ => continue } }, _ => continue }
+            usize symbol = out.reference(c, result.refs.values.get(i).unwrap(), x.span); out.occurrence(span, symbol, false);
+        }
+        for (f in 0..c.trees.len()) {
+            if (f == 1) { continue; } var tree = c.trees.get(f).unwrap(); var mod = module(c, f as uint);
+            for (t in &const tree.types) { out.path(c, mod, t.path); out.path(c, mod, t.bound.path); }
+            for (xi in 0..tree.exprs.len()) { var x = tree.expr(xi as uint); out.path(c, mod, x.path);
+                match x.kind {
+                    ast.ExprKind.StructLit => {
+                        match lookup(c, mod, x.path, x.path.segments.len()) { Some(sym) => { var id = symbol_def(sym); if (id.index != NONE && sym.kind == 0) { var sd = c.lowerer.ck.r.program.def(id);
+                            for (field in &const x.fields) { var name = defs.name(field.name); for (fd in &const sd.fields) { if (fd.name == name) { var target = out.find(key(c, name_span(c, fd.span, fd.name, true), fd.name)); var site = name_span(c, field.span, name, false); out.occurrence(site, target, false); } } }
+                        } }, None => {} }
+                    }
+                    ast.ExprKind.Closure => {
+                        match result.closure_captures.get(node_key(f as uint, xi as uint)) { Some(locals) => {
+                            for (capture in &const x.captures) { var name = defs.name(capture.name); for (local in locals) { usize symbol = out.local(c, f as uint, tree.expr(x.b).span, *local); if (symbol != NONE as usize && out.symbols.get(symbol).unwrap().name == name) { uint end = capture.span.start + name.len() as uint + 16; if (end > x.span.end) { end = x.span.end; } var site = name_span(c, Span { file: f as uint, start: capture.span.start, end: end }, name, false); out.occurrence(site, symbol, false); } } }
+                        }, None => {} }
+                    }
+                    _ => {}
+                }
+            }
+            for (pi in 0..tree.patterns.len()) { var pattern = tree.pattern(pi as uint); out.path(c, mod, pattern.path);
+                match pattern.kind {
+                    ast.PatternKind.Binding => { if (!result.pattern_locals.has(node_key(f as uint, pi as uint))) { var path = ast.empty_path(); path.segments.push(ast.PathSegment { span: pattern.span, name: bytes.copy(pattern.text, 0, pattern.text.len()) }); out.path(c, mod, path); } }
+                    ast.PatternKind.Struct => { match lookup(c, mod, pattern.path, pattern.path.segments.len()) { Some(s) => { var id = symbol_def(s); if (id.index != NONE) { var d = p.def(id); if (s.kind == 0) { out.pattern_fields(c, d.fields, pattern); } else if (s.kind == 5 && s.variant as usize < d.variants.len()) { out.pattern_fields(c, d.variants.get(s.variant as usize).unwrap().fields, pattern); } } }, None => {} } }
+                    _ => {}
+                }
+                match result.pattern_locals.get(node_key(f as uint, pi as uint)) { Some(local) => { usize symbol = out.local(c, f as uint, pattern.span, *local); var name = defs.name(pattern.text); if (!name.is_empty()) { out.occurrence(name_span(c, pattern.span, name, false), symbol, true); }
+                    if (symbol != NONE as usize) {
+                        for (stmt in &const tree.stmts) { match stmt.kind { ast.StmtKind.For => { if (contains(tree.pattern(stmt.a).span, pattern.span)) { out.symbols.get_mut(symbol).unwrap().scope = tree.block(stmt.c).span; } }, _ => {} } }
+                        for (expr in &const tree.exprs) { for (arm in &const expr.arms) { if (contains(tree.pattern(arm.pattern).span, pattern.span)) { out.symbols.get_mut(symbol).unwrap().scope = arm.span; } } }
+                    }
+                }, None => {} }
+            }
+            for (item in &const tree.items) {
+                out.path(c, mod, item.path); out.path(c, mod, item.bound.path);
+                for (g in &const item.generics) { for (bound in &const g.bounds) { out.path(c, mod, bound.path); } }
+                if (!item.names.is_empty()) { for (seg in &const item.names) { var path = ast.empty_path(); for (s in &const item.path.segments) { path.segments.push(ast.PathSegment { span: s.span, name: bytes.copy(s.name, 0, s.name.len()) }); } path.segments.push(ast.PathSegment { span: seg.span, name: bytes.copy(seg.name, 0, seg.name.len()) }); out.path(c, mod, path); } }
+            }
+            for (function in &const tree.functions) { for (g in &const function.generics) { for (bound in &const g.bounds) { out.path(c, mod, bound.path); } } }
+        } return out;
+    }
+    pub usize at(&const self, uint file, uint offset) {
+        usize selected = NONE as usize; uint width = 4294967295;
+        for (i in 0..self.uses.len()) { var u = self.uses.get(i).unwrap(); if (u.span.file == file && u.span.start <= offset && offset < u.span.end && u.span.end - u.span.start <= width) { selected = i; width = u.span.end - u.span.start; } } return selected;
+    }
+}

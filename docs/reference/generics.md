@@ -24,8 +24,12 @@ explicit argument list when inference has insufficient information. At a
 call, the parser recognizes `<...>` as type arguments when the closing `>`
 is followed by `(` or `.`. Otherwise, `<` remains a comparison operator.
 
-All type arguments must be sized. Bare `str`, slices, and `dyn Trait` cannot
-be generic arguments. Their reference forms are sized and can be arguments.
+Type arguments must be sized. Bare `str`, slices, and `dyn Trait` cannot be
+ordinary generic arguments. Their reference forms are sized and can be
+arguments. The compiler permits `Box<dyn Trait>` as an owning trait object.
+The box is sized and can itself be passed to generic functions or stored in
+containers, such as `Vec<Box<dyn Trait>>`. This exception does not permit
+`Vec<dyn Trait>` or general unsized type parameters.
 
 ## Example
 

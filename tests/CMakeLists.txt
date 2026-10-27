@@ -7,12 +7,27 @@ add_test(NAME fixtures COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/test
          ${SYNX_COMPILER} ${CMAKE_SOURCE_DIR}/tests/fixtures ${CMAKE_SOURCE_DIR}/tests/run/modules)
 set_tests_properties(fixtures PROPERTIES TIMEOUT 1800)
 
+add_test(NAME match_coverage COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/patterns/coverage.py
+         ${SYNX_COMPILER} ${CMAKE_BINARY_DIR}/match-coverage)
+set_tests_properties(match_coverage PROPERTIES TIMEOUT 1200)
+
 add_test(NAME regalloc COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/regalloc/check.py ${SYNX_COMPILER})
 set_tests_properties(regalloc PROPERTIES TIMEOUT 300)
 
 add_test(NAME cli COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/cli/test_cli.py
          ${SYNX_COMPILER} ${CMAKE_BINARY_DIR}/runtime)
 set_tests_properties(cli PROPERTIES TIMEOUT 1800)
+
+add_test(NAME workflow COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/workflow/test_workflow.py
+         ${SYNX_COMPILER} ${CMAKE_BINARY_DIR}/runtime)
+set_tests_properties(workflow PROPERTIES TIMEOUT 1800)
+
+add_test(NAME lsp COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/lsp/test_lsp.py ${SYNX_COMPILER})
+set_tests_properties(lsp PROPERTIES TIMEOUT 1800)
+
+add_test(NAME fmt COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/fmt/test_fmt.py
+         ${SYNX_COMPILER} $<TARGET_FILE:synx_rt_host>)
+set_tests_properties(fmt PROPERTIES TIMEOUT 1800)
 
 # Fixed point: stage 2 builds stage 3, and the two compiler objects must be
 # byte-identical. Then stage 3 builds and runs the workbench example.

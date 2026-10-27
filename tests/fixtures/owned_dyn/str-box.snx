@@ -1,0 +1,4 @@
+// fixture: str-box
+// stage: borrow
+// expect: error SNX0411
+main() { Box<str>? value = None; }

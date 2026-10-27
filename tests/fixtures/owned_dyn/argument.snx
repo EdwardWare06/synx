@@ -1,0 +1,8 @@
+// fixture: argument
+// stage: borrow
+// expect: ok
+trait Read { int read(&const self); }
+struct Number { int value; }
+impl Read for Number { int read(&const self) { return self.value; } }
+int get(Box<dyn Read> x) { return x.read(); }
+main() { print("{get(Box.new(Number { value: 4 }))}"); }

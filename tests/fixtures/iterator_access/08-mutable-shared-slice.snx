@@ -1,0 +1,4 @@
+// fixture: mutable-shared-slice
+// stage: borrow
+// expect: error read only
+void main() { var a = [1,2]; var shared = &const a; var view = &shared[..]; }

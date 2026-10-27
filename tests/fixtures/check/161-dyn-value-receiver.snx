@@ -1,4 +1,4 @@
 // fixture: dyn value receiver
 // stage: check
-// expect: error cannot be used as dyn
+// expect: ok
 trait T { void f(self); } f(&const dyn T t) {}

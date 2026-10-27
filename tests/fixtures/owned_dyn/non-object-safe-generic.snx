@@ -1,0 +1,5 @@
+// fixture: non-object-safe-generic
+// stage: borrow
+// expect: error SNX0410
+trait Bad { int value<T>(&const self, T t); }
+main() { Box<dyn Bad>? x = None; }

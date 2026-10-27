@@ -1,0 +1,5 @@
+// fixture: box-deref-move
+// stage: borrow
+// expect: error SNX0501
+enum E { A(String), B(String) }
+main() { var boxed = Box<E>.new(E.A(String.from("a"))); match *boxed.as_mut() { E.A(x) | E.B(x) if false => print(x), _ => {} }; }

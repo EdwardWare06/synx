@@ -1,0 +1,4 @@
+// fixture: or-binding-duplicate
+// stage: borrow
+// expect: error bound more than once
+int f(bool a, bool b) { return match (a,b) { (x, x) => 0 }; }

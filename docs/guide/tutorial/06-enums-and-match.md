@@ -246,9 +246,11 @@ main() {
 Take Me Back to Eden is from the 2020s
 ```
 
-In the current compiler, the alternatives of a `|` pattern cannot bind
-names. `Some(n) | None` is an error. Write a separate arm for each
-alternative that needs a name.
+The alternatives of a `|` pattern can bind names. Each alternative must bind
+the same names with the same types. For example, `Choice.Left(n) |
+Choice.Right(n)` binds one `n` when both variants carry the same type.
+`Some(n) | None` is an error because `None` does not bind `n`. The first
+matching alternative supplies the bindings.
 
 ## Exhaustive matches
 
@@ -271,7 +273,7 @@ main() {
 ```
 
 ```text
-example.snx:9:16: error[SNX0404]: match is not exhaustive; missing: Rect
+example.snx:9:16: error[SNX0404]: match is not exhaustive; missing: Rect { w: _, h: _ }
 9 |     var size = match s {
   |                ^^^^^^^^^
 1 error

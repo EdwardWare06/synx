@@ -1,0 +1,52 @@
+/// Iterators own their state. Borrowed items keep that state borrowed.
+pub import std.prelude.Iterator;
+
+pub struct SliceIter<T> {
+    &const T[] values;
+    usize position;
+}
+pub SliceIter<T> iter<T>(&const T[] values) { return SliceIter { values: values, position: 0 }; }
+impl<T> Iterator<&const T> for SliceIter<T> {
+    (&const T)? next(&self) {
+        if (self.position == self.values.len()) { return None; }
+        usize at = self.position; self.position += 1;
+        return Some(&const self.values[at]);
+    }
+}
+pub struct SliceIterMut<T> {
+    &T[] values;
+    usize position;
+}
+pub SliceIterMut<T> iter_mut<T>(&T[] values) { return SliceIterMut { values: values, position: 0 }; }
+impl<T> Iterator<&T> for SliceIterMut<T> {
+    (&T)? next(&self) {
+        if (self.position == self.values.len()) { return None; }
+        usize at = self.position; self.position += 1;
+        return Some(&self.values[at]);
+    }
+}
+
+pub struct Map<I, T, U> { I source; fn(T) -> U transform; }
+pub Map<I, T, U> map<T, U, I: Iterator<T>>(I source, fn(T) -> U transform) { return Map { source: source, transform: transform }; }
+impl<I: Iterator<T>, T, U> Iterator<U> for Map<I, T, U> {
+    U? next(&self) { match self.source.next() { Some(value) => return Some(self.transform(value)), None => return None } }
+}
+pub struct Filter<I, T> { I source; fn const(&const T) -> bool predicate; }
+pub Filter<I, T> filter<T, I: Iterator<T>>(I source, fn const(&const T) -> bool predicate) { return Filter { source: source, predicate: predicate }; }
+impl<I: Iterator<T>, T> Iterator<T> for Filter<I, T> {
+    T? next(&self) {
+        loop { match self.source.next() { Some(value) => { if (self.predicate(&const value)) { return Some(value); } }, None => return None } }
+    }
+}
+pub struct Enumerate<I, T> { I source; usize position; }
+pub Enumerate<I, T> enumerate<T, I: Iterator<T>>(I source) { return Enumerate { source: source, position: 0 }; }
+impl<I: Iterator<T>, T> Iterator<(usize, T)> for Enumerate<I, T> {
+    (usize, T)? next(&self) {
+        match self.source.next() {
+            Some(value) => { usize at = self.position; if (at == ~(0 as usize)) { panic("iterator index overflow"); } self.position += 1; return Some((at, value)); },
+            None => return None
+        }
+    }
+}
+/// Consumes an iterator whose items can be retained independently of next().
+pub Vec<T> collect<T, I: Iterator<T>>(I source) { Vec<T> out = Vec.new(); for (value in source) { out.push(value); } return out; }

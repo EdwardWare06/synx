@@ -1,0 +1,4 @@
+// fixture: private-string-literal
+// stage: borrow
+// expect: error SNX0304
+main() { var text = String { data: 0 as *byte, len: 1, cap: 1 }; }

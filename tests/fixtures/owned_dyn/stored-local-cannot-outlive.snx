@@ -1,0 +1,7 @@
+// fixture: stored-local-cannot-outlive
+// stage: borrow
+// expect: error SNX0504
+trait Store { void put(&self, &const int value); }
+struct S { Option<&const int> value; }
+impl Store for S { void put(&self, &const int value) { self.value = Some(value); } }
+main() { Box<dyn Store> p = Box.new(S { value: None }); { int x = 1; p.put(x); } }

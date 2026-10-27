@@ -312,6 +312,7 @@ struct IrDump {
         self.d.text("] otherwise={otherwise} callee=({ck} {f} "); self.d.quoted(t.callee.builtin);
         self.d.types(r, &const t.callee.type_args); self.d.text(" ("); self.operand(r, &const t.callee.fn_operand);
         uint slot = t.callee.vtable_slot; self.d.text(") {slot}) args="); self.operands(r, &const t.args);
+        if (t.loan_anchor != NONE) { self.d.text(" anchor={t.loan_anchor}"); }
         self.d.text(" dest="); self.place(&const t.dest);
         var diverges = flag(t.diverges); self.d.text(" diverges={diverges} cond=("); self.operand(r, &const t.cond);
         self.d.text(") message="); self.d.quoted(t.message); self.d.span(t.span); self.d.text("\n");
@@ -339,7 +340,7 @@ struct IrDump {
         self.d.text("]\n");
         for (i in 0..f.locals.len()) {
             var l = f.locals.get(i).unwrap(); self.d.text("  _{i}"); self.d.type(r, l.type); self.d.text(" "); self.d.quoted(l.name);
-            var arg = flag(l.is_arg); var escape = flag(l.escape_boundary); self.d.text(" arg={arg} escape={escape}"); self.d.span(l.span); self.d.text("\n");
+            var arg = flag(l.is_arg); var escape = flag(l.escape_boundary); self.d.text(" arg={arg} escape={escape}"); if (l.lifetime_guard) { self.d.text(" lifetime_guard=1"); } self.d.span(l.span); self.d.text("\n");
         }
         for (b in 0..f.blocks.len()) {
             self.d.text("  bb{b}\n");

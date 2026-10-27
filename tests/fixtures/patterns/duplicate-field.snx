@@ -1,0 +1,5 @@
+// fixture: duplicate-field
+// stage: borrow
+// expect: error occurs more than once
+struct P { bool a; }
+int f(P p) { return match p { P { a: true, a: false } => 0, _ => 1 }; }

@@ -1,0 +1,7 @@
+// fixture: drop-retains-payload
+// stage: borrow
+// expect: error SNX0504
+trait Read { int read(&const self); }
+struct Borrowed { &const int value; }
+impl Read for Borrowed { int read(&const self) { return *self.value; } }
+main() { Box<dyn Read>? saved = None; { int x = 7; saved = Some(Box.new(Borrowed { value: &const x })); } }

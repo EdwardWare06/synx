@@ -525,6 +525,7 @@ struct Gen {
                 self.a.store(RDI, 0, RSI, 8);
                 if (fat) { self.a.store(RDI, 8, RDX, 8); }
             }
+            RvalueKind.Slice => { self.gen_slice(&*ck, s); }
             RvalueKind.StrFromString => { self.gen_buffer_slice(&*ck, s); }
             RvalueKind.VecToSlice => { self.gen_buffer_slice(&*ck, s); }
             RvalueKind.ToDyn => {
@@ -574,6 +575,21 @@ struct Gen {
                 self.a.store(RDI, 0, RAX, 8);
             }
         }
+    }
+    /// The lowerer checks bounds before forming this borrowed data/length pair.
+    void gen_slice(&self, &Checker ck, &const Statement s) {
+        var r = &const s.rvalue;
+        self.load_operand_rax(&*ck, &const r.a); self.save_rax(&*ck, 0);
+        self.load_operand_rax(&*ck, &const r.b); self.save_rax(&*ck, 1);
+        var pi = self.addr(&*ck, &const r.place, RAX);
+        match self.kind(&*ck, pi.type) { TypeKind.Struct => { self.a.load(RAX, RAX, 0, 8, false); }, _ => {} }
+        self.a.mov_rr(RSI, RAX); self.load_rax(&*ck, 0);
+        var slice = self.inner(&*ck, r.type); var elem = self.inner(&*ck, slice);
+        ulong size = self.size_of(&*ck, elem);
+        self.a.mov_ri(RCX, size as long); self.a.imul_rr(RAX, RCX); self.a.alu_rr(ALU_ADD, RSI, RAX);
+        self.save_reg(&*ck, RSI, 0); self.addr(&*ck, &const s.place, RDI);
+        self.load_rax(&*ck, 0); self.a.store(RDI, 0, RAX, 8);
+        self.load_rax(&*ck, 1); self.a.store(RDI, 8, RAX, 8);
     }
     /// Operand is a reference to String or Vec: {data, len, cap}.
     void gen_buffer_slice(&self, &Checker ck, &const Statement s) {
@@ -752,6 +768,18 @@ struct Gen {
         var r = &const s.rvalue;
         var from = self.operand_type(&*ck, &const r.a);
         var to = r.type;
+        bool to_ptr = self.is_kind(&*ck, to, TypeKind.Ptr); var to_inner = if (to_ptr) { self.inner(&*ck, to) } else { TypeId.none() };
+        if (to_ptr && self.is_unsized(&*ck, to_inner)) {
+            bool from_ptr = self.is_kind(&*ck, from, TypeKind.Ptr); var from_inner = if (from_ptr) { self.inner(&*ck, from) } else { TypeId.none() };
+            bool fat_from = from_ptr && self.is_unsized(&*ck, from_inner);
+            if (fat_from) { self.addr(&*ck, &const s.place, RDI); self.store_operand_to_rdi(&*ck, &const r.a); }
+            else {
+                self.load_operand_rax(&*ck, &const r.a); self.save_rax(&*ck, 0);
+                self.addr(&*ck, &const s.place, RDI); self.load_rax(&*ck, 0); self.a.store(RDI, 0, RAX, 8);
+                self.a.mov_ri(RAX, 0); self.a.store(RDI, 8, RAX, 8);
+            }
+            return;
+        }
         bool from_f = self.is_float(&*ck, from); bool to_f = self.is_float(&*ck, to);
         if (from_f && to_f) {
             self.load_operand_xmm0(&*ck, &const r.a);
@@ -1088,6 +1116,15 @@ struct Gen {
         if (name == "drop_in_place") {
             if (t.callee.type_args.len() != 1 || t.args.len() != 1) { self.error(&*ck, t.span, "invalid drop_in_place arguments"); return true; }
             var ty = *t.callee.type_args.get(0).unwrap();
+            if (self.is_kind(&*ck, ty, TypeKind.Dyn)) {
+                if (t.args.get(0).unwrap().is_const()) { self.error(&*ck, t.span, "invalid drop_in_place operand"); return true; }
+                int done = self.a.new_label();
+                self.addr(&*ck, &const t.args.get(0).unwrap().place, RAX);
+                self.a.load(R10, RAX, 8, 8, false); self.a.load(R10, R10, 16, 8, false);
+                self.a.test_rr(R10, R10); self.a.jcc(COND_E, done);
+                self.a.load(RAX, RAX, 0, 8, false); self.a.store(RSP, 0, RAX, 8); self.a.call_reg(R10);
+                self.a.bind(done); return true;
+            }
             if (self.type_needs_drop(&*ck, ty)) {
                 self.load_operand_rax(&*ck, t.args.get(0).unwrap()); self.save_rax(&*ck, 0);
                 self.drop_at_slot(&*ck, ty, 0);

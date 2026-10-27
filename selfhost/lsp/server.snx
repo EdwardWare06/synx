@@ -1,0 +1,350 @@
+/// Stateful LSP session. Compilations own immutable document snapshots.
+/// Changes invalidate cached analyses. Queries use current versions only.
+/// stdout is reserved for frames; all host failures remain protocol errors.
+import lsp.json.{Json, NONE};
+import lsp.wire;
+import lsp.index.{Index, contains};
+import lsp.index;
+import compile.Compilation;
+import source.{SourceFile, Span, Inputs, Overlay};
+import source;
+import prelude_source;
+import defs;
+import ids.{DefId, TypeId, ModuleId};
+import ast;
+import types;
+import check_data;
+import bytes;
+import diagnostics;
+import driver_io;
+import lexer;
+import format;
+import token;
+import std.fs;
+import std.path.Path;
+import std.text;
+
+struct Document { String path; String uri; Vec<byte> data; long version; }
+struct Analysis { String entry; Compilation compilation; Index index; }
+pub uint position(&Json j, &const SourceFile file, uint offset) {
+    var p = wire.position(file, offset); uint out = j.object(); j.put(out, "line", j.number(p.0)); j.put(out, "character", j.number(p.1)); return out;
+}
+pub uint range(&Json j, &const SourceFile file, Span span) {
+    uint out = j.object(); j.put(out, "start", position(&*j, file, span.start)); j.put(out, "end", position(&*j, file, span.end)); return out;
+}
+uint location(&Json j, &const Compilation c, Span span) {
+    uint out = j.object(); if (span.file as usize >= c.sources.len()) { return out; }
+    var file = c.sources.get(span.file as usize).unwrap(); j.put(out, "uri", j.string(wire.uri(file.path()))); j.put(out, "range", range(&*j, file, span)); return out;
+}
+bool ordinary(&const SourceFile file) { return !std.text.starts_with(file.path(), "<"); }
+
+pub struct Server {
+    Vec<Document> documents;
+    Vec<Analysis> analyses;
+    Vec<String> workspace;
+    Vec<String> entries;
+    Vec<String> published;
+    bool initialized;
+    bool stopped;
+    pub Server new() { return Server { documents: Vec.new(), analyses: Vec.new(), workspace: Vec.new(), entries: Vec.new(), published: Vec.new(), initialized: false, stopped: false }; }
+    usize document(&const self, &const str path) { for (i in 0..self.documents.len()) { if (self.documents.get(i).unwrap().path == String.from(path)) { return i; } } return NONE as usize; }
+    Inputs inputs(&const self) {
+        var out = Inputs.new(); for (d in &const self.documents) { out.files.push(Overlay { key: String.from(d.path), data: bytes.copy(d.data, 0, d.data.len()) }); } return out;
+    }
+    usize analysis(&self, &const str path) {
+        for (i in 0..self.analyses.len()) { for (s in &const self.analyses.get(i).unwrap().compilation.sources) { if (ordinary(s) && source.path_key(s.path()) == String.from(path)) { return i; } } }
+        // A module's imports resolve from the program entry directory. Prefer
+        // the nearest ancestor main.snx (or a configured entry) over treating
+        // a nested module as a separate program.
+        String entry = String.from(path); usize nearest = 0;
+        for (candidate in &const self.workspace) { if (!std.text.ends_with(*candidate, "/main.snx")) { continue; }
+            var prefix = std.text.slice(*candidate, 0, candidate.len() - 8).unwrap();
+            if (std.text.starts_with(path, prefix) && prefix.len() > nearest) { entry = String.from(*candidate); nearest = prefix.len(); }
+        }
+        for (candidate in &const self.entries) { var parent = Path.from(*candidate).parent(); match parent { Some(dir) => { var prefix = "{dir.as_str()}/"; if (std.text.starts_with(path, prefix)) { entry = String.from(*candidate); break; } }, None => {} } }
+        if (entry != String.from(path)) {
+            bool cached = false; for (a in &const self.analyses) { if (a.entry == entry) { cached = true; break; } }
+            if (!cached) {
+                var inputs = self.inputs();
+                match Compilation.load_inputs(entry, prelude_source.source(), "", 5, false, inputs, true) {
+                    Ok(c) => { bool found = false; for (s in &const c.sources) { if (ordinary(s) && source.path_key(s.path()) == String.from(path)) { found = true; break; } }
+                        var idx = Index.build(c); usize n = self.analyses.len(); self.analyses.push(Analysis { entry: entry, compilation: c, index: idx }); if (found) { return n; }
+                    }, Err(_) => {}
+                }
+            }
+        }
+        var inputs = self.inputs();
+        match Compilation.load_inputs(path, prelude_source.source(), "", 5, false, inputs, true) {
+            Err(_) => return NONE as usize,
+            Ok(c) => { var idx = Index.build(c); usize n = self.analyses.len(); self.analyses.push(Analysis { entry: String.from(path), compilation: c, index: idx }); return n; }
+        }
+    }
+    void invalidate(&self) { self.analyses.clear(); }
+    void notify(&const self, &const str method, &const Json params, uint value) {
+        var j = Json.new(); uint root = j.object(); j.put(root, "jsonrpc", j.string("2.0")); j.put(root, "method", j.string(method)); j.put(root, "params", j.copy(params, value)); wire.send(j.encode(root));
+    }
+    void reply(&const self, &const Json request, &const Json result, uint value) {
+        var j = Json.new(); uint root = j.object(); j.put(root, "jsonrpc", j.string("2.0")); j.put(root, "id", j.copy(request, request.get(request.root, "id"))); j.put(root, "result", j.copy(result, value)); wire.send(j.encode(root));
+    }
+    void error(&const self, &const Json request, long code, &const str message) {
+        if (request.get(request.root, "id") == NONE) { return; }
+        var j = Json.new(); uint root = j.object(); uint error = j.object();
+        j.put(root, "jsonrpc", j.string("2.0")); j.put(root, "id", j.copy(request, request.get(request.root, "id")));
+        j.put(error, "code", j.number(code)); j.put(error, "message", j.string(message)); j.put(root, "error", error); wire.send(j.encode(root));
+    }
+    void diagnostics(&self) {
+        for (i in 0..self.documents.len()) { var path = String.from(self.documents.get(i).unwrap().path); self.analysis(path); }
+        var j = Json.new(); Vec<String> files = Vec.new();
+        for (d in &const self.documents) { files.push(String.from(d.path)); }
+        for (a in &const self.analyses) { for (s in &const a.compilation.sources) { if (!ordinary(s)) { continue; } var path = source.path_key(s.path()); bool found = false; for (old in &const files) { if (*old == path) { found = true; break; } } if (!found) { files.push(path); } } }
+        for (path in &const files) {
+            uint list = j.array(); Vec<String> seen = Vec.new();
+            for (a in &const self.analyses) {
+                var c = &const a.compilation;
+                for (d in &const c.lowerer.ck.r.sink.items) {
+                    if (d.span.file as usize >= c.sources.len()) { continue; } var file = c.sources.get(d.span.file as usize).unwrap(); if (source.path_key(file.path()) != *path) { continue; }
+                    var message = defs.name(d.message); var identity = "{d.span.start}:{d.span.end}:{d.code}:{message}"; bool duplicate = false; for (s in &const seen) { if (*s == identity) { duplicate = true; break; } } if (duplicate) { continue; } seen.push(identity);
+                    uint item = j.object(); j.put(item, "range", range(&j, file, d.span)); j.put(item, "message", j.string(message)); j.put(item, "source", j.string("synx"));
+                    j.put(item, "severity", j.number(match d.severity { diagnostics.Severity.Error => 1, diagnostics.Severity.Warning => 2, diagnostics.Severity.Note => 3 }));
+                    if (!d.code.is_empty()) { j.put(item, "code", j.string(d.code)); } j.push(list, item);
+                }
+            }
+            uint params = j.object(); j.put(params, "uri", j.string(wire.uri(*path))); j.put(params, "diagnostics", list);
+            usize doc = self.document(*path); if (doc != NONE as usize) { j.put(params, "version", j.number(self.documents.get(doc).unwrap().version)); }
+            self.notify("textDocument/publishDiagnostics", j, params);
+        }
+        for (old in &const self.published) { bool found = false; for (path in &const files) { if (*path == *old) { found = true; break; } }
+            if (!found) { uint p = j.object(); j.put(p, "uri", j.string(wire.uri(*old))); j.put(p, "diagnostics", j.array()); self.notify("textDocument/publishDiagnostics", j, p); }
+        }
+        self.published = files;
+    }
+    void change(&self, &const Json request, &const str method) {
+        uint p = request.get(request.root, "params"); uint td = request.get(p, "textDocument"); var uri = request.str(request.get(td, "uri")); String path = String.new();
+        match wire.path(uri) { Some(value) => { path = value; }, None => return }
+        usize doc = self.document(path);
+        if (method == "textDocument/didClose") { if (doc != NONE as usize) { usize last = self.documents.len() - 1; self.documents.swap(doc, last); var removed = self.documents.pop(); } self.invalidate(); self.diagnostics(); return; }
+        if (method == "textDocument/didOpen") {
+            if (request.kind(request.get(td, "text")) != 3) { return; }
+            Vec<byte> data = Vec.new(); bytes.text(&data, request.str(request.get(td, "text")));
+            if (doc != NONE as usize) { return; }
+            self.documents.push(Document { path: path, uri: String.from(uri), data: data, version: request.integer(request.get(td, "version"), 0) });
+        } else if (method == "textDocument/didChange") {
+            if (doc == NONE as usize) { return; } long version = request.integer(request.get(td, "version"), -1); if (version <= self.documents.get(doc).unwrap().version) { return; }
+            uint changes = request.get(p, "contentChanges"); var data = bytes.copy(self.documents.get(doc).unwrap().data, 0, self.documents.get(doc).unwrap().data.len());
+            for (i in 0..request.len(changes)) {
+                uint change = request.at(changes, i); uint r = request.get(change, "range"); uint content = request.get(change, "text"); if (request.kind(content) != 3) { return; }
+                Vec<byte> next = Vec.new();
+                if (r != NONE) {
+                    var file = SourceFile.new(String.from(path), bytes.copy(data, 0, data.len()), 0); uint begin = request.get(r, "start"); uint end = request.get(r, "end");
+                    uint lo = wire.offset(file, request.integer(request.get(begin, "line"), -1), request.integer(request.get(begin, "character"), -1));
+                    uint hi = wire.offset(file, request.integer(request.get(end, "line"), -1), request.integer(request.get(end, "character"), -1));
+                    if (lo == NONE || hi == NONE || hi < lo) { return; }
+                    bytes.append(&next, bytes.copy(data, 0, lo as usize)); bytes.text(&next, request.str(content)); bytes.append(&next, bytes.copy(data, hi as usize, data.len()));
+                } else { bytes.text(&next, request.str(content)); } data = next;
+            }
+            self.documents.get_mut(doc).unwrap().data = data; self.documents.get_mut(doc).unwrap().version = version;
+        }
+        self.invalidate(); self.diagnostics();
+    }
+    uint capabilities(&self, &Json j) {
+        uint root = j.object(); uint cap = j.object(); uint sync = j.object(); j.put(sync, "openClose", j.boolean(true)); j.put(sync, "change", j.number(2)); j.put(sync, "save", j.boolean(true)); j.put(cap, "textDocumentSync", sync);
+        j.put(cap, "positionEncoding", j.string("utf-16")); j.put(cap, "hoverProvider", j.boolean(true)); j.put(cap, "definitionProvider", j.boolean(true)); j.put(cap, "referencesProvider", j.boolean(true)); j.put(cap, "documentFormattingProvider", j.boolean(true));
+        uint rename = j.object(); j.put(rename, "prepareProvider", j.boolean(true)); j.put(cap, "renameProvider", rename);
+        uint completion = j.object(); uint triggers = j.array(); j.push(triggers, j.string(".")); j.put(completion, "triggerCharacters", triggers); j.put(cap, "completionProvider", completion);
+        uint signature = j.object(); uint chars = j.array(); j.push(chars, j.string("(")); j.push(chars, j.string(",")); j.put(signature, "triggerCharacters", chars); j.put(cap, "signatureHelpProvider", signature);
+        j.put(root, "capabilities", cap); uint info = j.object(); j.put(info, "name", j.string("Synx")); j.put(info, "version", j.string(driver_io.VERSION)); j.put(root, "serverInfo", info); return root;
+    }
+    void workspace_uses(&self, &const str spelling) {
+        // Query unopened sources only for references/rename. Ordinary typing checks
+        // the open import graph. The client supplies workspace file URIs.
+        for (i in 0..self.workspace.len()) {
+            var path = String.from(self.workspace.get(i).unwrap()); bool needed = true;
+            for (a in &const self.analyses) { for (s in &const a.compilation.sources) { if (ordinary(s) && source.path_key(s.path()) == path) { needed = false; break; } } }
+            if (!needed) { continue; }
+            match fs.read(path) { Ok(data) => { var text = defs.name(data); if (std.text.find(text, spelling).is_some()) { self.analysis(path); } }, Err(_) => {} }
+        }
+    }
+    uint completions(&const self, &Json j, &const Analysis a, uint file, uint offset) {
+        uint out = j.object(); uint items = j.array(); j.put(out, "isIncomplete", j.boolean(false)); j.put(out, "items", items);
+        var c = &const a.compilation; var data = c.sources.get(file as usize).unwrap().data(); usize start = offset as usize;
+        while (start > 0 && identifier_byte(bytes.at(data, start - 1))) { start -= 1; }
+        var prefix = defs.name(bytes.copy(data, start, offset as usize)); String member = String.new(); Vec<String> members = Vec.new();
+        if (start > 0 && bytes.at(data, start - 1) == 46) {
+            uint end = (start - 1) as uint; TypeId type = TypeId.none(); uint best = 0;
+            var tree = c.trees.get(file as usize).unwrap();
+            for (i in 0..tree.exprs.len()) { var x = tree.expr(i as uint); if (x.span.end == end && x.span.start >= best) { match c.lowerer.ck.result.expr_types.get(check_data.node_key(file, i as uint)) { Some(t) => { type = *t; best = x.span.start; }, None => {} } } }
+            while (type.index != NONE && c.lowerer.ck.r.types.get(type).is_ref()) { type = c.lowerer.ck.r.types.get(type).inner; }
+            if (type.index != NONE) { var t = c.lowerer.ck.r.types.get(type); var d = t.def; if (d.index != NONE) { members.push(index.def_key(c, d)); }
+                match t.kind {
+                    types.TypeKind.Str => members.push(String.from("builtin:str")),
+                    types.TypeKind.Param => { if (t.owner.index != NONE) { var owner = c.lowerer.ck.r.program.def(t.owner); if (t.index as usize < owner.generics.len()) { for (bound in &const owner.generics.get(t.index as usize).unwrap().bounds) { members.push(index.def_key(c, bound.trait_def)); } } } }
+                    _ => {}
+                }
+                if (d.index != NONE && d.index == c.lowerer.ck.r.program.box_def.index && t.elems.len() == 1) { var inner = c.lowerer.ck.r.types.get(*t.elems.get(0).unwrap()); match inner.kind { types.TypeKind.Dyn => members.push(index.def_key(c, inner.def)), _ => {} } }
+                if (!members.is_empty()) { member = String.from(members.get(0).unwrap()); }
+            }
+            // Namespace completion uses the resolved module view.
+            if (member.is_empty()) {
+                usize lo = start - 1; while (lo > 0 && (identifier_byte(bytes.at(data, lo - 1)) || bytes.at(data, lo - 1) == 46)) { lo -= 1; }
+                var name = defs.name(bytes.copy(data, lo, start - 1)); var mod = index.module(c, file);
+                if (mod.index != NONE) { var route = ast.empty_path(); usize begin = 0; Vec<byte> raw = Vec.new(); bytes.text(&raw, name);
+                    for (i in 0..(raw.len() + 1)) { if (i == raw.len() || bytes.at(raw, i) == 46) { route.segments.push(ast.PathSegment { span: index.empty(), name: bytes.copy(raw, begin, i) }); begin = i + 1; } }
+                    match index.lookup(c, mod, route, route.segments.len()) { Some(found) => { if (found.kind == 6) { self.module_completions(&*j, items, a, ModuleId { index: found.module_def }, prefix); } }, None => {} } }
+                return out;
+            }
+        }
+        var mod = index.module(c, file); Vec<String> seen = Vec.new();
+        for (i in 0..a.index.symbols.len()) { var s = a.index.symbols.get(a.index.symbols.len() - 1 - i).unwrap();
+            if (!s.name.starts_with(prefix)) { continue; }
+            if (!member.is_empty()) { bool matches = false; for (key in &const members) { if (s.member == *key) { matches = true; } } if (!matches || (!s.public && s.declaration.file != file)) { continue; } }
+            else {
+                if (!s.member.is_empty()) { continue; }
+                if (s.kind == 6 || s.kind == 25) { if (!contains(s.scope, Span { file: file, start: offset, end: offset }) || (s.kind == 6 && s.declaration.start > offset)) { continue; } }
+                else { bool visible = false; if (mod.index != NONE) { match c.lowerer.ck.r.program.module_find(mod, s.name) { Some(f) => { var d = index.symbol_def(f.symbol); visible = d.index != NONE && index.def_key(c, d) == s.key; }, None => {} } } if (!visible) { match c.lowerer.ck.r.program.globals.get(s.name) { Some(g) => { var d = index.symbol_def(g); visible = d.index != NONE && index.def_key(c, d) == s.key; }, None => {} } } if (!visible) { continue; } }
+            }
+            bool duplicate = false; for (old in &const seen) { if (*old == s.name) { duplicate = true; break; } } if (duplicate) { continue; } seen.push(String.from(s.name)); self.completion_item(&*j, items, s);
+        } return out;
+    }
+    void completion_item(&const self, &Json j, uint items, &const index.Symbol s) {
+        uint item = j.object(); j.put(item, "label", j.string(s.name)); j.put(item, "kind", j.number(s.kind as long)); j.put(item, "detail", j.string(s.detail)); if (!s.documentation.is_empty()) { j.put(item, "documentation", j.string(s.documentation)); } j.push(items, item);
+    }
+    void module_completions(&const self, &Json j, uint items, &const Analysis a, ModuleId module, &const str prefix) {
+        var m = a.compilation.lowerer.ck.r.program.module(module);
+        if (m.base_module.index != NONE) { self.module_completions(&*j, items, a, m.base_module, prefix); }
+        for (binding in &const m.symbols.entries) { if (!binding.symbol.is_pub || !binding.name.starts_with(prefix)) { continue; } var id = index.symbol_def(binding.symbol); if (id.index == NONE) { continue; } usize s = a.index.find(index.def_key(a.compilation, id)); if (s != NONE as usize) { self.completion_item(&*j, items, a.index.symbols.get(s).unwrap()); } }
+    }
+    uint signature(&const self, &Json j, &const Analysis a, uint file, uint offset) {
+        var c = &const a.compilation; var tree = c.trees.get(file as usize).unwrap(); uint selected = NONE; uint width = NONE;
+        for (i in 0..tree.exprs.len()) { var x = tree.expr(i as uint); match x.kind { ast.ExprKind.Call => {}, _ => continue } bool inside = contains(x.span, Span { file: file, start: offset, end: offset });
+            if (!inside && x.span.end <= offset && x.span.end > 0) { var data = c.sources.get(file as usize).unwrap().data();
+                bool unfinished = bytes.at(data, (x.span.end - 1) as usize) != 41;
+                for (p in (x.span.end as usize)..(offset as usize)) { byte ch = bytes.at(data, p); if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { unfinished = false; } }
+                inside = unfinished;
+            }
+            if (inside && x.span.end - x.span.start < width && tree.expr(x.a).span.end < offset) { selected = i as uint; width = x.span.end - x.span.start; } }
+        if (selected == NONE) { return j.null(); } var call = tree.expr(selected);
+        usize symbol = NONE as usize; match c.lowerer.ck.result.refs.get(check_data.node_key(file, call.a)) { Some(ref) => { symbol = a.index.reference(c, ref, tree.expr(call.a).span); }, None => {} }
+        if (symbol == NONE as usize) { match c.lowerer.ck.result.refs.get(check_data.node_key(file, selected)) { Some(ref) => { symbol = a.index.reference(c, ref, call.span); }, None => {} } }
+        if (symbol == NONE as usize) { return j.null(); } var s = a.index.symbols.get(symbol).unwrap(); if (s.definition.index == NONE || s.kind != 3) { return j.null(); }
+        var d = c.lowerer.ck.r.program.def(s.definition); uint out = j.object(); uint signatures = j.array(); uint info = j.object(); uint params = j.array();
+        j.put(info, "label", j.string(s.detail)); if (!s.documentation.is_empty()) { j.put(info, "documentation", j.string(s.documentation)); }
+        usize skip = 0; match tree.expr(call.a).kind { ast.ExprKind.Field => { if (!d.params.is_empty()) { match d.params.get(0).unwrap().self_kind { ast.SelfKind.None => {}, _ => { skip = 1; } } } }, _ => {} }
+        for (i in skip..d.params.len()) { var p = d.params.get(i).unwrap(); uint item = j.object(); var ty = index.type_name(c, p.type); j.put(item, "label", j.string("{ty} {p.name}")); j.push(params, item); }
+        usize active = 0; for (arg in &const call.items) { if (tree.expr(*arg).span.end < offset) { active += 1; } }
+        if (active >= d.params.len() - skip && d.params.len() > skip) { active = d.params.len() - skip - 1; }
+        j.put(info, "parameters", params); j.push(signatures, info); j.put(out, "signatures", signatures); j.put(out, "activeSignature", j.number(0)); j.put(out, "activeParameter", j.number(active as long)); return out;
+    }
+    pub bool handle(&self, &const Json request) {
+        var method = request.str(request.get(request.root, "method")); bool has_id = request.get(request.root, "id") != NONE;
+        if (method == "exit") { return false; }
+        var out = Json.new();
+        if (method == "initialize") {
+            if (self.initialized) { self.error(request, -32600, "Server already initialized"); return true; }
+            self.initialized = true; uint params = request.get(request.root, "params"); uint options = request.get(params, "initializationOptions"); uint files = request.get(options, "files");
+            uint entries = request.get(options, "entryPoints"); for (i in 0..request.len(entries)) { match wire.path(request.str(request.at(entries, i))) { Some(path) => self.entries.push(path), None => {} } }
+            for (i in 0..request.len(files)) { match wire.path(request.str(request.at(files, i))) { Some(path) => self.workspace.push(path), None => {} } }
+            uint result = self.capabilities(&out); self.reply(request, out, result); return true;
+        }
+        if (!self.initialized) { self.error(request, -32002, "Server not initialized"); return true; }
+        if (method == "shutdown") { self.stopped = true; uint n = out.null(); self.reply(request, out, n); return true; }
+        if (self.stopped) { self.error(request, -32600, "Server is shutting down"); return true; }
+        if (method == "initialized" || method == "$/setTrace" || method == "$/cancelRequest") { return true; }
+        if (method == "textDocument/didOpen" || method == "textDocument/didChange" || method == "textDocument/didClose" || method == "textDocument/didSave") { self.change(request, method); return true; }
+        if (method == "workspace/didChangeWatchedFiles") { self.invalidate(); uint p = request.get(request.root, "params"); uint changes = request.get(p, "changes"); for (i in 0..request.len(changes)) { uint change = request.at(changes, i); match wire.path(request.str(request.get(change, "uri"))) { Some(path) => { bool found = false; for (s in &const self.workspace) { if (*s == path) { found = true; break; } } if (!found && request.integer(request.get(change, "type"), 0) != 3) { self.workspace.push(path); } }, None => {} } } self.diagnostics(); return true; }
+        if (method == "textDocument/formatting") {
+            uint p = request.get(request.root, "params"); uint td = request.get(p, "textDocument");
+            match wire.path(request.str(request.get(td, "uri"))) {
+                None => { self.error(request, -32602, "Expected a file URI"); return true; },
+                Some(path) => {
+                    usize doc = self.document(path); var inputs = Inputs.new();
+                    if (doc != NONE as usize) { var d = self.documents.get(doc).unwrap(); inputs.files.push(Overlay { key: String.from(path), data: bytes.copy(d.data, 0, d.data.len()) }); }
+                    match inputs.load(path, 0) {
+                        Err(_) => { self.error(request, -32602, "Cannot read source file"); return true; },
+                        Ok(file) => {
+                            var formatted = format.file(file);
+                            if (!formatted.ok) { self.error(request, -32803, "Fix syntax errors before formatting this file"); return true; }
+                            uint edits = out.array();
+                            if (!format.equal(file.data(), formatted.data)) {
+                                uint edit = out.object(); out.put(edit, "range", range(&out, file, Span { start: 0, end: file.data().len() as uint, file: file.id }));
+                                out.put(edit, "newText", out.string(defs.name(formatted.data))); out.push(edits, edit);
+                            }
+                            self.reply(request, out, edits); return true;
+                        }
+                    }
+                }
+            }
+        }
+        bool query = method == "textDocument/hover" || method == "textDocument/definition" || method == "textDocument/references" || method == "textDocument/completion" || method == "textDocument/signatureHelp" || method == "textDocument/prepareRename" || method == "textDocument/rename";
+        if (!query) { if (has_id) { self.error(request, -32601, "Method not found"); } return true; }
+        uint p = request.get(request.root, "params"); uint td = request.get(p, "textDocument"); String path = String.new(); match wire.path(request.str(request.get(td, "uri"))) { Some(value) => { path = value; }, None => { self.error(request, -32602, "Expected a file URI"); return true; } }
+        usize a = self.analysis(path); if (a == NONE as usize) { self.error(request, -32602, "Cannot read source file"); return true; }
+        uint file = NONE; for (i in 0..self.analyses.get(a).unwrap().compilation.sources.len()) { var s = self.analyses.get(a).unwrap().compilation.sources.get(i).unwrap(); if (ordinary(s) && source.path_key(s.path()) == path) { file = i as uint; break; } }
+        uint pos = request.get(p, "position"); uint offset = wire.offset(self.analyses.get(a).unwrap().compilation.sources.get(file as usize).unwrap(), request.integer(request.get(pos, "line"), -1), request.integer(request.get(pos, "character"), -1));
+        if (offset == NONE) { self.error(request, -32602, "Position is outside the document"); return true; }
+        if (method == "textDocument/completion") { uint value = self.completions(&out, self.analyses.get(a).unwrap(), file, offset); self.reply(request, out, value); return true; }
+        if (method == "textDocument/signatureHelp") { uint value = self.signature(&out, self.analyses.get(a).unwrap(), file, offset); self.reply(request, out, value); return true; }
+        usize use = self.analyses.get(a).unwrap().index.at(file, offset);
+        if (use == NONE as usize) { uint n = if (method == "textDocument/references") { out.array() } else { out.null() }; self.reply(request, out, n); return true; }
+        usize si = self.analyses.get(a).unwrap().index.uses.get(use).unwrap().symbol;
+        if (method == "textDocument/hover") {
+            var symbol = self.analyses.get(a).unwrap().index.symbols.get(si).unwrap(); uint result = out.object(); uint content = out.object();
+            var text = "```synx\n{symbol.detail}\n```"; if (!symbol.documentation.is_empty()) { text.push_str("\n\n"); text.push_str(symbol.documentation); }
+            out.put(content, "kind", out.string("markdown")); out.put(content, "value", out.string(text)); out.put(result, "contents", content);
+            out.put(result, "range", range(&out, self.analyses.get(a).unwrap().compilation.sources.get(file as usize).unwrap(), self.analyses.get(a).unwrap().index.uses.get(use).unwrap().span)); self.reply(request, out, result); return true;
+        }
+        if (method == "textDocument/definition") { var analysis = self.analyses.get(a).unwrap(); var span = analysis.index.symbols.get(si).unwrap().declaration; uint result = if (span.file == NONE || span.file == 1) { out.null() } else { location(&out, analysis.compilation, span) }; self.reply(request, out, result); return true; }
+        if (method == "textDocument/prepareRename") {
+            var analysis = self.analyses.get(a).unwrap(); var symbol = analysis.index.symbols.get(si).unwrap(); if (!symbol.editable) { self.error(request, -32602, "This symbol cannot be renamed"); return true; }
+            uint result = range(&out, analysis.compilation.sources.get(file as usize).unwrap(), analysis.index.uses.get(use).unwrap().span); self.reply(request, out, result); return true;
+        }
+        var target = String.from(self.analyses.get(a).unwrap().index.symbols.get(si).unwrap().key); var name = String.from(self.analyses.get(a).unwrap().index.symbols.get(si).unwrap().name);
+        if (self.analyses.get(a).unwrap().index.symbols.get(si).unwrap().kind != 6) { self.workspace_uses(name); }
+        if (method == "textDocument/references") {
+            uint result = out.array(); Vec<String> seen = Vec.new(); bool declarations = request.str(request.get(request.get(p, "context"), "includeDeclaration")) == "true";
+            for (analysis in &const self.analyses) { for (u in &const analysis.index.uses) { if ((!declarations && u.declaration) || analysis.index.symbols.get(u.symbol).unwrap().key != target) { continue; } var source = analysis.compilation.sources.get(u.span.file as usize).unwrap(); var canonical = wire.uri(source.path()); var key = "{canonical}:{u.span.start}:{u.span.end}"; bool duplicate = false; for (s in &const seen) { if (*s == key) { duplicate = true; break; } } if (!duplicate) { seen.push(key); out.push(result, location(&out, analysis.compilation, u.span)); } } } self.reply(request, out, result); return true;
+        }
+        var new_name = request.str(request.get(p, "newName"));
+        if (!valid_name(new_name)) { self.error(request, -32602, "New name must be a Synx identifier and cannot be a keyword"); return true; }
+        // Conservative conflict policy: refuse a name already used by a symbol
+        // in any affected graph. This also prevents accidental local capture.
+        bool affected = false;
+        for (analysis in &const self.analyses) {
+            if (analysis.index.find(target) == NONE as usize) { continue; } affected = true;
+            if (!analysis.compilation.ok) { self.error(request, -32602, "Fix compilation errors before renaming this symbol"); return true; }
+            usize symbol = analysis.index.find(target); if (!analysis.index.symbols.get(symbol).unwrap().editable) { self.error(request, -32602, "This symbol cannot be renamed"); return true; }
+            for (m in &const analysis.compilation.lowerer.ck.r.program.modules) { match m.symbols.get(new_name) { Some(binding) => {
+                var definition = index.symbol_def(binding); if (definition.index == NONE || index.def_key(analysis.compilation, definition) != target) { self.error(request, -32602, "New name conflicts with a module or imported binding"); return true; }
+            }, None => {} } }
+            for (s in &const analysis.index.symbols) { if (s.name == String.from(new_name) && s.key != target) { self.error(request, -32602, "New name conflicts with an existing symbol"); return true; } }
+            for (source in &const analysis.compilation.sources) {
+                if (!ordinary(source)) { continue; } var sink = diagnostics.DiagnosticSink.new(); var tokens = lexer.tokenize(source, &sink);
+                for (t in &const tokens) { if (t.kind != token.Kind.Ident || !bytes.equals(t.text, name)) { continue; } bool resolved = false; usize first = NONE as usize;
+                    for (u in &const analysis.index.uses) { if (u.span.file == source.id && u.span.start == t.span.start && u.span.end == t.span.end) { resolved = true; if (first != NONE as usize && analysis.index.symbols.get(first).unwrap().key != analysis.index.symbols.get(u.symbol).unwrap().key) { self.error(request, -32602, "Rename requires expanding a shorthand binding first"); return true; } first = u.symbol; } }
+                    if (!resolved) { self.error(request, -32602, "Rename cannot resolve every use; expand shorthand or incomplete syntax first"); return true; }
+                }
+            }
+        }
+        if (!affected) { self.error(request, -32602, "Symbol is no longer available"); return true; }
+        uint result = out.object(); uint changes = out.array(); out.put(result, "documentChanges", changes); Vec<String> done = Vec.new();
+        for (analysis in &const self.analyses) { for (source in &const analysis.compilation.sources) {
+            if (!ordinary(source)) { continue; } var key = wire.path(wire.uri(source.path())).unwrap(); bool duplicate = false; for (s in &const done) { if (*s == key) { duplicate = true; break; } } if (duplicate) { continue; }
+            uint edits = out.array(); for (u in &const analysis.index.uses) { if (u.span.file != source.id || analysis.index.symbols.get(u.symbol).unwrap().key != target) { continue; } uint edit = out.object(); out.put(edit, "range", range(&out, source, u.span)); out.put(edit, "newText", out.string(new_name)); out.push(edits, edit); }
+            if (out.len(edits) == 0) { continue; } done.push(String.from(key)); uint item = out.object(); uint doc = out.object(); out.put(doc, "uri", out.string(wire.uri(key))); usize open = self.document(key); out.put(doc, "version", if (open == NONE as usize) { out.null() } else { out.number(self.documents.get(open).unwrap().version) }); out.put(item, "textDocument", doc); out.put(item, "edits", edits); out.push(changes, item);
+        } }
+        self.reply(request, out, result); return true;
+    }
+}
+bool identifier_byte(byte b) { return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 || b >= 128; }
+bool valid_name(&const str name) {
+    if (name.len() == 0) { return false; } Vec<byte> data = Vec.new(); bytes.text(&data, name); var f = SourceFile.new(String.from("<rename>"), data, 0); var sink = diagnostics.DiagnosticSink.new(); var tokens = lexer.tokenize(f, &sink);
+    return !sink.has_errors() && tokens.len() == 2 && tokens.get(0).unwrap().kind == token.Kind.Ident && tokens.get(0).unwrap().span.start == 0 && tokens.get(0).unwrap().span.end as usize == name.len();
+}
+pub int run() {
+    wire.init(); var server = Server.new();
+    loop { match wire.read() { None => return if (server.stopped) { 0 } else { 1 }, Some(body) => {
+        var request = Json.parse(body);
+        if (!request.ok) { var bad = Json.new(); uint root = bad.object(); bad.root = root; uint nil = bad.null(); bad.put(root, "id", nil); server.error(bad, -32700, "Parse error"); continue; }
+        if (request.kind(request.root) != 5 || request.str(request.get(request.root, "jsonrpc")) != "2.0" || request.kind(request.get(request.root, "method")) != 3) { var bad = Json.new(); uint root = bad.object(); bad.root = root; uint nil = bad.null(); bad.put(root, "id", nil); server.error(bad, -32600, "Invalid request"); continue; }
+        if (!server.handle(request)) { return if (server.stopped) { 0 } else { 1 }; }
+    } } }
+}

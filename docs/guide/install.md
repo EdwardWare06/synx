@@ -1,15 +1,15 @@
 # Installing Synx
 
-Synx 0.1.0 is distributed as a package for each host. A package holds the
+Synx 0.2.0 is distributed as a package for each host. A package holds the
 compiler, the runtime, and the standard library source. The compiler has its
 own linker, so no C compiler, Visual Studio, or system linker is needed to
 build programs.
 
 | Host | Package | Requirements |
 |------|---------|--------------|
-| Windows | `synx-0.1.0-windows-x86_64-setup.exe` or `synx-0.1.0-windows-x86_64.zip` | 64-bit Windows on x86-64 |
-| Linux | `synx-0.1.0-linux-x86_64.tar.gz` | x86-64, glibc 2.34 or later |
-| macOS | `synx-0.1.0-macos-x86_64.tar.gz` | macOS 10.15 or later; Rosetta 2 on Apple Silicon |
+| Windows | `synx-0.2.0-windows-x86_64-setup.exe` or `synx-0.2.0-windows-x86_64.zip` | 64-bit Windows on x86-64 |
+| Linux | `synx-0.2.0-linux-x86_64.tar.gz` | x86-64, glibc 2.34 or later |
+| macOS | `synx-0.2.0-macos-x86_64.tar.gz` | macOS 10.15 or later; Rosetta 2 on Apple Silicon |
 
 Synx makes x86-64 code only. On a Mac with Apple Silicon, the compiler and
 the programs it builds run through Rosetta 2. If Rosetta 2 is not installed,
@@ -19,11 +19,11 @@ install it with `softwareupdate --install-rosetta --agree-to-license`.
 
 ### Setup program
 
-1. Run `synx-0.1.0-windows-x86_64-setup.exe`.
+1. Run `synx-0.2.0-windows-x86_64-setup.exe`.
 2. Select the install folder. The default is `%LOCALAPPDATA%\Programs\Synx`.
 3. Keep **Add Synx to my PATH** selected, then select **Install**.
 4. Open a new terminal and run `synx version`. The output is
-   `Synx 0.1.0 (windows)`.
+   `Synx 0.2.0 (windows)`.
 
 The setup program installs for the current user and does not need
 administrator rights. **Add Synx to my PATH** adds the `bin` folder to the
@@ -50,7 +50,7 @@ select **Uninstall**. The uninstaller removes the `PATH` entry and
    synx version
    ```
 
-   The output is `Synx 0.1.0 (windows)`.
+   The output is `Synx 0.2.0 (windows)`.
 
 `install.cmd` copies the package to `%LOCALAPPDATA%\Programs\Synx`. It adds
 the `bin` folder to the user `PATH` and sets the user variable `SYNX_HOME`. It
@@ -79,16 +79,16 @@ Synx installation.
 ## Linux and macOS
 
 1. Extract the archive and run the installer. On macOS, use the file name
-   `synx-0.1.0-macos-x86_64`.
+   `synx-0.2.0-macos-x86_64`.
 
    ```text
-   tar -xzf synx-0.1.0-linux-x86_64.tar.gz
-   cd synx-0.1.0-linux-x86_64
+   tar -xzf synx-0.2.0-linux-x86_64.tar.gz
+   cd synx-0.2.0-linux-x86_64
    ./install.sh
    ```
 
 2. Open a new shell and run `synx version`. The output is
-   `Synx 0.1.0 (linux)` or `Synx 0.1.0 (macos)`.
+   `Synx 0.2.0 (linux)` or `Synx 0.2.0 (macos)`.
 
 `install.sh` copies the package to `~/.local/share/synx` and creates the link
 `~/.local/bin/synx`. If `~/.local/bin` is not on `PATH`, the installer adds
@@ -102,7 +102,7 @@ quarantine mark from the installed copy. If you run the compiler from the
 extracted folder without the installer, remove the mark first:
 
 ```text
-xattr -dr com.apple.quarantine synx-0.1.0-macos-x86_64
+xattr -dr com.apple.quarantine synx-0.2.0-macos-x86_64
 ```
 
 Options:
@@ -124,19 +124,44 @@ Give the same `--prefix` and `--bindir` that you used to install. The
 `PATH` line in the shell profile stays. Remove it by hand if you do not want
 it.
 
-## Programs and the runtime library
+## Visual Studio Code
 
-A program built by Synx loads the Synx runtime library at startup. The
-compiler copies the library next to each program that it builds:
+The [Synx extension](https://marketplace.visualstudio.com/items?itemName=edwardware06.synx)
+adds syntax colors, snippets, and compiler errors in the editor, and Run and
+Build buttons. In VS Code, open the Extensions view, search for **Synx**,
+and select **Install**. Or run:
 
-| Host | Runtime library |
-|------|-----------------|
-| Windows | `synx_rt.dll` |
-| Linux | `libsynx_rt.so` |
-| macOS | `libsynx_rt.dylib` |
+```text
+code --install-extension edwardware06.synx
+```
 
-To run a program on another computer, copy the program and the runtime
-library to the same folder. The other computer does not need Synx installed.
+The extension finds the compiler through the `synx.compilerPath` setting,
+`SYNX_HOME`, `PATH`, or the default install folder. Its source is in
+`editors/vscode/`.
+
+Extension 0.2.0 adds live diagnostics, completion, navigation, signature help,
+rename, and formatting. To install the VSIX attached to the 0.2.0 release:
+
+```text
+code --install-extension synx-0.2.0.vsix --force
+```
+
+Reload VS Code after the update. Marketplace publishing is separate from
+the compiler release.
+
+## Running and distributing programs
+
+`synx run program.snx` keeps native outputs in a private per-user cache.
+The source folder contains only the files you put there.
+
+`synx build program.snx` writes one executable with the Synx runtime
+included. Copy that file to another computer with the same supported OS
+and architecture. The other computer needs no Synx installation or Synx
+runtime sidecar. Normal OS libraries remain required; Linux programs need
+glibc 2.34 or later.
+
+`--shared-runtime` retains the separate runtime-library form when needed.
+See [the command reference](commands.md#run) for cache paths and options.
 
 ## Building from source
 

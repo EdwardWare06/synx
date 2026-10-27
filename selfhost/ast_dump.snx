@@ -188,8 +188,9 @@ byte hex_digit(uint value) {
 // The writer owns only its output. Returning output moves its sole field.
 struct Writer {
     Vec<byte> output;
+    bool positions;
 
-    Writer new() { return Writer { output: Vec.new() }; }
+    Writer new() { return Writer { output: Vec.new(), positions: true }; }
     void text(&self, &const str value) { bytes.text(&self.output, value); }
     void sp(&self) { self.output.push(32); }
     void end(&self) { self.output.push(41); }
@@ -199,7 +200,8 @@ struct Writer {
     }
     void number(&self, ulong value) { self.text("{value}"); }
     void span(&self, Span value) {
-        self.text("@{value.start}-{value.end}:{value.file}");
+        if (self.positions) { self.text("@{value.start}-{value.end}:{value.file}"); }
+        else { self.text("@0-0:0"); }
     }
     void begin(&self, &const str name, Span value) {
         self.output.push(40); self.text(name); self.sp(); self.span(value);
@@ -743,6 +745,12 @@ pub Vec<byte> module(&const ast.Ast tree) {
     var writer = Writer.new();
     writer.emit_module(tree);
     return writer.output;
+}
+/// Strict syntax record with positions removed. The formatter compares these
+/// records before it publishes edits; all other syntax fields remain exact.
+pub Vec<byte> canonical_module(&const ast.Ast tree) {
+    var writer = Writer.new(); writer.positions = false;
+    writer.emit_module(tree); return writer.output;
 }
 /// NONE at a root returns an empty buffer. Nested absent children print nil.
 pub Vec<byte> expr(&const ast.Ast tree, uint id) {

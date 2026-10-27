@@ -1,0 +1,5 @@
+// fixture: borrowed-or-cannot-escape
+// stage: borrow
+// expect: error SNX0502
+enum E { A(int), B(int) }
+&const int f() { var e = E.B(3); return match &const e { E.A(x) | E.B(x) => x }; }

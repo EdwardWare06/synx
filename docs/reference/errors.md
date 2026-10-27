@@ -52,9 +52,9 @@ Output: `8`.
 
 ## Notes
 
-Optional member access `expression?.field` is reserved. The parser and
-type checker accept it, but code generation rejects it with SNX0601. Use
-`match` or `??` instead.
+Optional member access `expression?.field` and optional method calls
+`expression?.method(args)` return an Option and skip the member operation
+when the base is None. See [Operators](operators.md).
 
 Panics do not run destructors. A worker-thread panic stops the process.
 The compiler reports diagnostics separately with SNX-prefixed codes.

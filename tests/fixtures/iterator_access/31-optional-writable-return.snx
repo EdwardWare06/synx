@@ -1,0 +1,4 @@
+// fixture: optional-writable-return
+// stage: borrow
+// expect: ok
+struct A { int n; &int field(&self) { return &self.n; } } void main() { Option<A> a = Some(A { n: 1 }); var r = a?.field(); *r.unwrap() = 2; }

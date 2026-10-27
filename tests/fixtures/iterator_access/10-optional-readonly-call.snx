@@ -1,0 +1,4 @@
+// fixture: optional-readonly-call
+// stage: borrow
+// expect: error writable
+struct A { int n; void change(&self) { self.n += 1; } } void main() { Option<A> a = Some(A { n: 1 }); var r = &const a; r?.change(); }

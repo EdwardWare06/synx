@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(synx VERSION 0.1.0 LANGUAGES C CXX)
+project(synx VERSION 0.2.0 LANGUAGES C CXX)
 
 # C builds the runtime. C++ builds only the test harnesses. The compiler is
 # Synx source in selfhost/, built by a previous Synx release (the seed).
@@ -45,9 +45,9 @@ message(STATUS "Synx seed: ${SYNX_SEED_COMPILER}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/scripts/seed.json)
 
 # Stage 1 (built by the seed) and stage 2 (built by stage 1). Stage 2 is the
-# compiler that the tests use and that the packages install. Both link with
-# the built-in linker against the runtime capsule built here, so the compiler
-# can use runtime functions that the seed's own runtime does not have.
+# compiler that the tests use and that the packages install. Stage 1 uses
+# the shared capsule for seed compatibility; stage 2 embeds the runtime host.
+# Both forms provide the runtime functions built from the current sources.
 file(GLOB_RECURSE SYNX_SELFHOST_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_SOURCE_DIR}/selfhost/*.snx ${CMAKE_SOURCE_DIR}/std/*.snx)
 set(SYNX_STAGE_DIR ${CMAKE_BINARY_DIR}/selfhost-stages)
@@ -55,7 +55,7 @@ set(SYNX_STAGE1 ${SYNX_STAGE_DIR}/synx-stage1${CMAKE_EXECUTABLE_SUFFIX})
 set(SYNX_STAGE2 ${SYNX_STAGE_DIR}/synx-stage2${CMAKE_EXECUTABLE_SUFFIX})
 set(SYNX_COMPILER ${SYNX_STAGE2})
 set(SYNX_STAGE_ENV ${CMAKE_COMMAND} -E env SYNX_STD_PATH=${CMAKE_SOURCE_DIR}/std
-    SYNX_RUNTIME_LIB= SYNX_LINKER=builtin SYNX_RUNTIME_SHARED=$<TARGET_FILE:synx_rt_shared>)
+    SYNX_RUNTIME_LIB= SYNX_LINKER=builtin SYNX_RUNTIME_SHARED=$<TARGET_FILE:synx_rt_shared> SYNX_RUNTIME_HOST=$<TARGET_FILE:synx_rt_host>)
 add_custom_command(OUTPUT ${SYNX_STAGE1}
   COMMAND ${CMAKE_COMMAND} -E make_directory ${SYNX_STAGE_DIR}
   COMMAND ${SYNX_STAGE_ENV} ${SYNX_SEED_COMPILER} build ${CMAKE_SOURCE_DIR}/selfhost/main.snx -o ${SYNX_STAGE1} --keep-obj --linker=builtin
@@ -64,7 +64,7 @@ add_custom_command(OUTPUT ${SYNX_STAGE1}
 add_custom_command(OUTPUT ${SYNX_STAGE2}
   COMMAND ${SYNX_STAGE_ENV} ${SYNX_STAGE1} build ${CMAKE_SOURCE_DIR}/selfhost/main.snx -o ${SYNX_STAGE2} --keep-obj --linker=builtin
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:synx_rt_shared> ${SYNX_STAGE_DIR}/$<TARGET_FILE_NAME:synx_rt_shared>
-  DEPENDS ${SYNX_STAGE1} synx_rt_shared
+  DEPENDS ${SYNX_STAGE1} synx_rt_shared synx_rt_host
   COMMENT "Building the Synx compiler with itself (stage 2)" VERBATIM)
 add_custom_target(synx_compiler ALL DEPENDS ${SYNX_STAGE2})
 
@@ -72,8 +72,9 @@ enable_testing()
 add_subdirectory(tests)
 
 # Installed layout: lib/ holds the runtime, std/ the standard library sources,
-# examples/workbench the demo program. The shared capsule also sits beside the
-# compiler for the OS loader. Windows uses libexec/synx.exe and bin/synx.cmd.
+# examples/workbench the demo program. The host supplies standalone builds;
+# the capsule and static archive retain explicit alternate linker modes.
+# Windows uses libexec/synx.exe and bin/synx.cmd.
 # The package also holds the two license files, and no other documents,
 # tests, or build files.
 if(WIN32)
@@ -83,8 +84,8 @@ else()
 endif()
 install(PROGRAMS ${SYNX_STAGE2} DESTINATION ${SYNX_COMPILER_DIR} RENAME synx${CMAKE_EXECUTABLE_SUFFIX})
 install(TARGETS synx_rt ARCHIVE DESTINATION lib)
+install(PROGRAMS $<TARGET_FILE:synx_rt_host> DESTINATION lib)
 install(FILES $<TARGET_FILE:synx_rt_shared> DESTINATION lib)
-install(FILES $<TARGET_FILE:synx_rt_shared> DESTINATION ${SYNX_COMPILER_DIR})
 install(DIRECTORY std/ DESTINATION std FILES_MATCHING PATTERN "*.snx")
 install(FILES examples/workbench/main.snx examples/workbench/calculator.snx DESTINATION examples/workbench)
 install(FILES LICENSE-MIT LICENSE-APACHE DESTINATION .)

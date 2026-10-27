@@ -1,0 +1,78 @@
+import std.iter;
+import std.task;
+void expect(bool ok) { if (!ok) { panic("iterator/access assertion failed"); } }
+struct Counter { int value; int end; }
+impl Iterator<int> for Counter {
+    int? next(&self) { if (self.value >= self.end) { return None; } int n = self.value; self.value += 1; return Some(n); }
+}
+int total<I: Iterator<int>>(I input) { int sum = 0; for (n in input) { sum += n; } return sum; }
+struct Numbers { int[3] values; }
+impl Index<usize, int> for Numbers { &const int index(&const self, usize at) { return &const self.values[at]; } }
+impl IndexMut<usize, int> for Numbers { &int index_mut(&self, usize at) { return &self.values[at]; } }
+struct Item { int value; String text; int read(&const self) { return self.value; } int add(&self, int n) { self.value += n; return self.value; } String take(self) { return self.text; } }
+int side_effect(&int n) { *n += 1; return 5; }
+usize index_once(&int calls) { *calls += 1; return 1; }
+struct Ticket { int id; Ticket consume(self) { return self; } Ticket fresh(&const self, int id) { return Ticket { id: id }; } }
+struct Words { Vec<String> values; }
+impl Index<usize, String> for Words { &const String index(&const self, usize at) { return self.values.get(at).unwrap(); } }
+impl IndexMut<usize, String> for Words { &String index_mut(&self, usize at) { return self.values.get_mut(at).unwrap(); } }
+impl Drop for Ticket { void drop(&self) { print("drop {self.id}"); } }
+async void suspended(Vec<Ticket> tickets) { for (ticket in tickets) { await task.yield_now(); expect(ticket.id > 0); } }
+struct Objects { Option<Item> value; }
+impl Index<int, Option<Item>> for Objects { &const Option<Item> index(&const self, int i) { return &const self.value; } }
+impl IndexMut<int, Option<Item>> for Objects { &Option<Item> index_mut(&self, int i) { return &self.value; } }
+void main() {
+    var mapped = iter.map(0..5, |int n| { return n * 2; });
+    var filtered = iter.filter(mapped, const |&const int n| { return *n >= 4; });
+    int sum_adapted = 0; usize last = 0;
+    for ((i, n) in iter.enumerate(filtered)) { sum_adapted += n; last = i; }
+    expect(sum_adapted == 18 && last == 2);
+    var collected = iter.collect(1..=3); expect(collected.len() == 3 && collected[2] == 3);
+    long highest = 9223372036854775807; var maximum = highest..=highest;
+    expect(maximum.next().unwrap() == highest && maximum.next().is_none());
+    expect(total(Counter { value: 1, end: 4 }) == 6);
+    var counter = Counter { value: 0, end: 3 }; int sum = 0;
+    for (n in &counter) { if (n == 1) { continue; } sum += n; } expect(sum == 2);
+    int indexes = 0;
+    var nums = Numbers { values: [2, 4, 6] }; nums[1] += 3; expect(nums[1] == 7); nums[index_once(&indexes)] += 1; expect(indexes == 1 && nums[1] == 8); nums[1] += nums[2]; expect(nums[1] == 14); nums[2] = nums[0]; expect(nums[2] == 2); *(&nums[0]) = 9; expect(nums[0] == 9);
+    var array = [1, 2, 3, 4];
+    var view = &const array[1..3]; expect(view.len() == 2); expect(view[0] == 2); expect(view[1] == 3);
+    usize view_len = view.len(); expect(view_len == 2);
+    Option<&const int[]> optional_view = Some(view); expect((optional_view?.len() ?? 0) == 2);
+    var nested = &const view[1..]; expect(nested.len() == 1); expect(nested[0] == 3);
+    int shared_sum = 0; for (n in iter.iter(view)) { shared_sum += *n; } expect(shared_sum == 5);
+    { var mutable = iter.iter_mut(&array[0..1]); for (n in mutable) { *n = 5; } } expect(array[0] == 5);
+    var empty = &const array[4..4]; expect(empty.len() == 0);
+    var all = &const array[..]; expect(all.len() == 4);
+    { var writable = &array[1..=2]; writable[0] = 8; writable[1] = 9; } expect(array[1] == 8 && array[2] == 9);
+    Range<usize> selected = Range { start: 1, end: 3 }; var selected_view = &const array[selected]; expect(selected_view.len() == 2 && selected_view[1] == 9);
+    var zero = [(); 3]; var zero_view = &const zero[1..3]; expect(zero_view.len() == 2);
+    Vec<int> numbers = Vec.new(); numbers.push(10); numbers.push(20); numbers.push(30);
+    { var part = &numbers[1..]; part[0] = 21; } expect(numbers[1] == 21);
+    sum = 0; for (n in numbers) { sum += n; } expect(sum == 61);
+    var dyn_counter = Counter { value: 2, end: 5 }; &dyn Iterator<int> dyn_it = &dyn_counter;
+    sum = 0; for (n in dyn_it) { sum += n; } expect(sum == 9);
+    &const dyn Index<usize, int> dyn_index = nums; expect(dyn_index[1] == 14);
+    Option<Item> item = Some(Item { value: 3, text: String.from("test") });
+    expect((item?.value ?? 0) == 3); expect((item?.read() ?? 0) == 3); expect((item?.add(4) ?? 0) == 7);
+    var borrowed = &const item; expect((borrowed?.value ?? 0) == 7);
+    Option<&const Item> payload_ref = Some(&const Item { value: 11, text: String.new() }); expect((payload_ref?.read() ?? 0) == 11);
+    Option<&const str> text = Some("abc"); expect((text?.len() ?? 0) == 3);
+    var objects = Objects { value: Some(Item { value: 20, text: String.new() }) };
+    Option<int> changed = objects[0]?.add(2); expect(changed.unwrap() == 22);
+    int calls = 0; Option<Item> absent = None; expect((absent?.add(side_effect(&calls)) ?? 0) == 0); expect(calls == 0);
+    expect((item?.take() ?? String.new()) == String.from("test"));
+    Vec<Ticket> tickets = Vec.new(); tickets.push(Ticket { id: 1 }); tickets.push(Ticket { id: 2 }); tickets.push(Ticket { id: 3 });
+    for (ticket in tickets) { expect(ticket.id == 1); break; }
+    { Vec<Ticket> waiting = Vec.new(); waiting.push(Ticket { id: 6 }); waiting.push(Ticket { id: 7 }); waiting.push(Ticket { id: 8 });
+      var work = suspended(waiting); var state = work.poll(Waker.new()); expect(match state { Pending => true, Ready(_) => false }); }
+    Vec<Ticket> ignored = Vec.new(); ignored.push(Ticket { id: 4 }); ignored.push(Ticket { id: 5 }); for (_ in ignored) {}
+    { Option<Ticket> some = Some(Ticket { id: 9 }); some?.consume(); Option<Ticket> none = None; none?.consume(); }
+    { Option<Ticket> some = Some(Ticket { id: 11 }); some?.fresh(10); }
+    { Vec<Ticket> input = Vec.new(); input.push(Ticket { id: 12 }); input.push(Ticket { id: 13 }); input.push(Ticket { id: 14 });
+      var selected = iter.collect(iter.filter(input.into_iter(), const |&const Ticket ticket| { return ticket.id == 13; }));
+      expect(selected.len() == 1 && selected[0].id == 13); }
+    { Vec<String> input = Vec.new(); input.push(String.from("old")); var words = Words { values: input }; words[0] = String.from("new"); expect(words[0] == String.from("new")); }
+
+}
+

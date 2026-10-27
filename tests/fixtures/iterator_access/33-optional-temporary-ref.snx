@@ -1,0 +1,4 @@
+// fixture: optional-temporary-ref
+// stage: borrow
+// expect: error SNX0502
+struct A { int n; &const int field(&const self) { return &const self.n; } } Option<&const int> bad() { return Some(A { n: 1 })?.field(); } void main() {}

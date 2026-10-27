@@ -28,7 +28,7 @@ enum Option<T> {
 An optional value. The type `T?` is the same type as `Option<T>`. The variant
 names `Some` and `None` are in scope without the `Option.` prefix.
 
-The postfix `?` operator and the `??` operator work on `Option`. See
+The postfix `?`, optional access `?.`, and `??` work on `Option`. See
 [Error values and panics](../reference/errors.md).
 
 ### Option.is_some
@@ -310,8 +310,9 @@ The index expression `v[i]` reads or writes element *i*. It panics with
 `index out of bounds` if *i* is not less than the length.
 
 A `for` loop over `&const v` gives a shared reference to each element. A
-`for` loop over `&v` gives a writable reference to each element. The compiler
-rejects a `for` loop over a `Vec` by value.
+`for` loop over `&v` gives a writable reference to each element. A loop over
+`v` consumes the vector and yields owned elements in order. An early exit
+drops the unread elements.
 
 ### Vec.new
 
@@ -434,13 +435,22 @@ An owning heap allocation for one value of type `T`. When a `Box` moves, its
 value stays at the same address. Dropping a `Box` drops the value and frees
 the allocation.
 
+`Box<dyn Trait>` owns a concrete implementing value through a data pointer
+and a vtable pointer. A sized `Box<T>` coerces to it by moving the box.
+Trait methods can be called directly. Reference receivers borrow the payload;
+a by-value `self` consumes the box. Dropping the box runs the concrete value's
+cleanup before freeing storage. Captured borrows remain checked.
+`Box<str>` and `Box<T[]>` are unsupported. See [Traits](../reference/traits.md).
+
 ### Box.new
 
 ```synx
 Box<T> new(T value)
 ```
 
-Allocates memory for one `T` and moves *value* into it.
+Allocates memory for one sized `T` and moves *value* into it. For an owned
+trait object, construct `Box.new(concrete_value)` and let the typed use
+convert it to `Box<dyn Trait>`.
 
 ### Box.as_ref
 
@@ -481,7 +491,7 @@ T into_inner(self)
 ```
 
 Moves the value out of the box and frees the allocation. The call consumes
-the box.
+the box. `T` must be sized; this method cannot extract `dyn Trait` by value.
 
 ### Poll
 
@@ -840,8 +850,8 @@ The compiler supplies these functions. The prelude uses them to build
 
 Returns a `str` view of *length* bytes at *data*. The bytes are not copied or
 checked. The caller must keep the bytes alive while the view is in use, and
-the bytes must be valid UTF-8. The compiler does not require an `unsafe`
-block for this call.
+the bytes must be valid UTF-8. This call requires an `unsafe` block
+(`SNX0415`).
 
 ### size_of
 
@@ -849,7 +859,7 @@ block for this call.
 usize size_of<T>()
 ```
 
-Returns the size of `T` in bytes.
+Returns the size of a sized `T` in bytes. Bare `dyn Trait` is rejected.
 
 ### drop_in_place
 
@@ -936,3 +946,18 @@ last: (3, 4), left: 1
 Synx! has 5 bytes
 (50, 6)
 ```
+
+## Iterator and indexing traits
+
+```synx
+trait Iterator<T> { T? next(&self); }
+trait Index<I, T> { &const T index(&const self, I key); }
+trait IndexMut<I, T> { &T index_mut(&self, I key); }
+```
+
+`for` advances Iterator values. Vec.into_iter consumes the vector and returns
+`VecIter<T>`, an owning iterator. Unread elements are dropped when it ends.
+VecIter has no public fields or constructor. See [std.iter](iter.md).
+Index and IndexMut implement shared and writable `value[key]` operations.
+User implementations supply their bounds checks. See
+[Operators](../reference/operators.md).

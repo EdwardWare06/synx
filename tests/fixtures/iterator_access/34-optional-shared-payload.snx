@@ -1,0 +1,4 @@
+// fixture: optional-shared-payload
+// stage: borrow
+// expect: error writable
+struct A { int n; void field(&self) { self.n += 1; } } void main() { var a = A { n: 1 }; Option<&const A> r = Some(&const a); r?.field(); }

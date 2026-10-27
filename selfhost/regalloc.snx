@@ -83,6 +83,7 @@ pub RegisterAllocation allocate_registers(&Checker ck, &const Function f, &Layou
                     match r.kind { RvalueKind.Cast => { if (ck.r.types.get(r.type).is_float()) { pin(&pinned, s.place.local); } }, _ => {} }
                     match r.kind {
                         RvalueKind.Ref => { pin(&pinned, r.place.local); place(&e, &pinned, &const r.place, false); }
+                        RvalueKind.Slice => { pin(&pinned, r.place.local); place(&e, &pinned, &const r.place, false); operand(&e, &pinned, &const r.a); operand(&e, &pinned, &const r.b); }
                         RvalueKind.Len => { pin(&pinned, r.place.local); place(&e, &pinned, &const r.place, false); }
                         RvalueKind.Discriminant => { pin(&pinned, r.place.local); place(&e, &pinned, &const r.place, false); }
                         RvalueKind.Aggregate => {
@@ -114,6 +115,7 @@ pub RegisterAllocation allocate_registers(&Checker ck, &const Function f, &Layou
                 b.successors.push(t.otherwise);
             }
             TerminatorKind.Call => {
+                if (t.loan_anchor != NONE) { set_add(&e.uses, t.loan_anchor); }
                 for (o in &const t.args) { operand(&e, &pinned, o); }
                 match t.callee.kind { CalleeKind.Indirect => { operand(&e, &pinned, &const t.callee.fn_operand); }, _ => {} }
                 place(&e, &pinned, &const t.dest, true);

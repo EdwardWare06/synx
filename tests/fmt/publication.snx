@@ -1,0 +1,14 @@
+/// Direct publication probe. Run as a native child so Python and the runtime
+/// can use different architectures on Apple Silicon hosts.
+import std.env;
+import std.fs;
+extern "C" { int synx_rt_format_write(*const byte path, usize length, *const usize slices); }
+int main() {
+    var args = env.args(); if (args.len() != 4) { return 2; }
+    var path = args.get(1).unwrap().as_str();
+    var expected = match fs.read(args.get(2).unwrap().as_str()) { Ok(data) => data, Err(_) => return 2 };
+    var replacement = match fs.read(args.get(3).unwrap().as_str()) { Ok(data) => data, Err(_) => return 2 };
+    Vec<usize> slices = Vec.new(); slices.push(expected.as_ptr() as usize); slices.push(expected.len());
+    slices.push(replacement.as_ptr() as usize); slices.push(replacement.len());
+    return unsafe { synx_rt_format_write(path.as_ptr(), path.len(), slices.as_ptr()) };
+}

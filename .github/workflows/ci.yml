@@ -32,12 +32,20 @@ jobs:
         run: |
           asan="$(cc -print-file-name=libasan.so)"
           test -f "$asan"
-          for case_name in recursive_owners recursive_mutation closure_modes async_core async_cancel async_executor async_futures async_outputs thread_core thread_sync thread_drop thread_channel pool_core pool_cancel pool_race pool_time pool_io host comparison_cleanup partial_move_cleanup; do
+          for case_name in recursive_owners recursive_mutation closure_modes async_core async_cancel async_executor async_futures async_outputs thread_core thread_sync thread_drop thread_channel pool_core pool_cancel pool_race pool_time pool_io host comparison_cleanup partial_move_cleanup pattern_groups owned_dyn iterator_access; do
             build/selfhost-stages/synx-stage2 build "tests/run/$case_name.snx" -o "build/$case_name-memory"
             input=/dev/null
             if test -f "tests/run/$case_name.stdin"; then input="tests/run/$case_name.stdin"; fi
             LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 "build/$case_name-memory" < "$input"
           done
+      - name: Formatter allocation check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export SYNX_FMT_ASAN="$(cc -print-file-name=libasan.so)"
+          test -f "$SYNX_FMT_ASAN"
+          python3 -B tests/fmt/test_fmt.py build/selfhost-stages/synx-stage2 build/runtime/synx-host
+          SYNX_LSP_ASAN="$SYNX_FMT_ASAN" python3 -B tests/lsp/test_lsp.py build/selfhost-stages/synx-stage2
       - name: Failed thread creation cleanup
         if: runner.os == 'Linux'
         shell: bash
@@ -98,3 +106,21 @@ jobs:
           else
             build/selfhost-stages/synx-stage2 version
           fi
+
+  vscode:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - run: npm ci
+      - name: Unit and grammar tests
+        run: npm test
+      - name: Package
+        run: npx vsce package --no-dependencies

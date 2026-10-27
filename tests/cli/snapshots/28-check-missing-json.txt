@@ -1,0 +1,4 @@
+exit 1
+--- stdout
+{"version":1,"ok":false,"error":"cannot read file","diagnostics":[]}
+--- stderr

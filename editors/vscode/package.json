@@ -1,0 +1,209 @@
+{
+  "name": "synx",
+  "displayName": "Synx",
+  "description": "Synx language support: live errors, completion, navigation, rename, and native Run and Build commands.",
+  "version": "0.2.0",
+  "publisher": "edwardware06",
+  "author": "Edward Ware",
+  "license": "(MIT OR Apache-2.0)",
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#252824",
+    "theme": "dark"
+  },
+  "homepage": "https://github.com/EdwardWare06/synx",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EdwardWare06/synx.git",
+    "directory": "editors/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/EdwardWare06/synx/issues"
+  },
+  "keywords": [
+    "synx",
+    "snx",
+    "compiler",
+    "ownership",
+    "borrow checker"
+  ],
+  "categories": [
+    "Programming Languages",
+    "Snippets",
+    "Linters"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/*.snx"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "synx",
+        "aliases": [
+          "Synx",
+          "synx"
+        ],
+        "extensions": [
+          ".snx"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./images/snx-file.svg",
+          "dark": "./images/snx-file.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "synx",
+        "scopeName": "source.synx",
+        "path": "./syntaxes/synx.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "synx",
+        "path": "./snippets/synx.json"
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "synx",
+        "required": [
+          "command",
+          "file"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "enum": [
+              "run",
+              "build"
+            ],
+            "description": "The synx command."
+          },
+          "file": {
+            "type": "string",
+            "description": "The Synx source file."
+          }
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "synx.runFile",
+        "title": "Run File",
+        "category": "Synx",
+        "icon": "$(play)"
+      },
+      {
+        "command": "synx.buildFile",
+        "title": "Build File",
+        "category": "Synx",
+        "icon": "$(package)"
+      },
+      {
+        "command": "synx.checkFile",
+        "title": "Check File",
+        "category": "Synx"
+      },
+      {
+        "command": "synx.showOutput",
+        "title": "Show Output",
+        "category": "Synx"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "synx.runFile",
+          "when": "resourceLangId == synx",
+          "group": "navigation@0"
+        },
+        {
+          "command": "synx.buildFile",
+          "when": "resourceLangId == synx",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "synx.runFile",
+          "when": "editorLangId == synx"
+        },
+        {
+          "command": "synx.buildFile",
+          "when": "editorLangId == synx"
+        },
+        {
+          "command": "synx.checkFile",
+          "when": "editorLangId == synx"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Synx",
+      "properties": {
+        "synx.compilerPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Path to the Synx compiler: `synx`, `synx.cmd`, or `synx.exe`. When empty, the extension uses `SYNX_HOME`, then `PATH`, then the default install folder."
+        },
+        "synx.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check a Synx file with the compiler when you save it, and show the errors in the editor."
+        },
+        "synx.checkOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check a Synx file with the compiler when you open it."
+        },
+        "synx.buildArguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra arguments for **Synx: Run File** and **Synx: Build File**, for example `--release`."
+        },
+        "synx.checkOnChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check unsaved changes with the Synx language server."
+        },
+        "synx.checkDelay": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "Delay in milliseconds before checking edits."
+        },
+        "synx.entryPoints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Program entry files relative to each workspace folder, or absolute paths. When empty, use the nearest ancestor main.snx."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.0.0",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  },
+  "scripts": {
+    "test": "node --test test/unit.test.js test/grammar.test.js test/lsp.test.js",
+    "test:vscode": "node test/integration/run.js",
+    "package": "vsce package --no-dependencies"
+  }
+}

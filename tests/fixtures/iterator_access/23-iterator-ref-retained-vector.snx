@@ -1,0 +1,4 @@
+// fixture: iterator-ref-retained-vector
+// stage: borrow
+// expect: error borrowed
+import std.iter; void main() { var a = [1,2]; var it = iter.iter_mut(&a[..]); Vec<&int> saved = Vec.new(); for (value in &it) { saved.push(value); } *saved[0] = 3; }

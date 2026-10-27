@@ -59,6 +59,7 @@ struct Writer {
             StrFromString => { self.text("str_from_string("); self.operand(r, m, v.a); self.text(")"); },
             ArrayToSlice => { self.text("array_to_slice("); self.operand(r, m, v.a); self.text(")"); },
             VecToSlice => { self.text("vec_to_slice("); self.operand(r, m, v.a); self.text(")"); },
+            Slice => { self.text("slice("); self.text(place(v.place)); self.text(", "); self.operand(r, m, v.a); self.text(", "); self.operand(r, m, v.b); self.text(")"); },
             ToDyn => { self.text("to_dyn("); self.operand(r, m, v.a); self.text(", "); self.type(r, v.type); self.text(")"); },
         }
     }
@@ -76,6 +77,7 @@ struct Writer {
                     Indirect => { self.text("call ("); self.operand(r, m, t.callee.fn_operand); self.text(")"); }
                 }
                 self.text("("); self.operands(r, m, t.args); self.text(")");
+                if (t.loan_anchor != NONE) { self.text(" anchor _{t.loan_anchor}"); }
                 if (t.diverges) { self.text(" -> diverges"); } else { self.text(" -> bb{t.target}"); }
             },
             Assert => { self.text("assert "); self.operand(r, m, t.cond); self.text(" \"{t.message}\" -> bb{t.target}"); },

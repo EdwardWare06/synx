@@ -16,7 +16,9 @@ continue;
 
 `while` tests a `bool` condition before each iteration. `loop` repeats until
 control leaves it. `for` evaluates its sequence and binds its pattern on
-each iteration. Parentheses are required for `while` and `for`.
+each iteration. The pattern must cover every possible element. Alternatives
+can bind names under the [pattern rules](patterns.md). Parentheses are
+required for `while` and `for`.
 
 Integer `start..end` ranges exclude the end. `start..=end` includes it.
 An inclusive range stops before incrementing past its final value, including
@@ -44,7 +46,17 @@ Output: `10`.
 
 ## Notes
 
-The current compiler lowers supported range and collection loops directly.
-Do not infer an arbitrary user-defined iterator protocol from the `for`
-syntax. A while-condition temporary lives through that iteration's body and
-drops before the next condition evaluation.
+`for` also accepts types that implement `Iterator<T>`. The compiler calls
+`T? next(&self)` until it returns `None`. The loop consumes an owned
+iterator, or borrows a writable iterator supplied through `&iterator`.
+A shared iterator reference cannot advance.
+
+Iteration by value consumes a Vec and visits its elements in order. An early
+exit drops unread elements. `&const vec` and `&vec` keep borrowed iteration.
+A borrowed iterator item cannot remain in use when the loop advances again.
+A break or return can preserve an item if its source and iterator loans
+permit it. Borrowing from an iterator owned by the loop cannot escape that
+owner's scope.
+[std.iter](../library/iter.md) supplies adapters and borrowed slice iterators.
+A while-condition temporary lives through that iteration's body and drops
+before the next condition evaluation.

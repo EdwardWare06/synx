@@ -1,0 +1,7 @@
+// fixture: owned-ref-result-retains-loan
+// stage: borrow
+// expect: error SNX0501
+trait Take { &const int take(self); }
+struct S { &const int value; }
+impl Take for S { &const int take(self) { return self.value; } }
+main() { int x = 1; Box<dyn Take> p = Box.new(S { value: &const x }); var r = p.take(); x = 2; print("{*r}"); }

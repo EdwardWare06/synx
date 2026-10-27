@@ -1,0 +1,5 @@
+// fixture: generic-borrowed-return
+// stage: borrow
+// expect: ok
+trait Read { int read(&const self); }
+Box<dyn Read> erase<T: Read>(Box<T> value) { return value; }

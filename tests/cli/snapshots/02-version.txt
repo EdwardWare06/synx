@@ -1,4 +1,4 @@
 exit 0
 --- stdout
-Synx 0.1.0 (<host>)
+Synx 0.2.0 (<host>)
 --- stderr

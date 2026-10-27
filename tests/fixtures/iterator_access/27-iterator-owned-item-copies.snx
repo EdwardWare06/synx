@@ -1,0 +1,4 @@
+// fixture: iterator-owned-item-copies
+// stage: borrow
+// expect: ok
+import std.iter; void main() { var a = [1,2]; var it = iter.iter(&const a[..]); Vec<int> saved = Vec.new(); for (value in it) { saved.push(*value); } var n = saved[0]; }

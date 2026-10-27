@@ -1,0 +1,5 @@
+// fixture: named-variant-correlation
+// stage: borrow
+// expect: error SNX0404
+enum Pair { Both { bool left; bool right; } }
+int f(Pair p) { return match p { Pair.Both { left: true, right: false } => 1, Pair.Both { left: false, right: true } => 2 }; }

@@ -1,0 +1,4 @@
+// fixture: iterator-break-borrow
+// stage: borrow
+// expect: ok
+import std.iter; void main() { var a = [1,2]; var it = iter.iter_mut(&a[..]); Option<&int> found = None; for (value in &it) { found = Some(value); break; } *found.unwrap() = 3; }

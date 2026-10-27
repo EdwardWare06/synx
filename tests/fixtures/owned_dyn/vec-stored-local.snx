@@ -1,0 +1,7 @@
+// fixture: vec-stored-local
+// stage: borrow
+// expect: error SNX0504
+trait Store { void put(&self, &const int value); }
+struct S { Option<&const int> value; }
+impl Store for S { void put(&self, &const int value) { self.value = Some(value); } }
+main() { Vec<Box<dyn Store>> list = Vec.new(); list.push(Box.new(S { value: None })); { int x = 1; list.get_mut(0).unwrap().put(x); } }

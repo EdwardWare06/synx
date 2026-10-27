@@ -1,6 +1,7 @@
 /* Compiler CLI transport. No parsing, semantic checks or code generation. */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
 #include <limits.h>
 #if defined(_WIN32)
@@ -44,6 +45,19 @@ int synx_rt_driver_write(int fd, const uint8_t* data, uint64_t n) {
   return fflush(stream) == 0 ? 0 : (errno ? errno : EIO);
 }
 
+/* LSP uses byte counts. Keep framing free of CRT newline conversion. */
+void synx_rt_driver_binary(void) {
+#if defined(_WIN32)
+  _setmode(_fileno(stdin), _O_BINARY);
+  _setmode(_fileno(stdout), _O_BINARY);
+#endif
+}
+int synx_rt_driver_read(uint8_t* data, uint64_t capacity, uint64_t* count) {
+  if (!count || (!data && capacity) || capacity > UINT_MAX) return EINVAL;
+  *count = (uint64_t)fread(data, 1, (size_t)capacity, stdin);
+  return ferror(stdin) ? (errno ? errno : EIO) : 0;
+}
+
 /* C++ ostringstream's default floating format uses six significant digits.
  * Decimal conversion/formatting remains a native boundary in this port. */
 uint64_t synx_rt_driver_float(double value, uint8_t* output, uint64_t capacity) {
@@ -51,3 +65,7 @@ uint64_t synx_rt_driver_float(double value, uint8_t* output, uint64_t capacity) 
   int count = snprintf((char*)output, 64, "%.6g", value);
   return count > 0 && count < 64 ? (uint64_t)count : 0;
 }
+
+#if defined(SYNX_STANDALONE_RUNTIME)
+#include "exports_driver.inc"
+#endif

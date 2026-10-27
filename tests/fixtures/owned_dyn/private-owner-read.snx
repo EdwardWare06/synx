@@ -1,0 +1,4 @@
+// fixture: private-owner-read
+// stage: borrow
+// expect: error private
+main() { var box = Box.new(3); var raw = box.data; }

@@ -1,0 +1,123 @@
+/// Bounded JSON arena. Nodes own strings and child IDs. No recursive owners.
+/// Parsing rejects invalid UTF-8, duplicate keys, malformed escapes and numbers.
+import bytes;
+import defs;
+import diagnostics;
+import std.text;
+import std.utf8;
+pub const uint NONE = 4294967295;
+pub struct Node { pub int kind; pub String text; pub Vec<String> keys; pub Vec<uint> children; }
+pub struct Json {
+    pub Vec<Node> nodes;
+    pub uint root;
+    pub bool ok;
+    Vec<byte> input;
+    usize pos;
+    pub Json new() { return Json { nodes: Vec.new(), root: NONE, ok: true, input: Vec.new(), pos: 0 }; }
+    pub uint add(&self, int kind, String text) {
+        uint id = self.nodes.len() as uint;
+        self.nodes.push(Node { kind: kind, text: text, keys: Vec.new(), children: Vec.new() }); return id;
+    }
+    pub uint object(&self) { return self.add(5, String.new()); }
+    pub uint array(&self) { return self.add(4, String.new()); }
+    pub uint string(&self, &const str value) { return self.add(3, String.from(value)); }
+    pub uint number(&self, long value) { return self.add(2, "{value}"); }
+    pub uint boolean(&self, bool value) { return self.add(1, String.from(if (value) { "true" } else { "false" })); }
+    pub uint null(&self) { return self.add(0, String.new()); }
+    pub void put(&self, uint object, &const str key, uint value) {
+        var n = self.nodes.get_mut(object as usize).unwrap(); n.keys.push(String.from(key)); n.children.push(value);
+    }
+    pub void push(&self, uint array, uint value) { self.nodes.get_mut(array as usize).unwrap().children.push(value); }
+    pub int kind(&const self, uint id) { if (id as usize >= self.nodes.len()) { return -1; } return self.nodes.get(id as usize).unwrap().kind; }
+    pub uint get(&const self, uint id, &const str key) {
+        if (self.kind(id) != 5) { return NONE; }
+        var n = self.nodes.get(id as usize).unwrap();
+        for (i in 0..n.keys.len()) { if (*n.keys.get(i).unwrap() == String.from(key)) { return *n.children.get(i).unwrap(); } } return NONE;
+    }
+    pub uint at(&const self, uint id, usize index) { if (id as usize >= self.nodes.len()) { return NONE; } match self.nodes.get(id as usize).unwrap().children.get(index) { Some(v) => return *v, None => return NONE } }
+    pub usize len(&const self, uint id) { if (id as usize >= self.nodes.len()) { return 0; } return self.nodes.get(id as usize).unwrap().children.len(); }
+    pub &const str str(&const self, uint id) { if (id as usize >= self.nodes.len()) { return ""; } return self.nodes.get(id as usize).unwrap().text.as_str(); }
+    pub long integer(&const self, uint id, long fallback) { if (self.kind(id) != 2) { return fallback; } match text.parse_long(self.str(id)) { Some(v) => return v, None => return fallback } }
+    pub uint copy(&self, &const Json other, uint id) {
+        int kind = other.kind(id); if (kind < 0) { return self.null(); }
+        uint out = self.add(kind, String.from(other.str(id)));
+        for (i in 0..other.len(id)) { uint child = self.copy(other, other.at(id, i));
+            if (kind == 5) { self.put(out, other.nodes.get(id as usize).unwrap().keys.get(i).unwrap(), child); } else { self.push(out, child); }
+        } return out;
+    }
+    void whitespace(&self) { while (self.pos < self.input.len()) { byte b = bytes.at(self.input, self.pos); if (b != 32 && b != 10 && b != 13 && b != 9) { break; } self.pos += 1; } }
+    byte take(&self) { if (self.pos >= self.input.len()) { self.ok = false; return 0; } byte b = bytes.at(self.input, self.pos); self.pos += 1; return b; }
+    uint hex4(&self) {
+        uint out = 0;
+        for (i in 0..4) { byte b = self.take(); uint digit = 0;
+            if (b >= 48 && b <= 57) { digit = (b - 48) as uint; } else if (b >= 65 && b <= 70) { digit = (b - 55) as uint; }
+            else if (b >= 97 && b <= 102) { digit = (b - 87) as uint; } else { self.ok = false; }
+            out = out * 16 + digit;
+        } return out;
+    }
+    String quoted(&self) {
+        Vec<byte> out = Vec.new();
+        if (self.take() != 34) { self.ok = false; return String.new(); }
+        while (self.ok) {
+            byte b = self.take(); if (!self.ok) { break; } if (b == 34) { return defs.name(out); }
+            if (b < 32) { self.ok = false; break; }
+            if (b != 92) { out.push(b); continue; }
+            byte e = self.take();
+            if (e == 34 || e == 92 || e == 47) { out.push(e); }
+            else if (e == 98) { out.push(8); } else if (e == 102) { out.push(12); }
+            else if (e == 110) { out.push(10); } else if (e == 114) { out.push(13); } else if (e == 116) { out.push(9); }
+            else if (e == 117) {
+                uint point = self.hex4();
+                if (point >= 55296 && point <= 56319) {
+                    if (self.take() != 92 || self.take() != 117) { self.ok = false; break; }
+                    uint low = self.hex4(); if (low < 56320 || low > 57343) { self.ok = false; break; }
+                    point = 65536 + (point - 55296) * 1024 + low - 56320;
+                }
+                match text.from_code_point(point) { Some(s) => bytes.text(&out, s), None => { self.ok = false; } }
+            } else { self.ok = false; }
+        } return String.new();
+    }
+    uint value(&self, uint depth) {
+        self.whitespace(); if (!self.ok || depth > 128 || self.nodes.len() > 1000000) { self.ok = false; return NONE; }
+        byte b = bytes.at(self.input, self.pos);
+        if (b == 34) { var s = self.quoted(); return self.add(3, s); }
+        if (b == 123 || b == 91) {
+            self.pos += 1; int kind = if (b == 123) { 5 } else { 4 }; byte close = if (b == 123) { 125 } else { 93 };
+            uint id = self.add(kind, String.new()); self.whitespace();
+            if (bytes.at(self.input, self.pos) == close) { self.pos += 1; return id; }
+            while (self.ok) {
+                String key = String.new();
+                if (kind == 5) { key = self.quoted(); self.whitespace(); if (self.take() != 58) { self.ok = false; } if (self.get(id, key) != NONE) { self.ok = false; } }
+                uint child = self.value(depth + 1); if (!self.ok) { break; }
+                if (kind == 5) { self.put(id, key, child); } else { self.push(id, child); }
+                self.whitespace(); byte next = self.take(); if (next == close) { return id; } if (next != 44) { self.ok = false; break; } self.whitespace();
+            } return id;
+        }
+        if (b == 116 || b == 102 || b == 110) {
+            var word = if (b == 116) { "true" } else if (b == 102) { "false" } else { "null" };
+            for (i in 0..word.len()) { if (self.take() != unsafe { *((word.as_ptr() as usize + i) as *const byte) }) { self.ok = false; } }
+            return self.add(if (b == 110) { 0 } else { 1 }, String.from(word));
+        }
+        usize start = self.pos; if (b == 45) { self.pos += 1; }
+        b = bytes.at(self.input, self.pos);
+        if (b == 48) { self.pos += 1; } else if (b >= 49 && b <= 57) { while (digit(bytes.at(self.input, self.pos))) { self.pos += 1; } } else { self.ok = false; return NONE; }
+        if (bytes.at(self.input, self.pos) == 46) { self.pos += 1; if (!digit(bytes.at(self.input, self.pos))) { self.ok = false; } while (digit(bytes.at(self.input, self.pos))) { self.pos += 1; } }
+        b = bytes.at(self.input, self.pos); if (b == 101 || b == 69) { self.pos += 1; b = bytes.at(self.input, self.pos); if (b == 43 || b == 45) { self.pos += 1; } if (!digit(bytes.at(self.input, self.pos))) { self.ok = false; } while (digit(bytes.at(self.input, self.pos))) { self.pos += 1; } }
+        var number = defs.name(bytes.copy(self.input, start, self.pos)); return self.add(2, number);
+    }
+    pub Json parse(Vec<byte> input) {
+        var j = Json.new(); if (utf8.decode(input).is_none()) { j.ok = false; return j; } j.input = input;
+        uint root = j.value(0); j.root = root; j.whitespace(); if (j.pos != j.input.len()) { j.ok = false; } return j;
+    }
+    void emit(&const self, uint id, &Vec<byte> out) {
+        int k = self.kind(id);
+        if (k == 3) { Vec<byte> b = Vec.new(); bytes.text(&b, self.str(id)); diagnostics.json_string(&*out, b); }
+        else if (k == 4 || k == 5) {
+            out.push(if (k == 4) { 91 } else { 123 });
+            for (i in 0..self.len(id)) { if (i > 0) { out.push(44); } if (k == 5) { Vec<byte> key = Vec.new(); bytes.text(&key, self.nodes.get(id as usize).unwrap().keys.get(i).unwrap()); diagnostics.json_string(&*out, key); out.push(58); } self.emit(self.at(id, i), &*out); }
+            out.push(if (k == 4) { 93 } else { 125 });
+        } else if (k == 1 || k == 2) { bytes.text(&*out, self.str(id)); } else { bytes.text(&*out, "null"); }
+    }
+    pub Vec<byte> encode(&const self, uint id) { Vec<byte> out = Vec.new(); self.emit(id, &out); return out; }
+}
+bool digit(byte b) { return b >= 48 && b <= 57; }

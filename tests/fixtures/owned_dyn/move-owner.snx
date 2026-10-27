@@ -1,0 +1,7 @@
+// fixture: move-owner
+// stage: borrow
+// expect: error SNX0501
+trait Read { int read(&const self); }
+struct Number { int value; }
+impl Read for Number { int read(&const self) { return self.value; } }
+main() { Box<dyn Read> x = Box.new(Number { value: 3 }); var y = x; print("{x.read()}"); }

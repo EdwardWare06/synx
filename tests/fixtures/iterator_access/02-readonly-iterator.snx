@@ -1,0 +1,4 @@
+// fixture: readonly-iterator
+// stage: borrow
+// expect: error writable
+struct I {} impl Iterator<int> for I { int? next(&self) { return None; } } void main() { var i = I {}; for (x in &const i) {} }

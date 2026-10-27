@@ -1,0 +1,4 @@
+// fixture: optional-method-generic
+// stage: borrow
+// expect: ok
+struct A { T echo<T>(&const self, T value) { return value; } } void main() { Option<A> a = Some(A {}); Option<int> x = a?.echo<int>(3); }

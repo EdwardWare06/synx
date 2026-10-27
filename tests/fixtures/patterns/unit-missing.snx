@@ -1,0 +1,4 @@
+// fixture: unit-missing
+// stage: borrow
+// expect: error missing: ()
+int f() { return match () { _ if false => 0 }; }

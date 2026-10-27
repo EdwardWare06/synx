@@ -17,6 +17,7 @@ import std.collections.{HashMap, sort};
 | Module | Contents |
 |--------|----------|
 | [Prelude](prelude.md) | `Option`, `Result`, `String`, `Vec`, `Box`, the core traits, `print`, `panic` |
+| [std.iter](iter.md) | Iterator adapters and borrowed slice iteration |
 | [std.mem](mem.md) | `replace`, `swap`, `drop` |
 | [std.hash](hash.md) | The `Hash` trait and the default hasher |
 | [std.collections](collections.md) | `HashMap` and `sort` |

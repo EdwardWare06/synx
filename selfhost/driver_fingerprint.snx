@@ -1,0 +1,22 @@
+/// SHA-256 content identities. Source graph order and path spelling are part
+/// of the manifest. Native hashing is a private compiler host service.
+import source.SourceFile;
+import link.model;
+import std.fs;
+import bytes;
+import std.binary;
+extern "C" { void synx_rt_cache_hash(*const byte input, usize size, *byte output); }
+pub Vec<byte> digest(&const Vec<byte> input) {
+    Vec<byte> out = Vec.new(); for (i in 0..32) { out.push(0); }
+    unsafe { synx_rt_cache_hash(input.as_ptr(), input.len(), out.as_mut_ptr()); } return out;
+}
+pub String hash(&const Vec<byte> input) { return model.key(digest(input)); }
+pub Result<String, fs.IoError> file(&const str path) { return Ok(hash(fs.read(path)?)); }
+pub void text(&Vec<byte> output, &const str value) {
+    bool valid = binary.write_uint(&*output, value.len() as ulong, 8, true); bytes.text(&*output, value);
+}
+pub String sources(&const Vec<SourceFile> files) {
+    Vec<byte> out = Vec.new();
+    for (file in files) { text(&out, file.path()); bytes.append(&out, digest(file.data())); }
+    return hash(out);
+}

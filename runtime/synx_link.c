@@ -119,3 +119,7 @@ int synx_rt_link_executable(const uint8_t* path, uint64_t length) {
   free(text); return error;
 #endif
 }
+
+#if defined(SYNX_STANDALONE_RUNTIME)
+#include "exports_link.inc"
+#endif

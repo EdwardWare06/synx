@@ -1,0 +1,4 @@
+// fixture: scalar-needs-fallback
+// stage: borrow
+// expect: error SNX0404
+int f(int value) { return match value { 0..=100 => 1 }; }

@@ -1,0 +1,5 @@
+// fixture: non-object-safe-self
+// stage: borrow
+// expect: error SNX0410
+trait Bad { Self take(self); }
+main() { Box<dyn Bad>? x = None; }

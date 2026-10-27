@@ -1,0 +1,4 @@
+// fixture: slice-return-local
+// stage: borrow
+// expect: error SNX0502
+&const int[] bad() { var a = [1,2]; return &const a[..]; } void main() {}

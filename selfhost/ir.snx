@@ -65,12 +65,12 @@ pub struct Operand {
 pub uint operand_index(OperandKind kind) { match kind { OperandKind.Copy => return 0, OperandKind.Move => return 1, OperandKind.Const => return 2 } }
 pub Vec<Operand> copy_operands(&const Vec<Operand> values) { Vec<Operand> out = Vec.new(); for (o in values) { out.push(o.copy()); } return out; }
 
-pub enum RvalueKind { Use, Ref, Binary, Unary, Cast, Aggregate, Discriminant, Len, StrFromString, ArrayToSlice, VecToSlice, ToDyn }
+pub enum RvalueKind { Use, Ref, Binary, Unary, Cast, Aggregate, Discriminant, Len, StrFromString, ArrayToSlice, VecToSlice, ToDyn, Slice }
 pub uint rvalue_index(RvalueKind kind) {
     match kind {
         RvalueKind.Use => return 0, RvalueKind.Ref => return 1, RvalueKind.Binary => return 2, RvalueKind.Unary => return 3,
         RvalueKind.Cast => return 4, RvalueKind.Aggregate => return 5, RvalueKind.Discriminant => return 6, RvalueKind.Len => return 7,
-        RvalueKind.StrFromString => return 8, RvalueKind.ArrayToSlice => return 9, RvalueKind.VecToSlice => return 10, RvalueKind.ToDyn => return 11,
+        RvalueKind.StrFromString => return 8, RvalueKind.ArrayToSlice => return 9, RvalueKind.VecToSlice => return 10, RvalueKind.ToDyn => return 11, RvalueKind.Slice => return 12,
     }
 }
 pub enum AggregateKind { Struct, Tuple, Array, Variant }
@@ -155,17 +155,20 @@ pub struct Terminator {
     pub Vec<Operand> args;
     pub Place dest;
     pub bool diverges;
+    /// Logical loan carried by a call result; not an ABI argument. NONE is absent.
+    /// Iterator loops use it to end reference-item use before their next advance.
+    pub uint loan_anchor;
     pub Operand cond;
     pub String message;
     pub Span span;
     pub Terminator new(TerminatorKind kind) {
         return Terminator { kind: kind, target: 0, discr: Operand.empty(), cases: Vec.new(), otherwise: 0, callee: Callee.new(CalleeKind.Direct),
-            args: Vec.new(), dest: Place.of(0), diverges: false, cond: Operand.empty(), message: String.new(), span: Span { start: 0, end: 0, file: 0 } };
+            args: Vec.new(), dest: Place.of(0), diverges: false, loan_anchor: NONE, cond: Operand.empty(), message: String.new(), span: Span { start: 0, end: 0, file: 0 } };
     }
     pub Terminator copy(&const self) {
         Vec<Case> cases = Vec.new(); for (c in &const self.cases) { cases.push(Case { value: c.value, block: c.block }); }
         return Terminator { kind: self.kind, target: self.target, discr: self.discr.copy(), cases: cases, otherwise: self.otherwise,
-            callee: self.callee.copy(), args: copy_operands(&const self.args), dest: self.dest.copy(), diverges: self.diverges,
+            callee: self.callee.copy(), args: copy_operands(&const self.args), dest: self.dest.copy(), diverges: self.diverges, loan_anchor: self.loan_anchor,
             cond: self.cond.copy(), message: String.from(self.message), span: self.span };
     }
 }
@@ -180,8 +183,11 @@ pub struct Local {
     pub bool is_arg;
     pub Span span;
     pub bool escape_boundary;
+    /// Compiler-only write barrier for advancing a reference-yielding iterator.
+    /// This marker contributes no data to an item and does not restrict escape.
+    pub bool lifetime_guard;
     pub Local new(TypeId type, &const str name, bool is_arg, Span span) {
-        return Local { type: type, name: String.from(name), is_arg: is_arg, span: span, escape_boundary: false };
+        return Local { type: type, name: String.from(name), is_arg: is_arg, span: span, escape_boundary: false, lifetime_guard: false };
     }
 }
 /// Sorted map entries; maps stay ordered by key like std::map.

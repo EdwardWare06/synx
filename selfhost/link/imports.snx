@@ -8,7 +8,10 @@ import std.utf8;
 import std.text;
 pub struct Import { pub Vec<byte> name; pub String library; }
 pub Result<Vec<Import>, Failure> collect(&const Vec<Object> inputs, &const str runtime, int os) {
-    var selected = resolve.active(inputs, "__synx_start")?;
+    return collect_for(inputs, runtime, os, "__synx_start");
+}
+pub Result<Vec<Import>, Failure> collect_for(&const Vec<Object> inputs, &const str runtime, int os, &const str entry) {
+    var selected = resolve.active(inputs, entry)?;
     HashMap<String, bool> definitions = HashMap.new();
     for (i in 0..inputs.len()) {
         if (!*selected.get(i).unwrap()) { continue; }

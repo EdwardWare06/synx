@@ -1,0 +1,8 @@
+// fixture: borrowed-payload-return
+// stage: borrow
+// expect: ok
+trait Read { int read(&const self); }
+struct Borrowed { &const int value; }
+impl Read for Borrowed { int read(&const self) { return *self.value; } }
+Box<dyn Read> f(&const int x) { return Box.new(Borrowed { value: x }); }
+main() { int x = 7; var b = f(x); print("{b.read()}"); }

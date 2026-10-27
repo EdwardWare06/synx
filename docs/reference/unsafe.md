@@ -43,6 +43,8 @@ Output: `9`.
 ## Notes
 
 `drop_in_place<T>` destroys an initialized value at an address and does not
-free its storage. `str_from_raw` borrows bytes under the caller's storage
+free its storage. For `drop_in_place<dyn Trait>`, the raw fat pointer must
+contain a valid concrete data pointer and matching vtable. Cleanup uses the
+vtable's complete destructor. `str_from_raw` borrows bytes under the caller's storage
 and UTF-8 contract. Unsafe code can invalidate memory safety; safe callers
 depend on the correctness of its exposed interface.

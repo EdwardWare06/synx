@@ -348,8 +348,9 @@ main() {
 total 575
 ```
 
-A loop over the `Vec` itself, `for (w in weights)`, is not supported. Use a
-reference, or remove elements with `pop`.
+A loop over the Vec itself, `for (w in weights)`, consumes it. Each iteration
+owns one element. Unread elements are dropped if the loop exits early. Use a
+reference when the vector must remain available after the loop.
 
 ## Sorting
 

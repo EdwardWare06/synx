@@ -1,0 +1,4 @@
+// fixture: private-owner-write
+// stage: borrow
+// expect: error SNX0304
+main() { var box = Box.new(3); box.data = 0 as *int; }

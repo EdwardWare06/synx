@@ -1,0 +1,7 @@
+// fixture: consume-twice
+// stage: borrow
+// expect: error SNX0501
+trait Take { int take(self); }
+struct S {}
+impl Take for S { int take(self) { return 1; } }
+main() { Box<dyn Take> p = Box.new(S {}); p.take(); p.take(); }

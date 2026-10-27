@@ -1,0 +1,4 @@
+// fixture: optional-nested
+// stage: borrow
+// expect: ok
+struct A { int? n; } void main() { Option<A> a = Some(A { n: Some(2) }); Option<Option<int>> r = a?.n; }

@@ -1,0 +1,5 @@
+// fixture: consume-box-borrow
+// stage: borrow
+// expect: error needs an owned Box
+trait Take { int take(self); }
+int f(&Box<dyn Take> p) { return p.take(); }

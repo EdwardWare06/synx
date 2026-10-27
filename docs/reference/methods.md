@@ -49,5 +49,6 @@ Output: `3`.
 ## Notes
 
 Use `.` for both associated functions and receiver calls. There is no `::`
-member operator. Trait implementations use the same receiver forms; a trait
-object requires reference receivers. See [Traits](traits.md).
+member operator. Trait implementations use the same receiver forms. Borrowed
+trait objects call reference receivers; `Box<dyn Trait>` also calls consuming
+receivers. See [Traits](traits.md).

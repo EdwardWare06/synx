@@ -1,0 +1,5 @@
+// fixture: guard-moved-following-arm
+// stage: borrow
+// expect: error SNX0501
+enum E { A(String), B(String) }
+main() { var e = E.A(String.from("a")); match e { E.A(x) | E.B(x) if false => print(x), E.A(x) | E.B(x) => print(x) }; }

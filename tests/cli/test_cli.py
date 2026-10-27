@@ -10,8 +10,8 @@ Checks:
 - driver core: selfhost/driver_probe.snx built in all four modes reports the
   embedded prelude and the fixed output-path, link-command, and option-parsing
   records in tests/cli/driver_core.bin;
-- command output: usage errors, lex, parse, check, ir, and modules on a
-  Unicode file name and on malformed input match the snapshots;
+- command output: usage errors, lex, parse, check, check --json, ir, and
+  modules on a Unicode file name and on malformed input match the snapshots;
 - about: the credit and reference lines;
 - build and run in all four modes: exit status, output, deterministic objects,
   and object removal without --keep-obj;
@@ -31,7 +31,7 @@ SNAPSHOTS = HERE / "snapshots"
 EXE = ".exe" if sys.platform == "win32" else ""
 OBJ = ".obj" if sys.platform == "win32" else ".o"
 MODES = [[], ["--no-regalloc"], ["--release"], ["--no-regalloc", "--release"]]
-ENV_KEYS = ["SYNX_STD_PATH", "SYNX_RUNTIME_LIB", "SYNX_RUNTIME_SHARED", "SYNX_LINKER", "SYNX_LINKER_DRIVER"]
+ENV_KEYS = ["SYNX_STD_PATH", "SYNX_RUNTIME_LIB", "SYNX_RUNTIME_SHARED", "SYNX_LINKER", "SYNX_LINKER_DRIVER", "SYNX_RUNTIME_HOST", "SYNX_CACHE_DIR"]
 checks = failures = 0
 
 
@@ -123,6 +123,8 @@ def commands(synx, work, env, update):
              ["check", entry], ["check", "broken.snx"], ["ir", entry], ["ir", "broken.snx"]]
     cases += [["modules", entry, *([flag] if flag else [])]
               for flag in ("", "--signatures", "--check", "--lower", "--borrow", "--async", "--machine")]
+    cases += [["check", entry, "--json"], ["check", "broken.snx", "--json"], ["check", "missing.snx", "--json"],
+              ["check", "malformed.snx", "--json"]]
     SNAPSHOTS.mkdir(exist_ok=True)
     for number, case in enumerate(cases):
         name = "-".join([f"{number:02d}", *[a.replace(entry, "entry").lstrip("-").replace(".snx", "") for a in case]]) or f"{number:02d}"
@@ -173,8 +175,8 @@ def relocated(synx, runtime_dir, work):
     (package / "lib").mkdir()
     installed = package / "bin" / f"synx{EXE}"
     shutil.copy2(synx, installed)
-    shutil.copy2(runtime_dir / capsule, package / "bin" / capsule)
     shutil.copy2(runtime_dir / capsule, package / "lib" / capsule)
+    shutil.copy2(runtime_dir / ("synx-host" + EXE), package / "lib" / ("synx-host" + EXE))
     shutil.copytree(ROOT / "std", package / "std")
     env = {k: v for k, v in os.environ.items() if k not in ENV_KEYS}
     literal = work / f"literal & '$(name) λ{EXE}"

@@ -1,0 +1,4 @@
+// fixture: private-owner-pattern
+// stage: borrow
+// expect: error SNX0304
+main() { var box = Box.new(3); match box { Box { data } => {} } }

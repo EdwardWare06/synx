@@ -1,0 +1,1 @@
+void main() { var a = [1]; var view = &const a[0..=(~(0 as usize))]; print("{view.len()}"); }

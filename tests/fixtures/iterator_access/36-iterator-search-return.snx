@@ -1,0 +1,4 @@
+// fixture: iterator-search-return
+// stage: borrow
+// expect: ok
+struct I { &int value; } impl Iterator<&int> for I { (&int)? next(&self) { return Some(&*self.value); } } (&int)? first(&I source) { for (value in source) { return Some(value); } return None; } void main() {}

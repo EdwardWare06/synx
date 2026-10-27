@@ -1,14 +1,14 @@
 name: release
 
 # Started by hand from the Actions tab. Each host builds the compiler from
-# the seed release, runs the self-hosting fixed point (stages 2 and 3 must
-# emit identical objects), and builds its install package. With a tag, the
+# the seed release, runs all tests including the self-hosting fixed point
+# (stages 2 and 3 must emit identical objects), and builds its install package. With a tag, the
 # packages are attached to that existing release.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag that receives the packages, such as v0.1.0. Empty keeps the packages as run artifacts only. The packages are built from the selected branch, so pick a branch whose compiler source matches the tag.
+        description: Existing release tag that receives the packages, such as v0.2.0. Empty keeps the packages as run artifacts only. The packages are built from the selected branch, so pick a branch whose compiler source matches the tag.
         required: false
         default: ''
       overwrite:
@@ -37,19 +37,19 @@ jobs:
       - name: MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
-      - name: Build and bootstrap (Linux and macOS)
+      - name: Build and test (Linux and macOS)
         if: runner.os != 'Windows'
         run: |
           cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build-linux
-          ctest --test-dir build-linux -R "^bootstrap$" --output-on-failure
-      - name: Build and bootstrap (Windows)
+          ctest --test-dir build-linux --output-on-failure
+      - name: Build and test (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: |
           cmake -S . -B build-win -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release || exit /b 1
           cmake --build build-win || exit /b 1
-          ctest --test-dir build-win -R "^bootstrap$" --output-on-failure || exit /b 1
+          ctest --test-dir build-win --output-on-failure || exit /b 1
       - name: Package (Linux and macOS)
         if: runner.os != 'Windows'
         run: bash scripts/package-linux.sh
@@ -69,8 +69,31 @@ jobs:
           path: dist/packages/*
           if-no-files-found: error
 
+  vscode:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - run: npm ci
+      - name: Test and package the extension
+        run: |
+          npm test
+          npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-vscode
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
+
   publish:
-    needs: package
+    needs: [package, vscode]
     if: inputs.tag != ''
     runs-on: ubuntu-latest
     steps:
@@ -85,7 +108,8 @@ jobs:
           OVERWRITE: ${{ inputs.overwrite }}
         run: |
           cd packages
-          sha256sum *
+          sha256sum synx-* > SHA256SUMS
+          cat SHA256SUMS
           existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
           for file in *; do
             if [ "$OVERWRITE" != true ] && printf '%s\n' "$existing" | grep -qxF "$file"; then

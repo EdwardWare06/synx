@@ -1,0 +1,7 @@
+// fixture: view-cannot-outlive-owner
+// stage: borrow
+// expect: error SNX0502
+trait View { &const int view(&const self); }
+struct S { int value; }
+impl View for S { &const int view(&const self) { return &const self.value; } }
+&const int f() { Box<dyn View> p = Box.new(S { value: 1 }); return p.view(); }

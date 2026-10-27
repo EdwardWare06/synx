@@ -36,6 +36,56 @@ pub struct DiagnosticSink {
         }
         return output;
     }
+    /// JSON for synx check --json: {"version":1,"ok":..,"diagnostics":[..]}.
+    /// Each item has file, severity, code, message, and a range of one-based
+    /// lines and one-based UTF-8 byte columns; the end is exclusive.
+    pub Vec<byte> render_json(&const self, &const SourceFile fallback, &const Vec<SourceFile> sources) {
+        Vec<byte> output = Vec.new();
+        var ok = if (self.errors == 0) { "true" } else { "false" };
+        bytes.text(&output, "\{\"version\":1,\"ok\":{ok},\"diagnostics\":[");
+        bool first = true;
+        for (item in &const self.items) {
+            if (!first) { output.push(44); } first = false;
+            bool found = false; usize selected = 0;
+            for (i in 0..sources.len()) {
+                if (sources.get(i).unwrap().id == item.span.file) { selected = i; found = true; }
+            }
+            var file = if (found) { sources.get(selected).unwrap() } else { fallback };
+            var item_json = json_one(item, file); bytes.append(&output, item_json);
+        }
+        bytes.text(&output, "]\}\n");
+        return output;
+    }
+}
+Vec<byte> json_one(&const Diagnostic item, &const SourceFile file) {
+    var start = file.line_col(item.span.start); var end = file.line_col(item.span.end);
+    Vec<byte> output = Vec.new();
+    Vec<byte> path = Vec.new(); bytes.text(&path, file.path());
+    bytes.text(&output, "\{\"file\":"); json_string(&output, path);
+    var severity = match item.severity { Severity.Error => "error", Severity.Warning => "warning", Severity.Note => "note" };
+    bytes.text(&output, ",\"severity\":\"{severity}\",\"code\":");
+    Vec<byte> code = Vec.new(); bytes.text(&code, item.code.as_str()); json_string(&output, code);
+    bytes.text(&output, ",\"message\":"); json_string(&output, item.message);
+    bytes.text(&output, ",\"range\":\{\"start\":\{\"line\":{start.line},\"column\":{start.col}\},\"end\":\{\"line\":{end.line},\"column\":{end.col}\}\}\}");
+    return output;
+}
+/// Appends data as a JSON string. Bytes 0x80 and above pass through, so
+/// valid UTF-8 stays valid.
+pub void json_string(&Vec<byte> output, &const Vec<byte> data) {
+    output.push(34);
+    for (i in 0..data.len()) {
+        byte c = bytes.at(data, i);
+        if (c == 34 || c == 92) { output.push(92); output.push(c); }
+        else if (c == 10) { bytes.text(&*output, "\\n"); }
+        else if (c == 13) { bytes.text(&*output, "\\r"); }
+        else if (c == 9) { bytes.text(&*output, "\\t"); }
+        else if (c < 32) {
+            bytes.text(&*output, "\\u00"); output.push(48 + c / 16);
+            byte low = c % 16; output.push(if (low < 10) { 48 + low } else { 87 + low });
+        }
+        else { output.push(c); }
+    }
+    output.push(34);
 }
 pub Vec<byte> render_one(&const Diagnostic item, &const SourceFile file) {
     var lc = file.line_col(item.span.start);

@@ -1,0 +1,4 @@
+// fixture: owned-vector-moved
+// stage: borrow
+// expect: error moved
+void main() { Vec<int> v = Vec.new(); for (x in v) {} print(v.len()); }

@@ -224,7 +224,7 @@ bool transform(&Checker ck, &Function factory, &Function poll, &Function cancel)
             for (i in 0..statement.rvalue.elems.len()) { fr.operand(&*poll, &const old_locals, statement.rvalue.elems.get_mut(i).unwrap(), &before); }
             statement.rvalue.captures = Vec.new();
             bool remap = false;
-            match statement.rvalue.kind { RvalueKind.Ref => { remap = true; }, RvalueKind.Len => { remap = true; }, RvalueKind.Discriminant => { remap = true; }, _ => {} }
+            match statement.rvalue.kind { RvalueKind.Ref => { remap = true; }, RvalueKind.Slice => { remap = true; }, RvalueKind.Len => { remap = true; }, RvalueKind.Discriminant => { remap = true; }, _ => {} }
             if (remap) { statement.rvalue.place = fr.place(&*poll, &const old_locals, &const st.rvalue.place, &before); }
             var statement_kind = statement.kind;
             match statement_kind { StatementKind.DropIf => { statement.flag_local = fr.load(&*poll, &const old_locals, st.flag_local, &before); }, _ => {} }
@@ -238,6 +238,8 @@ bool transform(&Checker ck, &Function factory, &Function poll, &Function cancel)
         bool returns = false;
         match term.kind { TerminatorKind.Return => { returns = true; }, _ => {} }
         if (returns) { fr.finish(&*ck, &*poll, block, true, COMPLETE, poll_type, output); continue; }
+        // Logical loan anchors were checked before frame conversion.
+        term.loan_anchor = NONE;
         Vec<Statement> before = Vec.new();
         fr.operand(&*poll, &const old_locals, &term.discr, &before);
         fr.operand(&*poll, &const old_locals, &term.cond, &before);

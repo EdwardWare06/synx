@@ -1,0 +1,8 @@
+// fixture: return
+// stage: borrow
+// expect: ok
+trait Read { int read(&const self); }
+struct Number { int value; }
+impl Read for Number { int read(&const self) { return self.value; } }
+Box<dyn Read> make() { return Box.new(Number { value: 5 }); }
+main() { print("{make().read()}"); }

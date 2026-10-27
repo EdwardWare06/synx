@@ -1,0 +1,89 @@
+import source;
+/// LSP byte framing and UTF-16 positions. stdout contains protocol frames only.
+/// Frames are limited to 16 MiB; header bytes to 8 KiB. EOF ends the session.
+import bytes;
+import defs;
+import driver_io;
+import source.{SourceFile, Span};
+import std.text;
+import std.utf8;
+import std.path.{host_style, Style};
+extern "C" { void synx_rt_driver_binary(); int synx_rt_driver_read(*byte data, usize capacity, &usize count); }
+pub void init() { unsafe { synx_rt_driver_binary(); } }
+int read_byte() {
+    byte b = 0; usize n = 0; int error = unsafe { synx_rt_driver_read(&b as *byte, 1, &n) };
+    if (error != 0 || n == 0) { return -1; } return b as int;
+}
+pub Vec<byte>? read() {
+    Vec<byte> line = Vec.new(); usize total = 0; usize length = 0; bool found = false;
+    loop {
+        int c = read_byte(); if (c < 0) { return None; } total += 1; if (total > 8192) { return None; }
+        if (c != 10) { line.push(c as byte); continue; }
+        if (line.is_empty() || bytes.at(line, line.len() - 1) != 13) { return None; }
+        var ignored = line.pop(); if (line.is_empty()) { break; }
+        var s = defs.name(line); var lower = text.to_ascii_lowercase(s);
+        if (lower.starts_with("content-length:")) {
+            if (found) { return None; } found = true; usize start = 15;
+            while (start < s.len() && bytes.at(line, start) == 32) { start += 1; }
+            var count = text.slice(s, start, s.len()).unwrap();
+            match text.parse_ulong(count) { Some(n) => { if (n > 16777216) { return None; } length = n as usize; }, None => return None }
+        }
+        line.clear();
+    }
+    if (!found) { return None; }
+    Vec<byte> body = Vec.new(); for (i in 0..length) { body.push(0); }
+    usize offset = 0;
+    while (offset < length) {
+        usize count = 0; int code = unsafe { synx_rt_driver_read((body.as_mut_ptr() as usize + offset) as *byte, length - offset, &count) };
+        if (code != 0 || count == 0) { return None; } offset += count;
+    } return Some(body);
+}
+pub bool send(&const Vec<byte> body) {
+    usize length = body.len(); if (!driver_io.text(1, "Content-Length: {length}\r\n\r\n")) { return false; } return driver_io.write(1, body);
+}
+pub uint width(byte b) { if (b >= 240) { return 4; } if (b >= 224) { return 3; } if (b >= 192) { return 2; } return 1; }
+pub uint offset(&const SourceFile file, long line, long character) {
+    if (line < 0 || character < 0) { return 4294967295; }
+    var data = file.data(); usize pos = 0; long row = 0;
+    while (row < line && pos < data.len()) { if (bytes.at(data, pos) == 10) { row += 1; } pos += 1; }
+    if (row != line) { return 4294967295; }
+    long units = 0;
+    while (units < character && pos < data.len() && bytes.at(data, pos) != 10 && bytes.at(data, pos) != 13) {
+        uint n = width(bytes.at(data, pos)); units += if (n == 4) { 2 } else { 1 }; pos += n as usize;
+    }
+    if (units != character) { return 4294967295; } return pos as uint;
+}
+pub (long, long) position(&const SourceFile file, uint offset) {
+    var lc = file.line_col(offset); var line = file.line_text(lc.line); usize i = 0; long units = 0;
+    while (i < line.len() && i < (lc.col - 1) as usize) { uint n = width(bytes.at(line, i)); units += if (n == 4) { 2 } else { 1 }; i += n as usize; }
+    return ((lc.line - 1) as long, units);
+}
+byte hex(byte c) { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 65 && c <= 70) { return c - 55; } if (c >= 97 && c <= 102) { return c - 87; } return 255; }
+pub String? path(&const str uri) {
+    if (!text.starts_with(uri, "file://")) { return None; }
+    Vec<byte> raw = Vec.new(); bytes.text(&raw, uri); usize start = 7;
+    if (text.starts_with(uri, "file://localhost/")) { start = 16; }
+    if (start >= raw.len()) { return None; }
+    bool windows = false; match host_style() { Style.Windows => { windows = true; }, _ => {} }
+    if (bytes.at(raw, start) != 47) { if (!windows) { return None; } start = 5; }
+    if (windows && bytes.at(raw, start) == 47 && bytes.at(raw, start + 2) == 58) { start += 1; }
+    Vec<byte> out = Vec.new(); usize i = start;
+    while (i < raw.len()) {
+        byte b = bytes.at(raw, i);
+        if (b == 37) { if (i + 2 >= raw.len()) { return None; } byte h = hex(bytes.at(raw, i + 1)); byte l = hex(bytes.at(raw, i + 2)); if (h == 255 || l == 255) { return None; } b = h * 16 + l; i += 2; }
+        else if (b == 35 || b == 63) { return None; }
+        if (b == 0) { return None; } out.push(b); i += 1;
+    }
+    // VS Code encodes a Windows drive colon as %3A. Strip the URI slash
+    // after percent decoding as well as for an unescaped drive colon.
+    if (windows && bytes.at(out, 0) == 47 && bytes.at(out, 2) == 58) { out = bytes.copy(out, 1, out.len()); }
+    match utf8.decode(out) { Some(s) => return Some(source.path_key(s)), None => return None }
+}
+pub String uri(&const str path) {
+    var normalized = source.path_key(path); Vec<byte> raw = Vec.new(); bytes.text(&raw, normalized);
+    String out = String.from(if (normalized.starts_with("//")) { "file:" } else if (normalized.starts_with("/")) { "file://" } else { "file:///" });
+    for (b in &const raw) {
+        if ((*b >= 65 && *b <= 90) || (*b >= 97 && *b <= 122) || (*b >= 48 && *b <= 57) || *b == 47 || *b == 58 || *b == 45 || *b == 95 || *b == 46 || *b == 126) { out.push(*b as char); }
+        else { out.push('%'); byte h = *b / 16; byte l = *b % 16; out.push((if (h < 10) { 48 + h } else { 55 + h }) as char); out.push((if (l < 10) { 48 + l } else { 55 + l }) as char); }
+    } return out;
+}

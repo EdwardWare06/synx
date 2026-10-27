@@ -1,0 +1,113 @@
+// Correlated coverage, canonical or-bindings, and delayed move selection.
+void expect(bool value) { if (!value) { panic("pattern assertion failed"); } }
+struct Ticket { int id; }
+impl Drop for Ticket { void drop(&self) { print("drop {self.id}"); } }
+enum Choice<T> { A(T), B(T) }
+enum Named { A { Ticket value; int code; }, B { int code; Ticket value; } }
+struct Pair { bool left; bool right; }
+enum Split { Pair(bool, Ticket, Ticket) }
+
+int correlated(bool a, bool b) {
+    return match (a, b) {
+        (true, false) => 1, (false, true) => 2,
+        (true, true) => 3, (false, false) => 4,
+    };
+}
+int struct_match(Pair p) {
+    return match p { Pair { left: true } => 1, Pair { left: false } => 2 };
+}
+int nested(Option<Option<bool>> p) {
+    return match p { None => 1, Some(None) => 2, Some(Some(true | false)) => 3 };
+}
+int borrowed<T: Copy>(&const Choice<T> choice, T wanted) {
+    return match choice { Choice.A(value) | Choice.B(value) => 7 };
+}
+int read(&const Choice<int> choice) {
+    return match choice { Choice.A(value) | Choice.B(value) => *value };
+}
+void update(&Choice<int> choice) {
+    match choice { Choice.A(value) | Choice.B(value) => { *value += 10; } }
+}
+int consume(Choice<Ticket> choice, bool accept) {
+    return match (choice, accept) {
+        (Choice.A(value) | Choice.B(value), true) => value.id,
+        (Choice.A(value) | Choice.B(value), false) => value.id + 100,
+    };
+}
+int named(Named choice) {
+    return match choice {
+        Named.A { code, value } | Named.B { code, value } => value.id + code,
+    };
+}
+int split(Split p) {
+    return match p { Split.Pair(true,x,_) | Split.Pair(false,_,x) => x.id };
+}
+int false_guard(Choice<Ticket> p) {
+    return match p { Choice.A(x) | Choice.B(x) if false => x.id, _ => 0 };
+}
+int nested_binding(Option<Choice<int>> choice) {
+    return match choice { Some(Choice.A(x) | Choice.B(x)) => x, None => 0 };
+}
+int two_choices(Choice<int> a, Choice<int> b) {
+    return match (a,b) { (Choice.A(x) | Choice.B(x), Choice.A(y) | Choice.B(y)) => x * 10 + y };
+}
+int nested_choices(Choice<Choice<int>> p) {
+    return match p {
+        Choice.A(Choice.A(x) | Choice.B(x)) | Choice.B(Choice.A(x) | Choice.B(x)) => x,
+    };
+}
+int ordered(int a, int b) {
+    return match (a,b) { (x,_) | (_,x) => x };
+}
+int guarded(&const Choice<int> p) {
+    return match p { Choice.A(x) | Choice.B(x) if *x > 0 => *x, _ => -1 };
+}
+String take_string(Choice<String> p) {
+    return match p { Choice.A(x) | Choice.B(x) => x };
+}
+main() {
+    expect(correlated(true,false) == 1); expect(correlated(false,true) == 2);
+    expect(correlated(true,true) == 3); expect(correlated(false,false) == 4);
+    expect(struct_match(Pair { left: true, right: false }) == 1);
+    expect(struct_match(Pair { left: false, right: true }) == 2);
+    expect(nested(None) == 1); expect(nested(Some(None)) == 2);
+    expect(nested(Some(Some(true))) == 3); expect(nested(Some(Some(false))) == 3);
+    var a = Choice.A(1); var b = Choice.B(2);
+    expect(read(a) == 1); expect(read(b) == 2);
+    update(&a); update(&b); expect(read(a) == 11); expect(read(b) == 12);
+    expect(borrowed(a, 0) == 7);
+    expect(consume(Choice.A(Ticket { id: 1 }), true) == 1);
+    expect(consume(Choice.B(Ticket { id: 2 }), true) == 2);
+    expect(consume(Choice.A(Ticket { id: 3 }), false) == 103);
+    expect(consume(Choice.B(Ticket { id: 4 }), false) == 104);
+    expect(named(Named.A { value: Ticket { id: 5 }, code: 10 }) == 15);
+    expect(named(Named.B { value: Ticket { id: 6 }, code: 10 }) == 16);
+    expect(nested_binding(Some(Choice.A(5))) == 5); expect(nested_binding(Some(Choice.B(6))) == 6);
+    expect(nested_binding(None) == 0);
+    expect(two_choices(Choice.A(1), Choice.A(2)) == 12);
+    expect(two_choices(Choice.A(3), Choice.B(4)) == 34);
+    expect(two_choices(Choice.B(5), Choice.A(6)) == 56);
+    expect(two_choices(Choice.B(7), Choice.B(8)) == 78);
+    expect(nested_choices(Choice.A(Choice.A(1))) == 1);
+    expect(nested_choices(Choice.A(Choice.B(2))) == 2);
+    expect(nested_choices(Choice.B(Choice.A(3))) == 3);
+    expect(nested_choices(Choice.B(Choice.B(4))) == 4);
+    expect(ordered(7, 9) == 7);
+    expect(guarded(Choice.A(10)) == 10); expect(guarded(Choice.B(-1)) == -1);
+    expect(take_string(Choice.A(String.from("one"))) == String.from("one"));
+    expect(take_string(Choice.B(String.from("two"))) == String.from("two"));
+    expect(false_guard(Choice.A(Ticket { id: 7 })) == 0);
+    expect(false_guard(Choice.B(Ticket { id: 8 })) == 0);
+    expect(split(Split.Pair(true, Ticket { id: 9 }, Ticket { id: 10 })) == 9);
+    expect(split(Split.Pair(false, Ticket { id: 11 }, Ticket { id: 12 })) == 12);
+    expect(false_guard(Box<Choice<Ticket>>.new(Choice.A(Ticket { id: 13 })).into_inner()) == 0);
+    expect(false_guard(Box<Choice<Ticket>>.new(Choice.B(Ticket { id: 14 })).into_inner()) == 0);
+    int total = 0;
+    for (x | x in 0..3) { total += x; }
+    expect(total == 3);
+    Choice<int>[2] choices = [Choice.A(5), Choice.B(7)];
+    for (Choice.A(x) | Choice.B(x) in &choices) { *x += 1; }
+    for (Choice.A(x) | Choice.B(x) in &const choices) { total += *x; }
+    expect(total == 17);
+    print("patterns ok");
+}

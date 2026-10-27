@@ -1,0 +1,7 @@
+// fixture: view-blocks-replacement
+// stage: borrow
+// expect: error SNX0501
+trait View { &const int view(&const self); }
+struct S { int value; }
+impl View for S { &const int view(&const self) { return &const self.value; } }
+main() { Box<dyn View> p = Box.new(S { value: 1 }); var r = p.view(); p = Box.new(S { value: 2 }); print("{*r}"); }

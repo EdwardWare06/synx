@@ -8,7 +8,7 @@ extern "C" {
     int synx_rt_driver_write(int fd, *const byte data, usize length);
     usize synx_rt_driver_float(double value, *byte output, usize capacity);
 }
-pub const &const str VERSION = "0.1.0";
+pub const &const str VERSION = "0.2.0";
 pub void init() { unsafe { synx_rt_driver_init(); } }
 pub Target host_target() {
     int host = unsafe { synx_rt_driver_host() };

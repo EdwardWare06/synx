@@ -1,0 +1,5 @@
+// fixture: or-binding-type
+// stage: borrow
+// expect: error or-pattern binding
+enum E { A(int), B(bool) }
+int f(E e) { return match e { E.A(x) | E.B(x) => 0 }; }

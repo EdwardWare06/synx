@@ -1,0 +1,4 @@
+// fixture: optional-copy-reuse
+// stage: borrow
+// expect: ok
+struct A { int n; } void main() { Option<A> a = Some(A { n: 1 }); var x = a?.n; var y = a?.n; }

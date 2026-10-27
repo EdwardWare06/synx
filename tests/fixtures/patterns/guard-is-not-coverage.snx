@@ -1,0 +1,4 @@
+// fixture: guard-is-not-coverage
+// stage: borrow
+// expect: error SNX0404
+int f(bool a) { return match a { true => 1, false if true => 0 }; }

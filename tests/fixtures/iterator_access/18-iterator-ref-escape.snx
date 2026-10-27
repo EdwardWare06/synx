@@ -1,0 +1,4 @@
+// fixture: iterator-ref-escape
+// stage: borrow
+// expect: error SNX0502
+import std.iter; iter.SliceIter<int> bad() { var a = [1,2]; return iter.iter(&const a[..]); } void main() {}

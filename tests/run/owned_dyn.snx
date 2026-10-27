@@ -1,0 +1,121 @@
+import std.mem;
+import std.task;
+void expect(bool ok) { if (!ok) { panic("owned dyn assertion failed"); } }
+struct Ticket { int id; }
+impl Drop for Ticket { void drop(&self) { print("drop {self.id}"); } }
+trait Shape { int area(&const self); void grow(&self, int n); int finish(self); }
+struct Square { int side; Ticket ticket; }
+impl Shape for Square {
+    int area(&const self) { return self.side * self.side; }
+    void grow(&self, int n) { self.side += n; }
+    int finish(self) { return self.side; }
+}
+Box<dyn Shape> square(int side, int id) { return Box.new(Square { side: side, ticket: Ticket { id: id } }); }
+int read(&const Box<dyn Shape> value) { return value.area(); }
+void grow(&Box<dyn Shape> value, int n) { value.grow(n); }
+int consume(Box<dyn Shape> value) { return value.finish(); }
+void early() { var value = square(3, 3); if (value.area() == 9) { return; } }
+trait Text { String finish(self); }
+struct Message { String text; Ticket ticket; }
+impl Text for Message { String finish(self) { return self.text; } }
+struct Large { long a; long b; long c; long d; }
+trait Build { Large build(self, long n); }
+struct Builder { Ticket ticket; }
+impl Build for Builder { Large build(self, long n) { return Large { a: n, b: n+1, c: n+2, d: n+3 }; } }
+trait PairResult { (long, long) finish(self); }
+impl PairResult for Ticket { (long, long) finish(self) { return (self.id as long, 20); } }
+trait VoidResult { void finish(self); }
+impl VoidResult for Ticket { void finish(self) { expect(self.id == 7); } }
+trait FloatResult { double finish(self); }
+impl FloatResult for Ticket { double finish(self) { return 2.5; } }
+trait Produce<T> { T finish(self); }
+impl Produce<String> for Message { String finish(self) { return self.text; } }
+trait Default { int read(&const self); int finish(self) { return self.read() + 10; } }
+impl Default for Ticket { int read(&const self) { return self.id; } }
+trait Empty { int read(&const self); int finish(self); }
+struct Unit {}
+impl Empty for Unit { int read(&const self) { return 31; } int finish(self) { return 32; } }
+trait Read { int read(&const self); }
+impl Read for int { int read(&const self) { return *self; } }
+struct Borrowed { &const int value; }
+impl Read for Borrowed { int read(&const self) { return *self.value; } }
+Box<dyn Read> borrowed(&const int value) { return Box.new(Borrowed { value: value }); }
+trait View { &const int view(&const self); }
+impl View for Square { &const int view(&const self) { return &const self.side; } }
+trait Store { void put(&self, &const int value); int read(&const self); }
+struct Holder { Option<&const int> value; }
+impl Store for Holder {
+    void put(&self, &const int value) { self.value = Some(value); }
+    int read(&const self) { return **self.value.as_ref().unwrap(); }
+}
+trait TakeRef { &const int take(self); }
+impl TakeRef for Borrowed { &const int take(self) { return self.value; } }
+trait Suffix { String finish(self, String suffix); }
+impl Suffix for Message { String finish(self, String suffix) { var result = self.text; result.push_str(suffix); return result; } }
+trait Accumulate { int read(&const self); int finish(self, int n); }
+impl Accumulate for Ticket { int read(&const self) { return self.id; } int finish(self, int n) { return self.id + n; } }
+trait Owner { int read(&const self); }
+impl Owner for Box<dyn Read> { int read(&const self) { return 900; } }
+trait AsyncTake { Task<int> finish(self); }
+async int later(Ticket ticket) { await std.task.yield_now(); return ticket.id; }
+impl AsyncTake for Ticket { Task<int> finish(self) { return later(self); } }
+Box<dyn Shape> erase<T: Shape>(Box<T> value) { return value; }
+async int use_owned_box(Box<dyn Shape> value) { await std.task.yield_now(); return value.finish(); }
+int? missing() { return None; }
+void accept(Box<dyn Shape> value, int argument) { expect(argument > 0); }
+int? argument_try() { accept(Box.new(Square { side: 1, ticket: Ticket { id: 22 } }), missing()?); return Some(1); }
+int argument_return() { accept(Box.new(Square { side: 1, ticket: Ticket { id: 23 } }), { return 9; }); return 0; }
+void argument_break() {
+    loop { accept(Box.new(Square { side: 1, ticket: Ticket { id: 24 } }), { break; }); }
+}
+void argument_continue() {
+    for (i in 0..1) { accept(Box.new(Square { side: 1, ticket: Ticket { id: 25 } }), { continue; }); }
+}
+main() {
+    {
+        var a = square(2, 1); expect(read(a) == 4); grow(&a, 1); expect(a.as_ref().area() == 9);
+        a.as_mut().grow(1); expect(a.area() == 16);
+        var raw = a.as_ptr(); expect(unsafe { (&const *raw).area() } == 16);
+        var writable = a.as_mut_ptr(); unsafe { (&*writable).grow(1); }
+        expect(a.area() == 25); expect(consume(a) == 5);
+    }
+    { var original = Box.new(Square { side: 3, ticket: Ticket { id: 2 } }); Box<dyn Shape> erased = original; var moved = erased; expect(moved.area() == 9); }
+    early();
+    { Box<dyn Text> text = Box.new(Message { text: String.from("payload"), ticket: Ticket { id: 4 } }); expect(text.finish() == String.from("payload")); }
+    { Box<dyn Build> build = Box.new(Builder { ticket: Ticket { id: 5 } }); var large = build.build(40); expect(large.a == 40 && large.d == 43); }
+    { Box<dyn PairResult> p = Box.new(Ticket { id: 6 }); var pair = p.finish(); expect(pair.0 == 6 && pair.1 == 20); }
+    { Box<dyn VoidResult> p = Box.new(Ticket { id: 7 }); p.finish(); }
+    { Box<dyn FloatResult> p = Box.new(Ticket { id: 8 }); expect(p.finish() == 2.5); }
+    { Box<dyn Produce<String>> p = Box.new(Message { text: String.from("generic"), ticket: Ticket { id: 9 } }); expect(p.finish() == String.from("generic")); }
+    { Box<dyn Default> p = Box.new(Ticket { id: 10 }); expect(p.as_ref().read() == 10); expect(p.finish() == 20); }
+    { Box<dyn Empty> p = Box.new(Unit {}); expect(p.read() == 31); expect(p.finish() == 32); }
+    { Box<dyn Empty> p = Box.new(Unit {}); expect(p.read() == 31); }
+    { Box<dyn Read> p = Box.new(27); expect(p.as_ref().read() == 27); expect(p.read() == 900); }
+    {
+        Vec<Box<dyn Shape>> list = Vec.new();
+        list.push(Box.new(Square { side: 2, ticket: Ticket { id: 11 } }));
+        list.push(square(3, 12)); expect(list.get(0).unwrap().area() == 4);
+        list.get_mut(1).unwrap().grow(1); expect(list.get(1).unwrap().area() == 16);
+        expect(list.pop().unwrap().finish() == 4);
+    }
+    {
+        int outside = 29; var object = borrowed(outside); expect(object.as_ref().read() == 29);
+        Box<dyn TakeRef> take = Box.new(Borrowed { value: &const outside }); var result = take.take(); expect(*result == 29);
+        Box<dyn Store> holder = Box.new(Holder { value: None }); holder.put(outside); expect(holder.read() == 29);
+    }
+    {
+        Box<dyn View> p = Box.new(Square { side: 8, ticket: Ticket { id: 13 } }); var v = p.view(); expect(*v == 8);
+    }
+    { Box<dyn Shape> p = square(4, 14); p = square(5, 15); expect(p.area() == 25); }
+    { Option<Box<dyn Shape>> p = Some(square(6, 16)); expect(p.take().unwrap().finish() == 6); }
+    { Box<dyn Shape> p = square(7, 17); var f = once || p.finish(); expect(f() == 7); }
+    { Box<dyn AsyncTake> p = Box.new(Ticket { id: 18 }); expect(std.task.block_on(p.finish()) == 18); }
+    { Box<dyn Suffix> p = Box.new(Message { text: String.from("hello"), ticket: Ticket { id: 19 } }); expect(p.finish(String.from(" world")) == String.from("hello world")); }
+    { var p = square(2, 20); p.grow(p.area()); expect(p.finish() == 6); }
+    { Box<dyn Accumulate> p = Box.new(Ticket { id: 21 }); expect(p.finish(p.read()) == 42); }
+    expect(argument_try().is_none()); expect(argument_return() == 9); argument_break(); argument_continue();
+    { var p = erase(Box.new(Square { side: 8, ticket: Ticket { id: 26 } })); expect(p.finish() == 8); }
+    { var task = use_owned_box(square(9, 27)); expect(std.task.block_on(task) == 9); }
+    { var task = use_owned_box(square(10, 28)); }
+    print("owned dyn ok");
+}

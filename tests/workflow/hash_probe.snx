@@ -1,0 +1,11 @@
+/// Native hash boundary probe for hosts whose Python and compiler architectures differ.
+import std.env;
+import std.fs;
+extern "C" { void synx_rt_cache_hash(*const byte input, usize size, *byte output); }
+int main() {
+    var args = env.args(); if (args.len() != 3) { return 2; }
+    var input = match fs.read(args.get(1).unwrap()) { Ok(value) => value, Err(_) => return 3 };
+    Vec<byte> output = Vec.new(); for (i in 0..32) { output.push(0); }
+    unsafe { synx_rt_cache_hash(input.as_ptr(), input.len(), output.as_mut_ptr()); }
+    match fs.write(args.get(2).unwrap(), output) { Ok(_) => return 0, Err(_) => return 4 }
+}

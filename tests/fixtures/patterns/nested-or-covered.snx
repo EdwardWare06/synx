@@ -1,0 +1,4 @@
+// fixture: nested-or-covered
+// stage: borrow
+// expect: ok
+int f(Option<Option<bool>> x) { return match x { None => 0, Some(None) => 1, Some(Some(true | false)) => 2 }; }

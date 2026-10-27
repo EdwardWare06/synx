@@ -4,8 +4,8 @@ Usage: python tests/bootstrap/fixed_point.py STAGE2 WORKDIR
 
 STAGE2 was built by stage 1 with --keep-obj, so STAGE2.o (or .obj) exists.
 Stage 3 must emit a byte-identical compiler object, report the same version,
-and build and run the workbench example. The runtime capsule beside STAGE2
-links stage 3 and the example. Artifacts stay in WORKDIR.
+and build and run the workbench example. The runtime template from the build tree
+links stage 3 and the example as standalone executables. Artifacts stay in WORKDIR.
 """
 import os
 import shutil
@@ -36,6 +36,7 @@ def main():
     env = {k: v for k, v in os.environ.items() if not k.startswith("SYNX_")}
     env["SYNX_STD_PATH"] = str(ROOT / "std")
     env["SYNX_RUNTIME_SHARED"] = str(stage2.parent / capsule)
+    env["SYNX_RUNTIME_HOST"] = str(stage2.parent.parent / "runtime" / ("synx-host" + exe))
 
     stage3 = work / f"synx-stage3{exe}"
     run([stage2, "build", ROOT / "selfhost" / "main.snx", "-o", stage3, "--keep-obj", "--linker=builtin"], env)

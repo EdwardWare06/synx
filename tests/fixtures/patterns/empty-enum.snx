@@ -1,0 +1,5 @@
+// fixture: empty-enum
+// stage: borrow
+// expect: ok
+enum Empty { }
+void f(Empty value) { match value { } }

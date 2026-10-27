@@ -1,0 +1,4 @@
+// fixture: iterator-ref-owner
+// stage: borrow
+// expect: error borrowed
+import std.iter; void main() { Vec<int> v = Vec.new(); v.push(1); var it = iter.iter(&const v[..]); v.push(2); var n = it.next(); }

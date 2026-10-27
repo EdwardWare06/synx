@@ -21,13 +21,13 @@ function Invoke-WithoutToolchain([scriptblock]$Action) {
 }
 
 Invoke-Checked cmake @('-S', $root, '-B', $build, '-G', 'NMake Makefiles', '-DCMAKE_BUILD_TYPE=Release')
-Invoke-Checked cmake @('--build', $build, '--target', 'synx_compiler', 'synx_rt', 'synx_rt_shared')
+Invoke-Checked cmake @('--build', $build, '--target', 'synx_compiler', 'synx_rt', 'synx_rt_shared', 'synx_rt_host')
 if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
 Invoke-Checked cmake @('--install', $build, '--prefix', $stage)
 
 # The package holds only the launcher, compiler, runtime, standard library
 # sources, the workbench example, the installer, and the license files.
-$allowed = '^(bin/synx\.cmd|libexec/(synx\.exe|synx_rt\.dll)|lib/(synx_rt\.lib|synx_rt\.dll)|install\.cmd|install\.ps1|LICENSE-(MIT|APACHE)|std/.+\.snx|examples/workbench/[a-z_]+\.snx)$'
+$allowed = '^(bin/synx\.cmd|libexec/synx\.exe|lib/(synx_rt\.lib|synx_rt\.dll|synx-host\.exe)|install\.cmd|install\.ps1|LICENSE-(MIT|APACHE)|std/.+\.snx|examples/workbench/[a-z_]+\.snx)$'
 $unexpected = @(Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {
     $_.FullName.Substring($stage.Length + 1).Replace('\', '/') } | Where-Object { $_ -notmatch $allowed })
 if ($unexpected.Count -gt 0) { throw "unexpected package files: $($unexpected -join ', ')" }
@@ -46,15 +46,20 @@ foreach ($binary in (Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Ob
 $check = Join-Path $build 'check'
 if (Test-Path -LiteralPath $check) { Remove-Item -LiteralPath $check -Recurse -Force }
 New-Item -ItemType Directory -Path $check | Out-Null
-Remove-Item Env:SYNX_STD_PATH, Env:SYNX_RUNTIME_LIB, Env:SYNX_RUNTIME_SHARED, Env:SYNX_LINKER, Env:SYNX_LINKER_DRIVER -ErrorAction SilentlyContinue
+Remove-Item Env:SYNX_STD_PATH, Env:SYNX_RUNTIME_LIB, Env:SYNX_RUNTIME_SHARED, Env:SYNX_LINKER, Env:SYNX_LINKER_DRIVER, Env:SYNX_RUNTIME_HOST, Env:SYNX_CACHE_DIR -ErrorAction SilentlyContinue
 $launcher = Join-Path $stage 'bin\synx.cmd'
 $workbench = Join-Path $check 'workbench.exe'
+$formatInput = Join-Path $check 'format.snx'
+[IO.File]::WriteAllText($formatInput, 'main(){}', (New-Object Text.UTF8Encoding $false))
 Invoke-WithoutToolchain {
     Invoke-Checked $launcher @('version')
     Invoke-Checked $launcher @('build', (Join-Path $stage 'examples\workbench\main.snx'), '-o', $workbench, '--linker=builtin')
     $null | & $workbench > (Join-Path $check 'workbench.out')
     if ($LASTEXITCODE -ne 0) { throw "workbench failed with exit code $LASTEXITCODE" }
+    Invoke-Checked $launcher @('fmt', $formatInput)
+    Invoke-Checked $launcher @('fmt', '--check', $formatInput)
 }
+if ([IO.File]::ReadAllText($formatInput) -ne "main() {}`n") { throw 'packaged formatter output mismatch' }
 $target = Join-Path $check 'installed Synx'
 Invoke-Checked (Join-Path $stage 'install.cmd') @('-Destination', $target, '-NoPath')
 Invoke-WithoutToolchain {

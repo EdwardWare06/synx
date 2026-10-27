@@ -1,0 +1,4 @@
+// fixture: slice-unsized-value
+// stage: borrow
+// expect: error unsized
+void main() { var a = [1,2]; var view = a[..]; }

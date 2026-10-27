@@ -1,0 +1,7 @@
+// fixture: mismatched-abi
+// stage: borrow
+// expect: error does not match its trait signature
+trait T { int f(self, int n); }
+struct S {}
+impl T for S { int f(self, long n) { return 1; } }
+main() { Box<dyn T> p = Box.new(S {}); }

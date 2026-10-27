@@ -1,0 +1,7 @@
+// fixture: vec-hint
+// stage: borrow
+// expect: ok
+trait Read { int read(&const self); }
+struct Number { int value; }
+impl Read for Number { int read(&const self) { return self.value; } }
+main() { Vec<Box<dyn Read>> items = Vec.new(); items.push(Box.new(Number { value: 6 })); print("{items.get(0).unwrap().read()}"); }

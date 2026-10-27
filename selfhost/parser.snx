@@ -86,6 +86,7 @@ bool is_field_kind(ExprKind kind) { match kind { ExprKind.Field => return true, 
 Vec<byte> clone_bytes(&const Vec<byte> value) { return bytes.copy(value, 0, value.len()); }
 
 pub struct Parser {
+    pub bool editor;
     Vec<Token> tokens;
     usize pos;
     int speculating;
@@ -104,7 +105,7 @@ pub struct Parser {
             uint end = file.data().len() as uint;
             list.push(Token.new(Kind.Eof, Span { start: end, end: end, file: file.id }));
         }
-        return Parser { tokens: list, pos: 0, speculating: 0, spec_errors: 0, no_struct: 0,
+        return Parser { editor: false, tokens: list, pos: 0, speculating: 0, spec_errors: 0, no_struct: 0,
                         ident_span: Span { start: 0, end: 0, file: 0 }, ast: Ast.new(), sink: sink };
     }
 
@@ -855,7 +856,7 @@ pub struct Parser {
                     }
                 }
             }
-            if (self.sink.errors > errors_before) {
+            if (self.sink.errors > errors_before && (!self.editor || self.pos == 0 || self.tokens.get(self.pos - 1).unwrap().kind != Kind.Semi)) {
                 while (!self.at_end() && !self.at(Kind.Semi) && !self.at(Kind.RBrace)) { self.advance(); }
                 self.accept(Kind.Semi);
             }
@@ -1102,7 +1103,8 @@ pub struct Parser {
                 self.advance();
                 Vec<byte> name = self.expect_ident("field name after '?.'");
                 var node = Expr.new(ExprKind.OptChain, self.span_from(start));
-                node.a = e; node.text = name;
+                node.a = e; node.text = name; node.name_span = self.ident_span;
+                if (self.at(Kind.Lt)) { self.try_parse_type_args_for_call(&node.type_args); }
                 e = self.ast.add_expr(node);
             } else if (self.at(Kind.QuestionQuestion)) {
                 self.advance();

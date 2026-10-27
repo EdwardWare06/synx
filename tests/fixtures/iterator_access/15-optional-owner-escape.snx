@@ -1,0 +1,4 @@
+// fixture: optional-owner-escape
+// stage: borrow
+// expect: error SNX0502
+struct A { int n; &const int read(&const self) { return &const self.n; } } (&const int)? bad() { Option<A> a = Some(A { n: 1 }); return a?.read(); } void main() {}

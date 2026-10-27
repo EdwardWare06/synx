@@ -73,17 +73,17 @@ don't need Visual Studio, a C compiler, or a system linker.
 
 | Host | Package |
 |------|---------|
-| Windows x86-64 | `synx-0.1.0-windows-x86_64-setup.exe` or `synx-0.1.0-windows-x86_64.zip` |
-| Linux x86-64 (glibc 2.34+) | `synx-0.1.0-linux-x86_64.tar.gz` |
-| macOS 10.15+ (Rosetta 2 on Apple Silicon) | `synx-0.1.0-macos-x86_64.tar.gz` |
+| Windows x86-64 | `synx-0.2.0-windows-x86_64-setup.exe` or `synx-0.2.0-windows-x86_64.zip` |
+| Linux x86-64 (glibc 2.34+) | `synx-0.2.0-linux-x86_64.tar.gz` |
+| macOS 10.15+ (Rosetta 2 on Apple Silicon) | `synx-0.2.0-macos-x86_64.tar.gz` |
 
 Windows: run the setup program, or extract the zip and run `install.cmd`.
 
 Linux (on macOS, use `macos` in place of `linux`):
 
 ```text
-tar -xzf synx-0.1.0-linux-x86_64.tar.gz
-cd synx-0.1.0-linux-x86_64
+tar -xzf synx-0.2.0-linux-x86_64.tar.gz
+cd synx-0.2.0-linux-x86_64
 ./install.sh
 ```
 
@@ -95,6 +95,15 @@ synx version
 
 The [install guide](docs/guide/install.md) covers install options and how
 to uninstall.
+
+For Visual Studio Code, install the
+[Synx extension](https://marketplace.visualstudio.com/items?itemName=edwardware06.synx):
+syntax colors, snippets, compiler errors in the editor, and Run and Build
+buttons.
+
+Extension 0.2.0 adds live errors, completion, navigation, argument hints,
+rename, and formatting. Install `synx-0.2.0.vsix` from the 0.2.0 release to
+use these features. See the [extension guide](editors/vscode/README.md).
 
 ## Quick start
 
@@ -112,11 +121,14 @@ Run it:
 synx run hello.snx
 ```
 
-`synx build hello.snx -o hello` makes an executable instead. The runtime
-library (`synx_rt.dll`, `libsynx_rt.so`, or `libsynx_rt.dylib`) gets copied next to it. Copy
-both files together and the program runs on another machine without Synx
-installed. `synx check` checks a file without building it, and `synx about`
-shows information about the build.
+`synx run` keeps generated files in a private cache and reuses unchanged
+programs. `synx build hello.snx -o hello` writes one executable with the Synx
+runtime included. Copy that file to a computer with the same supported OS
+and architecture. Normal OS libraries remain required. `synx check` checks
+a file without building it, and `synx about` describes the compiler.
+
+`synx fmt hello.snx` formats the file. Use `synx fmt --check hello.snx` to
+check its format without changing it.
 
 ## How it's built
 
@@ -171,19 +183,19 @@ packages.
 
 ## Status and limits
 
-Synx is at 0.1.0. It's a working language, but it's still early.
+Synx is at 0.2.0. It's a working language, but it's still early.
 
-- Windows, Linux, and macOS on x86-64 are tested. On Apple Silicon Macs,
-  Synx and the programs it builds run through Rosetta 2.
+- Targets Windows, Linux, and macOS on x86-64. The release workflow checks
+  all three hosts. On Apple Silicon, Synx uses Rosetta 2.
 - No ARM64 code generation yet.
 - It builds command-line programs. There are no GUI or web libraries yet,
   so the frontend part of the goal is still ahead.
-- Trait objects only work through references (`&dyn Trait`).
+- Trait objects support references and owned `Box<dyn Trait>` values.
+- Match expressions check coverage, and or-patterns can bind values.
+- Iterators, slice views, and user-defined indexing are supported.
 - Values shared between threads with `Arc` or sent over channels have to own
   their data. They can't hold references.
-- `?.` is reserved. The compiler parses it but rejects it during code
-  generation, so use `match` or `??` for now.
-- User types can't overload indexing.
+- `?.` supports optional fields and calls.
 - The Myelin package manager is planned, not built.
 
 ## Documentation

@@ -6,12 +6,14 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #if defined(_WIN32)
 #include <windows.h>
 #include <wchar.h>
 #else
 #include <unistd.h>
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #if defined(__APPLE__)
@@ -389,3 +391,133 @@ int synx_rt_command(const uint8_t* blob, uint64_t length, uint64_t argc, int64_t
   *status = signal ? -(int64_t)signal : (int64_t)code;
   return error;
 }
+
+/* Formatter publication. Inputs remain owned by the caller. Check the expected
+ * bytes, write a new file beside the target, then replace it atomically. The
+ * caller resolves symlinks first. Return errno; all failure paths remove the
+ * temporary file. The target is never opened with truncation. */
+int synx_rt_format_write(const uint8_t* path, uint64_t length, const uint64_t* slices) {
+  if (!slices) return EINVAL;
+  const uint8_t* expected = (const uint8_t*)(uintptr_t)slices[0];
+  uint64_t expected_length = slices[1];
+  const uint8_t* data = (const uint8_t*)(uintptr_t)slices[2];
+  uint64_t count = slices[3];
+  if (!path || !length || length > SIZE_MAX || memchr(path, 0, (size_t)length) ||
+      expected_length > SIZE_MAX || count > SIZE_MAX ||
+      (!expected && expected_length) || (!data && count)) return EINVAL;
+  int error = 0;
+  uint8_t buffer[8192];
+  uint64_t offset = 0;
+#if defined(_WIN32)
+  wchar_t* name = wide_text(path, length);
+  if (!name) return errno;
+  size_t n = wcslen(name);
+  wchar_t* temporary = (wchar_t*)malloc((n + 80) * sizeof(wchar_t));
+  if (!temporary) { free(name); return ENOMEM; }
+  temporary[0] = 0;
+  HANDLE source = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  HANDLE output = INVALID_HANDLE_VALUE;
+  if (source == INVALID_HANDLE_VALUE) { error = windows_error(GetLastError()); goto done_format; }
+  LARGE_INTEGER size;
+  if (!GetFileSizeEx(source, &size)) { error = windows_error(GetLastError()); goto done_format; }
+  if (size.QuadPart < 0 || (uint64_t)size.QuadPart != expected_length) { error = EBUSY; goto done_format; }
+  while (offset < expected_length) {
+    DWORD want = (DWORD)((expected_length - offset > sizeof(buffer)) ? sizeof(buffer) : expected_length - offset);
+    DWORD got = 0;
+    if (!ReadFile(source, buffer, want, &got, NULL)) { error = windows_error(GetLastError()); goto done_format; }
+    if (got != want || memcmp(buffer, expected + (size_t)offset, got)) { error = EBUSY; goto done_format; }
+    offset += got;
+  }
+  for (unsigned attempt = 0; attempt < 128; ++attempt) {
+    _snwprintf(temporary, n + 80, L"%ls.synx-fmt-%lu-%lu-%u.tmp", name,
+               GetCurrentProcessId(), GetCurrentThreadId(), attempt);
+    output = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (output != INVALID_HANDLE_VALUE) break;
+    DWORD code = GetLastError();
+    if (code != ERROR_FILE_EXISTS && code != ERROR_ALREADY_EXISTS) { error = windows_error(code); temporary[0] = 0; goto done_format; }
+    temporary[0] = 0;
+  }
+  if (output == INVALID_HANDLE_VALUE) { error = EEXIST; goto done_format; }
+  offset = 0;
+  while (offset < count) {
+    DWORD want = (DWORD)((count - offset > sizeof(buffer)) ? sizeof(buffer) : count - offset);
+    DWORD wrote = 0;
+    if (!WriteFile(output, data + (size_t)offset, want, &wrote, NULL) || wrote != want) { error = EIO; goto done_format; }
+    offset += wrote;
+  }
+  if (!FlushFileBuffers(output)) { error = windows_error(GetLastError()); goto done_format; }
+  if (!CloseHandle(output)) { output = INVALID_HANDLE_VALUE; error = EIO; goto done_format; }
+  output = INVALID_HANDLE_VALUE;
+  // ReplaceFile preserves the existing ACL, attributes and alternate streams.
+  if (!ReplaceFileW(name, temporary, NULL, 0, NULL, NULL)) { error = windows_error(GetLastError()); goto done_format; }
+  temporary[0] = 0;
+done_format:
+  if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+  if (source != INVALID_HANDLE_VALUE) CloseHandle(source);
+  if (temporary[0]) DeleteFileW(temporary);
+  free(temporary); free(name);
+#else
+  char* name = native_text(path, length);
+  if (!name) return errno;
+  if (length > SIZE_MAX - 32) { free(name); return E2BIG; }
+  char* temporary = (char*)malloc((size_t)length + 32);
+  if (!temporary) { free(name); return ENOMEM; }
+  temporary[0] = 0;
+  int source = open(name, O_RDONLY | O_NONBLOCK);
+  int output = -1;
+  struct stat info;
+  if (source < 0) { error = errno; goto done_format; }
+  if (fstat(source, &info)) { error = errno; goto done_format; }
+  if (!S_ISREG(info.st_mode)) { error = EINVAL; goto done_format; }
+  if (!(info.st_mode & 0222)) { error = EACCES; goto done_format; }
+  if (info.st_size < 0 || (uint64_t)info.st_size != expected_length) { error = EBUSY; goto done_format; }
+  while (offset < expected_length) {
+    size_t want = (size_t)((expected_length - offset > sizeof(buffer)) ? sizeof(buffer) : expected_length - offset);
+    ssize_t got = read(source, buffer, want);
+    if (got < 0 && errno == EINTR) continue;
+    if (got < 0) { error = errno; goto done_format; }
+    if (!got || memcmp(buffer, expected + (size_t)offset, (size_t)got)) { error = EBUSY; goto done_format; }
+    offset += (uint64_t)got;
+  }
+  snprintf(temporary, (size_t)length + 32, "%s.synx-fmt-XXXXXX", name);
+  output = mkstemp(temporary);
+  if (output < 0) { error = errno; temporary[0] = 0; goto done_format; }
+  offset = 0;
+  while (offset < count) {
+    size_t want = (size_t)((count - offset > sizeof(buffer)) ? sizeof(buffer) : count - offset);
+    ssize_t wrote = write(output, data + (size_t)offset, want);
+    if (wrote < 0 && errno == EINTR) continue;
+    if (wrote <= 0) { error = wrote < 0 ? errno : EIO; goto done_format; }
+    offset += (uint64_t)wrote;
+  }
+  if (fchmod(output, info.st_mode & 0777) || fsync(output)) { error = errno; goto done_format; }
+  if (close(output)) { output = -1; error = errno; goto done_format; }
+  output = -1;
+  struct stat current;
+  if (stat(name, &current)) { error = errno; goto done_format; }
+  if (current.st_dev != info.st_dev || current.st_ino != info.st_ino || current.st_size != info.st_size || current.st_mtime != info.st_mtime) { error = EBUSY; goto done_format; }
+  if (lseek(source, 0, SEEK_SET) < 0) { error = errno; goto done_format; }
+  offset = 0;
+  while (offset < expected_length) {
+    size_t want = (size_t)((expected_length - offset > sizeof(buffer)) ? sizeof(buffer) : expected_length - offset);
+    ssize_t got = read(source, buffer, want);
+    if (got < 0 && errno == EINTR) continue;
+    if (got < 0) { error = errno; goto done_format; }
+    if (!got || memcmp(buffer, expected + (size_t)offset, (size_t)got)) { error = EBUSY; goto done_format; }
+    offset += (uint64_t)got;
+  }
+  if (rename(temporary, name)) { error = errno; goto done_format; }
+  temporary[0] = 0;
+done_format:
+  if (output >= 0) close(output);
+  if (source >= 0) close(source);
+  if (temporary[0]) unlink(temporary);
+  free(temporary); free(name);
+#endif
+  return error;
+}
+
+#if defined(SYNX_STANDALONE_RUNTIME)
+#include "exports_host.inc"
+#endif

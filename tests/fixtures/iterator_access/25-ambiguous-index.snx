@@ -1,0 +1,4 @@
+// fixture: ambiguous-index
+// stage: borrow
+// expect: error ambiguous
+struct A { int i; long l; } impl Index<int,int> for A { &const int index(&const self,int i) { return &const self.i; } } impl Index<int,long> for A { &const long index(&const self,int i) { return &const self.l; } } void main() { var a = A { i: 1, l: 2 }; var value = a[0]; }

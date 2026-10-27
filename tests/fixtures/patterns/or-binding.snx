@@ -1,0 +1,5 @@
+// fixture: or-binding
+// stage: borrow
+// expect: ok
+enum E { A(int), B(int) }
+int f(E e) { return match e { E.A(x) | E.B(x) => x }; }

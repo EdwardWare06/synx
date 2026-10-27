@@ -1,0 +1,5 @@
+// fixture: recursive-reference-covered
+// stage: borrow
+// expect: ok
+struct Chain { &const Chain next; }
+int f(&const Chain p) { return match p { Chain { next: Chain { next: _ } } => 0 }; }

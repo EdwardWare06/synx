@@ -1,0 +1,4 @@
+// fixture: optional-field-move
+// stage: borrow
+// expect: error moved
+struct A { String s; int n; } void main() { Option<A> a = Some(A { s: String.new(), n: 1 }); var s = a?.s; var n = a?.n; }

@@ -1,0 +1,7 @@
+// fixture: borrowed-payload-escape
+// stage: borrow
+// expect: error SNX0502
+trait Read { int read(&const self); }
+struct Borrowed { &const int value; }
+impl Read for Borrowed { int read(&const self) { return *self.value; } }
+Box<dyn Read> f() { int x = 4; return Box.new(Borrowed { value: &const x }); }

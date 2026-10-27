@@ -165,6 +165,7 @@ pub struct Program {
     pub DefId result_def;
     pub DefId string_def;
     pub DefId vec_def;
+    pub DefId box_def;
     pub DefId range_def;
     pub DefId range_inclusive_def;
     pub DefId task_def;
@@ -175,7 +176,7 @@ pub struct Program {
     pub Program new() { return Program { structs: Vec.new(), enums: Vec.new(), traits: Vec.new(), impls: Vec.new(),
         functions: Vec.new(), consts: Vec.new(), globals: SymbolTable.new(), modules: Vec.new(), root_module: ModuleId.none(),
         active_module: ModuleId.none(), option_def: DefId.none(), result_def: DefId.none(), string_def: DefId.none(),
-        vec_def: DefId.none(), range_def: DefId.none(), range_inclusive_def: DefId.none(), task_def: DefId.none(),
+        vec_def: DefId.none(), box_def: DefId.none(), range_def: DefId.none(), range_inclusive_def: DefId.none(), task_def: DefId.none(),
         send_task_def: DefId.none(), waker_def: DefId.none(), poll_def: DefId.none(), core_traits: IndexMap.new() }; }
     pub &const Definition def(&const self, DefId id) {
         match id.kind { DefKind.Struct => return self.structs.get(id.index as usize).unwrap(), DefKind.Enum => return self.enums.get(id.index as usize).unwrap(),

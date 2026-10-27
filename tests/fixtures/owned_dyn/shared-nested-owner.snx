@@ -1,0 +1,7 @@
+// fixture: shared-nested-owner
+// stage: borrow
+// expect: error writable
+trait Change { void change(&self); }
+struct S {}
+impl Change for S { void change(&self) {} }
+main() { Box<dyn Change> p = Box.new(S {}); var shared = &const p; var alias = &shared; alias.change(); }

@@ -1,0 +1,8 @@
+// fixture: erased-not-send
+// stage: borrow
+// expect: error does not implement
+trait Read { int read(&const self); }
+struct Number { int value; }
+impl Read for Number { int read(&const self) { return self.value; } }
+void accept<T: Send>(T x) {}
+main() { Box<dyn Read> p = Box.new(Number { value: 3 }); accept(p); }

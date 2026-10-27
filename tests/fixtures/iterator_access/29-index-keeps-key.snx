@@ -1,0 +1,4 @@
+// fixture: index-keeps-key
+// stage: borrow
+// expect: error borrowed
+struct A { int n; } impl Index<&const int,int> for A { &const int index(&const self,&const int key) { if (*key == 0) { return &const self.n; } return key; } } void main() { var a = A { n: 1 }; int key = 0; var value = &const a[&const key]; key = 2; print("{*value}"); }

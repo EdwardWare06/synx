@@ -67,16 +67,22 @@ The call borrows `reading` through the shared parameter. In the second arm,
 ## Notes
 
 Patterns include literals, bindings, `_`, enum variants, tuples, struct
-fields, alternatives (`1 | 2`), and literal ranges (`3..=9`). Alternatives
-cannot introduce bindings in the current compiler.
+fields, alternatives (`1 | 2`), and literal ranges (`3..=9`). Alternatives can
+bind names when each alternative binds the same names and types. The first
+matching alternative supplies the bindings. A false guard continues with the
+next arm. Bindings are made before the guard. A false guard drops those
+bindings. Later arms must follow the move rules for any fields already moved.
 
 A by-value match follows the move and Copy rules. Use a reference operand
 when the matched value must remain available.
 
-The current coverage check treats fields of a tuple or variant separately.
-It can accept arms that leave a combination uncovered. If no arm matches,
-execution panics with `entered unreachable code`. Include a fallback arm
-when matching combinations that the explicit arms do not cover.
+Coverage preserves the combinations of fields in tuples, structs, and enum
+variants, including nested alternatives. Covering each field separately is
+insufficient. For example, `(true, false)` and `(false, true)` leave
+`(true, true)` and `(false, false)` uncovered. Diagnostic `SNX0404` reports a
+missing pattern. Literal and range patterns on scalar types other than
+`bool` require a fallback arm.
 
 Implementation: `selfhost/check.snx`, `selfhost/lower.snx`.
-Regression cases: `tests/check_test.cpp`, `test_enums_and_match`.
+Regression cases: `tests/fixtures/patterns/`, `tests/patterns/coverage.py`,
+and `tests/run/pattern_groups.snx`.

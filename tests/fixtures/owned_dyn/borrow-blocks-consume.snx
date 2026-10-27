@@ -1,0 +1,5 @@
+// fixture: borrow-blocks-consume
+// stage: borrow
+// expect: error SNX0501
+trait Both { int read(&const self); int take(self); }
+void f(Box<dyn Both> p) { var r = p.as_ref(); p.take(); print("{r.read()}"); }

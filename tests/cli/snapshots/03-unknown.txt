@@ -7,9 +7,11 @@ commands:
   lex <file.snx>     print the token stream of a file
   parse <file.snx>   print the syntax tree (--strict adds spans and every field)
   modules <file.snx> print declarations and bound module namespaces (--signatures, --check, --lower, --borrow, --async stop after that stage; --machine adds layouts and registers)
-  check <file.snx>   check names, types, and ownership without building
+  check <file.snx>   check names, types, and ownership without building (--json writes the diagnostics as JSON)
+  fmt <file.snx>    format source files (--check, --stdout, --stdin)
+  lsp                start the language server over standard input/output
   ir <file.snx>      print the Dendrite IR of a program
-  build <file.snx>   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, -v)
-  run <file.snx>     build and run
+  build <file.snx>   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, --standalone, --shared-runtime, -v)
+  run <file.snx>     build privately and run ([options] -- program arguments)
 --- stderr
 unknown command: unknown

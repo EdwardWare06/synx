@@ -1,0 +1,73 @@
+/// Re-sign a native runtime template after attaching its program image.
+/// The template reserves header padding. All original load commands and dyld
+/// records retain their offsets. Only LINKEDIT size and the signature change.
+import link.buffer.{Buffer, align};
+import link.model.{Failure, Code};
+import link.model;
+import link.reader;
+import link.macho_sha256;
+import std.binary;
+
+ulong get(&const Vec<byte> data, usize at, usize width) { return binary.read_uint(data, at, width, true).unwrap_or(0); }
+void be(&Buffer out, ulong value, usize width) { for (i in 0..width) { out.word((value >> ((width - i - 1) * 8)) & 255, 1); } }
+pub Result<Vec<byte>, Failure> strip(&const Vec<byte> data) {
+    if (data.len() < 32 || get(data, 0, 4) != 0xfeedfacf || get(data, 4, 4) != 0x1000007) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    usize end = 32 + get(data, 20, 4) as usize; if (end > data.len()) { return Err(model.fail(Code.Invalid, 0, end)); }
+    usize cursor = 32; usize size = data.len();
+    for (i in 0..get(data, 16, 4) as usize) {
+        if (cursor > end || end - cursor < 8) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+        usize count = get(data, cursor + 4, 4) as usize; if (count < 8 || count > end - cursor) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+        if (get(data, cursor, 4) == 0x1d) {
+            if (count != 16) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+            usize offset = get(data, cursor + 8, 4) as usize; usize bytes = get(data, cursor + 12, 4) as usize;
+            if (offset < end || offset > data.len() || bytes != data.len() - offset) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+            size = offset;
+        }
+        cursor += count;
+    }
+    if (cursor != end) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+    return match reader.copy(data, 0, size) { Ok(value) => Ok(value), Err(_) => Err(model.fail(Code.Invalid, 0, size)) };
+}
+pub Result<Vec<byte>, Failure> sign(Vec<byte> input) {
+    var out = Buffer.new(); out.data = input;
+    if (out.data.len() < 32) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    usize commands = get(out.data, 20, 4) as usize; usize ncmd = get(out.data, 16, 4) as usize;
+    if (commands > out.data.len() - 32) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    usize cursor = 32; usize signature_command = 0; usize linkedit = 0; ulong text_end = 0; ulong first_data = out.data.len() as ulong;
+    for (i in 0..ncmd) {
+        if (cursor > 32 + commands || 32 + commands - cursor < 8) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+        ulong kind = get(out.data, cursor, 4); usize count = get(out.data, cursor + 4, 4) as usize;
+        if (count < 8 || count > 32 + commands - cursor) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+        if (kind == 0x1d) { if (signature_command != 0 || count != 16) { return Err(model.fail(Code.Invalid, 0, cursor)); } signature_command = cursor; }
+        if (kind == 0x19 && count >= 72) {
+            if (reader.matches(out.data, cursor + 8, "__LINKEDIT")) { linkedit = cursor; }
+            if (reader.matches(out.data, cursor + 8, "__TEXT")) { text_end = get(out.data, cursor + 48, 8); }
+            usize sections = get(out.data, cursor + 64, 4) as usize;
+            if (sections > (count - 72) / 80) { return Err(model.fail(Code.Invalid, 0, cursor)); }
+            for (j in 0..sections) { ulong offset = get(out.data, cursor + 72 + j * 80 + 48, 4); if (offset != 0 && offset < first_data) { first_data = offset; } }
+        }
+        cursor += count;
+    }
+    if (linkedit == 0 || text_end == 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    if (signature_command == 0) {
+        if (cursor as ulong + 16 > first_data) { return Err(model.fail(Code.Range, 0, cursor)); }
+        signature_command = cursor; out.patch(cursor, 0x1d, 4); out.patch(cursor + 4, 16, 4);
+        out.patch(16, ncmd as ulong + 1, 4); out.patch(20, commands as ulong + 16, 4);
+    }
+    ulong offset = align(out.data.len() as ulong, 16)?; var padded = out.pad(offset)?;
+    ulong pages = (offset + 4095) / 4096; ulong size = 116 + pages * 32;
+    ulong fileoff = get(out.data, linkedit + 40, 8); if (fileoff > offset) { return Err(model.fail(Code.Invalid, 0, linkedit)); }
+    out.patch(signature_command + 8, offset, 4); out.patch(signature_command + 12, size, 4);
+    out.patch(linkedit + 48, offset + size - fileoff, 8); out.patch(linkedit + 32, align(offset + size - fileoff, 4096)?, 8);
+    var signature = Buffer.new();
+    be(&signature, 0xfade0cc0, 4); be(&signature, size, 4); be(&signature, 1, 4); be(&signature, 0, 4); be(&signature, 20, 4);
+    be(&signature, 0xfade0c02, 4); be(&signature, size - 20, 4); be(&signature, 0x20400, 4); be(&signature, 0x20002, 4);
+    be(&signature, 96, 4); be(&signature, 88, 4); be(&signature, 0, 4); be(&signature, pages, 4); be(&signature, offset, 4);
+    signature.word(32, 1); signature.word(2, 1); signature.word(0, 1); signature.word(12, 1);
+    for (i in 0..4) { be(&signature, 0, 4); }
+    be(&signature, 0, 8); be(&signature, 0, 8); be(&signature, text_end, 8); be(&signature, 1, 8);
+    signature.name("synx");
+    for (i in 0..pages as usize) { usize start = i * 4096; usize count = if (offset as usize - start < 4096) { offset as usize - start } else { 4096 }; signature.append(macho_sha256.digest(out.data, start, count)); }
+    if (signature.data.len() as ulong != size) { panic("standalone signature size"); }
+    out.append(signature.data); return Ok(out.data);
+}

@@ -1,0 +1,127 @@
+/// Private native run cache. Discovery re-resolves imports before each lookup.
+/// Compiler, runtime, source contents, paths, cwd, and build options form the key.
+/// Entry locks serialize publication; they release before the child is launched.
+import driver_options.BuildOptions;
+import driver_paths;
+import driver_io;
+import driver_fingerprint;
+import build;
+import compile.Compilation;
+import prelude_source;
+import link.linker;
+import std.env;
+import std.fs;
+import std.path.Path;
+import std.text;
+import bytes;
+
+extern "C" {
+    int synx_rt_cache_prepare(*const byte path, usize length);
+    int synx_rt_cache_lock(*const byte path, usize length, &(*byte) handle);
+    void synx_rt_cache_unlock(*byte handle);
+    ulong synx_rt_cache_nonce();
+}
+struct Lock {
+    *byte handle;
+    Result<Lock, String> acquire(&const str path, bool needed) {
+        var handle = 0 as *byte;
+        if (needed && unsafe { synx_rt_cache_lock(path.as_ptr(), path.len(), &handle) } != 0) { return Err("cannot lock run cache: {path}\n"); }
+        return Ok(Lock { handle: handle });
+    }
+}
+impl Drop for Lock { void drop(&self) { unsafe { synx_rt_cache_unlock(self.handle); } } }
+Result<String, String> variable(&const str name) { match env.get(name) { Ok(Some(value)) => return Ok(value), _ => return Err("cannot find {name}; set SYNX_CACHE_DIR\n") } }
+Result<String, String> root() {
+    var selected = match env.get("SYNX_CACHE_DIR") { Ok(Some(value)) => value, _ => String.new() };
+    if (selected.is_empty()) {
+        match driver_io.host_target().os {
+            Windows => { selected = String.from(Path.from(variable("LOCALAPPDATA")?).join("Synx").join("cache").join("run").as_str()); }
+            MacOs => { selected = String.from(Path.from(variable("HOME")?).join("Library").join("Caches").join("Synx").join("run").as_str()); }
+            Linux => {
+                var xdg = match env.get("XDG_CACHE_HOME") { Ok(Some(value)) => value, _ => String.new() };
+                var base = if (!xdg.is_empty() && Path.from(xdg).is_absolute()) { Path.from(xdg) } else { Path.from(variable("HOME")?).join(".cache") };
+                selected = String.from(base.join("synx").join("run").as_str());
+            }
+        }
+    }
+    var absolute = match fs.absolute(selected) { Ok(value) => value, Err(_) => return Err(String.from("cannot resolve SYNX_CACHE_DIR\n")) };
+    if (unsafe { synx_rt_cache_prepare(absolute.as_str().as_ptr(), absolute.len()) } != 0) { return Err("cannot create private run cache: {absolute}\n"); }
+    return Ok(absolute);
+}
+struct Snapshot { String key; String sources; bool valid; }
+Result<Snapshot, String> snapshot(&const BuildOptions options) {
+    var loaded = match Compilation.load(options.input, prelude_source.source(), "", 0, false) { Ok(value) => value, Err(_) => return Err("cannot read file: {options.input}\n") };
+    var sources = driver_fingerprint.sources(loaded.sources); Vec<byte> manifest = Vec.new();
+    driver_fingerprint.text(&manifest, "Synx run cache v1"); driver_fingerprint.text(&manifest, sources);
+    var exe = match env.exe_path() { Ok(value) => value, Err(_) => return Err(String.from("cannot locate the compiler\n")) };
+    driver_fingerprint.text(&manifest, exe);
+    var compiler_hash = match driver_fingerprint.file(exe) { Ok(value) => value, Err(_) => return Err(String.from("cannot fingerprint the compiler\n")) };
+    driver_fingerprint.text(&manifest, compiler_hash);
+    var asset = if (driver_paths.selected_linker(options) != 0) { driver_paths.runtime_library(options.target) } else if (options.standalone) { driver_paths.runtime_host(options.target) } else { driver_paths.runtime_capsule(options.target) };
+    var asset_hash = match driver_fingerprint.file(asset) { Ok(value) => value, Err(_) => return Err("cannot read the selected Synx runtime: {asset}\n") };
+    driver_fingerprint.text(&manifest, asset); driver_fingerprint.text(&manifest, asset_hash);
+    var cwd = match fs.current_dir() { Ok(value) => value, Err(_) => return Err(String.from("cannot read the working directory\n")) }; driver_fingerprint.text(&manifest, cwd);
+    var target = options.target.name(); driver_fingerprint.text(&manifest, target);
+    manifest.push(if (options.target.register_allocation) { 1 } else { 0 }); manifest.push(if (options.target.checked_arithmetic) { 1 } else { 0 });
+    manifest.push(if (options.standalone) { 1 } else { 0 }); manifest.push(if (options.keep_object) { 1 } else { 0 });
+    manifest.push(driver_paths.selected_linker(options) as byte);
+    return Ok(Snapshot { key: driver_fingerprint.hash(manifest), sources: sources, valid: loaded.ok });
+}
+bool safe_name(&const str value) {
+    if (!text.starts_with(value, "program-") || value.len() > 80) { return false; }
+    for (i in 0..value.len()) { byte c = unsafe { *((value.as_ptr() as usize + i) as *const byte) }; if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 122) || c == 45 || c == 46)) { return false; } }
+    return true;
+}
+bool runtime_valid(&const BuildOptions options, &const Path folder) {
+    if (options.standalone) { return true; }
+    var expected = driver_paths.runtime_capsule(options.target);
+    int os = match options.target.os { Windows => 1, MacOs => 2, Linux => 0 };
+    var actual = folder.join(linker.runtime_name(os));
+    match driver_fingerprint.file(expected) { Ok(wanted) => match driver_fingerprint.file(actual.as_str()) { Ok(found) => return found == wanted, Err(_) => {} }, Err(_) => {} }
+    return false;
+}
+Result<String, String> prepare(&BuildOptions options) {
+    if (!options.output.is_empty()) { var result = build.program(&const *options); if (!result.ok) { return Err(String.new()); } return Ok(result.executable); }
+    options.input = match fs.absolute(options.input) { Ok(value) => value, Err(_) => return Err(String.from("cannot resolve source path\n")) };
+    var base = root()?; var initial = snapshot(&const *options)?;
+    var folder = Path.from(base).join(initial.key); var directory = String.from(folder.as_str());
+    if (unsafe { synx_rt_cache_prepare(directory.as_str().as_ptr(), directory.len()) } != 0) { return Err("cannot create cache entry: {directory}\n"); }
+    var lock_path = folder.join("entry.lock"); var guard = Lock.acquire(lock_path.as_str(), !options.no_cache)?;
+    var entry = folder.join("entry"); bool reusable = !options.no_cache && initial.valid && driver_paths.selected_linker(&const *options) == 0;
+    if (reusable) {
+        match fs.read_text(entry.as_str()) { Ok(manifest) => {
+            var lines = manifest.split("\n");
+            if (lines.len() == 3 && lines.get(2).unwrap().is_empty() && safe_name(lines.get(0).unwrap().as_str())) {
+                var output = folder.join(lines.get(0).unwrap().as_str());
+                match driver_fingerprint.file(output.as_str()) { Ok(hash) => {
+                    bool object = true; if (options.keep_object) { object = driver_paths.exists(driver_paths.object_path(output.as_str(), options.target)); }
+                    if (hash == *lines.get(1).unwrap() && object && runtime_valid(&const *options, folder)) { if (options.verbose) { driver_io.text(2, "run cache: hit\n"); } return Ok(String.from(output.as_str())); }
+                }, Err(_) => {} }
+            }
+        }, Err(_) => {} }
+    }
+    if (options.verbose) { driver_io.text(2, "run cache: miss\n"); }
+    ulong nonce = unsafe { synx_rt_cache_nonce() }; var suffix = match options.target.os { Windows => ".exe", _ => "" };
+    options.output = String.from(folder.join("program-{nonce}{suffix}").as_str()); options.cache_record = true;
+    var result = build.program(&const *options); if (!result.ok) { return Err(String.new()); }
+    // A changed source or toolchain during compilation cannot publish under an old key.
+    if (reusable && result.source_hash == initial.sources) {
+        match snapshot(&const *options) { Ok(current) => { if (current.valid && current.key == initial.key) {
+            var output_hash = match driver_fingerprint.file(result.executable) { Ok(value) => value, Err(_) => return Err(String.from("cannot fingerprint run output\n")) };
+            var name = Path.from(result.executable).file_name().unwrap(); Vec<byte> manifest = Vec.new(); bytes.text(&manifest, "{name}\n{output_hash}\n");
+            match linker.publish(entry.as_str(), manifest) { Ok(_) => {}, Err(_) => return Err(String.from("cannot publish run-cache manifest\n")) }
+        } }, Err(_) => {} }
+    }
+    return Ok(result.executable);
+}
+pub int run(BuildOptions options) {
+    bool temporary = options.output.is_empty() && options.no_cache;
+    match prepare(&options) {
+        Err(message) => { if (!message.is_empty()) { driver_io.text(2, message); } return 1; }
+        Ok(executable) => {
+            int status = driver_paths.run_arguments(executable, options.program_args);
+            if (temporary && !options.keep_object) { var removed = fs.remove(executable); }
+            return status;
+        }
+    }
+}

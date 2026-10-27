@@ -1,0 +1,4 @@
+// fixture: index-needs-mut
+// stage: borrow
+// expect: error read only
+struct A { int value; } impl Index<int,int> for A { &const int index(&const self, int i) { return &const self.value; } } void main() { var a = A { value: 1 }; a[0] = 2; }

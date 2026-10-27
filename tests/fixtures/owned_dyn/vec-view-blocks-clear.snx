@@ -1,0 +1,7 @@
+// fixture: vec-view-blocks-clear
+// stage: borrow
+// expect: error SNX0501
+trait View { &const int view(&const self); }
+struct S { int value; }
+impl View for S { &const int view(&const self) { return &const self.value; } }
+main() { Vec<Box<dyn View>> list = Vec.new(); list.push(Box.new(S { value: 1 })); var r = list.get(0).unwrap().view(); list.clear(); print("{*r}"); }

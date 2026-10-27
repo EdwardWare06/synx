@@ -1,0 +1,7 @@
+// fixture: box-impl-priority
+// stage: borrow
+// expect: ok
+trait Value { int value(&const self); }
+trait Owner { int value(&const self); }
+impl Owner for Box<dyn Value> { int value(&const self) { return 1; } }
+void f(Box<dyn Value> x) { print("{x.value()}"); }

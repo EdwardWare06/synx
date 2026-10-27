@@ -1,0 +1,4 @@
+// fixture: borrowed-iterator-pattern
+// stage: borrow
+// expect: ok
+import std.iter; void main() { var a = [(1,2)]; for ((x,y) in iter.iter(&const a[..])) { var n = *x + *y; } }

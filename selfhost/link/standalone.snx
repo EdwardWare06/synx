@@ -1,0 +1,97 @@
+/// Link a native image against the runtime embedded in a prelinked host.
+/// Imports use in-image RIP-relative thunks; only absolute image pointers need
+/// a load-base adjustment. The host never extracts a runtime library.
+import link.model.{Object, Symbol, Section, SectionKind, Binding, Definition, Relocation, RelocKind, Failure, Code};
+import link.model;
+import link.image;
+import link.imports;
+import link.buffer.{Buffer, align};
+import link.reader;
+import link.standalone_macho;
+import std.binary;
+import std.collections;
+import std.utf8;
+import link.macho_sha256;
+
+pub const &const str MARKER = "SYNX-NATIVE-TEMPLATE-V1-X64-LOC\0";
+ulong get(&const Vec<byte> data, usize at, usize width) { return binary.read_uint(data, at, width, true).unwrap_or(0); }
+pub Result<usize, Failure> descriptor(&const Vec<byte> data, int os) {
+    bool header = false;
+    if (os == 0) { header = data.len() >= 64 && get(data, 0, 4) == 0x464c457f && get(data, 4, 2) == 0x0102 && get(data, 18, 2) == 62; }
+    else if (os == 1 && data.len() >= 64 && get(data, 0, 2) == 0x5a4d) {
+        ulong pe = get(data, 60, 4);
+        header = pe <= data.len() as ulong && data.len() as ulong - pe >= 26 && get(data, pe as usize, 4) == 0x4550 && get(data, pe as usize + 4, 2) == 0x8664 && get(data, pe as usize + 24, 2) == 0x20b;
+    } else if (os == 2) { header = data.len() >= 32 && get(data, 0, 4) == 0xfeedfacf && get(data, 4, 4) == 0x1000007; }
+    if (!header) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    if (os == 1) {
+        usize pe = get(data, 60, 4) as usize;
+        if (get(data, pe + 24 + 108, 4) >= 5 && (get(data, pe + 24 + 144, 4) != 0 || get(data, pe + 24 + 148, 4) != 0)) { return Err(model.named(Code.Unsupported, 0, pe, "signed runtime template")); }
+    }
+    usize found = data.len();
+    if (data.len() < 96) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    for (i in 0..=(data.len() - 96)) {
+        if (*data.get(i).unwrap() != 83) { continue; }
+        if (reader.matches(data, i, MARKER)) { if (found != data.len()) { return Err(model.fail(Code.Invalid, 0, i)); } found = i; }
+    }
+    if (found == data.len() || get(data, found + 32, 4) != 1 || get(data, found + 36, 4) != os as ulong) { return Err(model.fail(Code.Invalid, 0, found)); }
+    ulong size = get(data, found + 88, 8);
+    if (size == 0 || size > (data.len() - found - 96) as ulong || *data.get(found + 96 + size as usize - 1).unwrap() != 0) { return Err(model.fail(Code.Invalid, 0, found)); }
+    if (get(data, found + 40, 8) != 0 || get(data, found + 48, 8) != 0) { return Err(model.fail(Code.Invalid, 0, found)); }
+    var hash = macho_sha256.digest(data, found + 96, size as usize - 1);
+    for (i in 0..32) { if (*hash.get(i).unwrap() != *data.get(found + 56 + i).unwrap()) { return Err(model.fail(Code.Invalid, 0, found)); } }
+    return Ok(found);
+}
+bool exported(&const Vec<byte> host, usize desc, &const str name) {
+    usize size = get(host, desc + 88, 8) as usize; usize start = desc + 96;
+    var encoded = std.utf8.encode(name); encoded.push(10);
+    usize at = start; usize end = start + size - 1;
+    while (at < end) {
+        bool same = encoded.len() <= end - at;
+        if (same) { for (i in 0..encoded.len()) { if (*encoded.get(i).unwrap() != *host.get(at + i).unwrap()) { same = false; break; } } }
+        if (same) { return true; }
+        while (at < end && *host.get(at).unwrap() != 10) { at += 1; } at += 1;
+    }
+    return false;
+}
+Result<Vec<byte>, Failure> payload(Vec<Object> inputs, &const Vec<byte> host, usize desc, int os) {
+    var entry = if (os == 2) { "_synx_entry" } else { "synx_entry" };
+    var thread = if (os == 2) { "_synx_thread_entry" } else { "synx_thread_entry" };
+    var catalogue = imports.collect_for(inputs, "runtime", os, entry)?;
+    var stubs = Object.new("<standalone-imports>", false); var code = Buffer.new(); var slots = Buffer.new();
+    Vec<String> names = Vec.new();
+    for (i in 0..catalogue.len()) {
+        var raw = std.utf8.decode(catalogue.get(i).unwrap().name).unwrap();
+        var name = if (os == 2 && raw.starts_with("_")) { String.from(unsafe { str_from_raw((raw.as_str().as_ptr() as usize + 1) as *const byte, raw.len() - 1) }) } else { String.from(raw) };
+        if (!exported(host, desc, name)) { return Err(model.named(Code.Unresolved, 0, i, name)); }
+        names.push(name);
+        usize slot = stubs.symbols.len(); stubs.symbols.push(Symbol.new("__synx_standalone_slot_{i}", Binding.Global, Definition.Section(1, slots.data.len() as ulong)));
+        stubs.symbols.push(Symbol.new(raw, Binding.Global, Definition.Section(0, code.data.len() as ulong)));
+        stubs.symbols.push(Symbol.new("__imp_{raw}", Binding.Global, Definition.Section(1, slots.data.len() as ulong)));
+        code.word(255, 1); code.word(37, 1);
+        stubs.relocations.push(Relocation { section: 0, offset: code.data.len() as ulong, symbol: slot, kind: RelocKind.Pc32, addend: -4 }); code.word(0, 4); slots.word(0, 8);
+    }
+    stubs.sections.push(Section.new(SectionKind.Text, 16, code.data)); stubs.sections.push(Section.new(SectionKind.Data, 8, slots.data)); inputs.push(stubs);
+    var linked = image.build_aligned(inputs, entry, 0, 65536)?;
+    if (!linked.rebase_safe) { return Err(model.fail(Code.Unsupported, 0, 0)); }
+    ulong thread_rva = image.symbol(linked, thread).unwrap_or(0); if (thread_rva == 0) { return Err(model.named(Code.Entry, 0, 0, thread)); }
+    var out = Buffer.new(); for (ch in &const std.utf8.encode("SNXPAY01")) { out.word(*ch as ulong, 1); }
+    for (i in 0..32) { out.word(*host.get(desc + 56 + i).unwrap() as ulong, 1); }
+    out.word(linked.end_rva, 8); out.word(linked.entry, 8); out.word(thread_rva, 8); out.word(4, 8);
+    out.word(linked.absolute_sites.len() as ulong, 8); out.word(names.len() as ulong, 8);
+    for (i in 0..4) { var s = linked.segments.get(i).unwrap(); out.word(s.rva, 8); out.word(s.size, 8); out.word(s.data.len() as ulong, 8); out.word(0, 8); out.word(if (i == 0) { 5 } else if (i == 1) { 1 } else { 3 }, 8); }
+    collections.sort(&linked.absolute_sites); for (site in &const linked.absolute_sites) { out.word(*site, 8); }
+    for (i in 0..names.len()) { var name = names.get(i).unwrap(); ulong slot = image.symbol(linked, "__synx_standalone_slot_{i}").unwrap(); out.word(slot, 8); out.word(name.len() as ulong, 8); out.append(std.utf8.encode(name)); }
+    for (i in 0..4) { var s = linked.segments.get(i).unwrap(); usize offset = out.data.len(); out.patch(88 + i * 40 + 24, offset as ulong, 8); out.append(s.data); }
+    return Ok(out.data);
+}
+pub Result<Vec<byte>, Failure> bytes(Vec<Object> inputs, &const Vec<byte> host, int os) {
+    usize desc = descriptor(host, os)?;
+    var stripped = if (os == 2) { standalone_macho.strip(host)? } else { match reader.copy(host, 0, host.len()) { Ok(value) => value, Err(_) => return Err(model.fail(Code.Invalid, 0, 0)) } };
+    if (desc > stripped.len() || stripped.len() - desc < 96 + get(host, desc + 88, 8) as usize) { return Err(model.fail(Code.Invalid, 0, desc)); }
+    var program = payload(inputs, host, desc, os)?;
+    var out = Buffer.new(); out.data = stripped;
+    var padded = out.pad(align(out.data.len() as ulong, 16)?)?;
+    out.patch(desc + 40, out.data.len() as ulong, 8); out.patch(desc + 48, program.len() as ulong, 8); out.append(program);
+    if (os == 2) { return standalone_macho.sign(out.data); }
+    return Ok(out.data);
+}

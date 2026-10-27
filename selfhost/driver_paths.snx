@@ -21,6 +21,19 @@ pub int selected_linker(&const BuildOptions options) {
     match env.get("SYNX_RUNTIME_LIB") { Ok(value) => match value { Some(_) => return 1, None => {} }, Err(_) => {} }
     return 0;
 }
+pub String runtime_host(Target target) {
+    match env.get("SYNX_RUNTIME_HOST") { Ok(Some(path)) => { if (exists(path)) { return display(path); } }, _ => {} }
+    var executable = match env.exe_path() { Ok(value) => value, Err(_) => return String.new() };
+    var dir = Path.from(executable).parent().unwrap_or(Path.from("."));
+    var name = match target.os { Windows => "synx-host.exe", _ => "synx-host" };
+    for (up in 0..4) {
+        var local = dir.join(name); if (exists(local.as_str())) { return display(local.as_str()); }
+        var lib = dir.join("lib").join(name); if (exists(lib.as_str())) { return display(lib.as_str()); }
+        var runtime = dir.join("runtime").join(name); if (exists(runtime.as_str())) { return display(runtime.as_str()); }
+        match dir.parent() { Some(parent) => { dir = parent; }, None => {} }
+    }
+    return String.new();
+}
 pub String runtime_capsule(Target target) {
     match env.get("SYNX_RUNTIME_SHARED") { Ok(value) => match value { Some(path) => { if (exists(path)) { return display(path); } }, None => {} }, Err(_) => {} }
     var executable = match env.exe_path() { Ok(value) => value, Err(_) => return String.new() };
@@ -96,8 +109,11 @@ pub int exit_code(&const ExitStatus status) {
     match status.signal { Some(signal) => return 128 + signal, None => return 1 }
 }
 pub int run_executable(&const str executable) {
+    Vec<String> args = Vec.new(); return run_arguments(executable, args);
+}
+pub int run_arguments(&const str executable, &const Vec<String> args) {
     String absolute = match fs.absolute(executable) { Ok(value) => value, Err(_) => return 1 };
-    var command = Command.new(absolute);
+    var command = Command.new(absolute); for (arg in args) { command.arg(arg); }
     match command.status() { Ok(status) => return exit_code(status), Err(_) => return 1 }
 }
 /// Rendering is for verbose output only; it is never executed as shell text.

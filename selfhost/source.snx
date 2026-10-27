@@ -58,3 +58,32 @@ pub struct SourceFile {
         return bytes.copy(self.data, start as usize, end as usize);
     }
 }
+
+/// Owned editor inputs. Disk remains the fallback. Keys use host path rules.
+/// Each compilation owns a snapshot; editor buffers never change during a pass.
+import std.path.{Path, Style, host_style};
+import std.text;
+pub String path_key(&const str path) {
+    String absolute = String.from(path);
+    match fs.canonicalize(path) { Ok(value) => { absolute = value; }, Err(_) => {
+        match fs.absolute(path) { Ok(value) => { absolute = value; }, Err(_) => {} }
+    } }
+    var normalized = Path.from(absolute).normalize();
+    var result = text.replace(normalized.as_str(), "\\", "/");
+    if (result.starts_with("//?/UNC/")) { result = "//{text.slice(result, 8, result.len()).unwrap()}"; }
+    else if (result.starts_with("//?/")) { result = text.slice(result, 4, result.len()).unwrap(); }
+    match host_style() { Style.Windows => return text.to_ascii_lowercase(result), _ => return result }
+}
+pub struct Overlay { pub String key; pub Vec<byte> data; }
+pub struct Inputs {
+    pub Vec<Overlay> files;
+    pub Inputs new() { return Inputs { files: Vec.new() }; }
+    pub bool contains(&const self, &const str path) {
+        var key = path_key(path); for (f in &const self.files) { if (f.key == key) { return true; } } return false;
+    }
+    pub Result<SourceFile, fs.IoError> load(&const self, &const str path, uint id) {
+        var key = path_key(path);
+        for (f in &const self.files) { if (f.key == key) { return Ok(SourceFile.new(String.from(path), bytes.copy(f.data, 0, f.data.len()), id)); } }
+        return SourceFile.load(path, id);
+    }
+}

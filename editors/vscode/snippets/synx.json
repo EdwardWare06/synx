@@ -1,0 +1,87 @@
+{
+  "main": {
+    "prefix": "main",
+    "description": "Program entry point",
+    "body": ["main() {", "\t${0:print(\"Hello from Synx\");}", "}"]
+  },
+  "function": {
+    "prefix": "fn",
+    "description": "Function with a return type",
+    "body": ["${1:int} ${2:name}(${3:int value}) {", "\t$0", "}"]
+  },
+  "struct": {
+    "prefix": "struct",
+    "description": "Struct declaration",
+    "body": ["struct ${1:Name} {", "\t${2:int} ${3:field};$0", "}"]
+  },
+  "enum": {
+    "prefix": "enum",
+    "description": "Enum declaration",
+    "body": ["enum ${1:Name} {", "\t${2:First},", "\t${3:Second}(${4:int}),$0", "}"]
+  },
+  "trait": {
+    "prefix": "trait",
+    "description": "Trait declaration",
+    "body": ["trait ${1:Name} {", "\t${2:int} ${3:method}(&const self);$0", "}"]
+  },
+  "impl": {
+    "prefix": "impl",
+    "description": "Trait implementation",
+    "body": ["impl ${1:Trait} for ${2:Type} {", "\t$0", "}"]
+  },
+  "if": {
+    "prefix": "if",
+    "description": "if statement",
+    "body": ["if (${1:condition}) {", "\t$0", "}"]
+  },
+  "ifelse": {
+    "prefix": "ifelse",
+    "description": "if statement with else",
+    "body": ["if (${1:condition}) {", "\t$2", "} else {", "\t$0", "}"]
+  },
+  "for": {
+    "prefix": "for",
+    "description": "for loop over a range",
+    "body": ["for (${1:i} in ${2:0}..${3:count}) {", "\t$0", "}"]
+  },
+  "foreach": {
+    "prefix": "foreach",
+    "description": "for loop over a borrowed collection",
+    "body": ["for (${1:item} in &const ${2:items}) {", "\t$0", "}"]
+  },
+  "while": {
+    "prefix": "while",
+    "description": "while loop",
+    "body": ["while (${1:condition}) {", "\t$0", "}"]
+  },
+  "loop": {
+    "prefix": "loop",
+    "description": "Endless loop",
+    "body": ["loop {", "\t$0", "}"]
+  },
+  "match": {
+    "prefix": "match",
+    "description": "match expression",
+    "body": ["match ${1:value} {", "\t${2:pattern} => ${3:result},", "\t_ => ${0:other},", "}"]
+  },
+  "matchoption": {
+    "prefix": "matchopt",
+    "description": "match on an Option",
+    "body": ["match ${1:value} {", "\tSome(${2:item}) => ${3:item},", "\tNone => ${0:fallback},", "}"]
+  },
+  "matchresult": {
+    "prefix": "matchres",
+    "description": "match on a Result",
+    "body": ["match ${1:value} {", "\tOk(${2:item}) => ${3:item},", "\tErr(${4:error}) => ${0:fallback},", "}"]
+  },
+  "import": {
+    "prefix": "import",
+    "description": "import declaration",
+    "body": ["import ${1:std.io};"]
+  },
+  "print": {
+    "prefix": "print",
+    "description": "Print a line",
+    "body": ["print(\"${1:{value\\}}\");"]
+  }
+}

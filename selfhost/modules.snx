@@ -1,3 +1,4 @@
+import source;
 /// Module discovery and import binding. Ported from compiler/src/modules.cpp.
 /// Discovery is depth first. File identity breaks cycles and hard-link aliases.
 /// Binding runs to a fixed point. Namespace overlays belong to one importer.
@@ -68,6 +69,8 @@ pub struct ModuleLoader {
     pub Vec<ast.Ast> trees;
     pub DiagnosticSink prelude_sink;
     pub bool host_failed;
+    pub source.Inputs inputs;
+    pub bool editor;
     Span error_span;
     String root;
     String std_root;
@@ -84,19 +87,20 @@ pub struct ModuleLoader {
         Vec<SourceFile> sources = Vec.new(); sources.push(user); sources.push(prelude);
         Vec<ast.Ast> trees = Vec.new(); trees.push(ast.Ast.new()); trees.push(ast.Ast.new());
         return ModuleLoader { resolver: Resolver.new(), sources: sources, trees: trees, prelude_sink: DiagnosticSink.new(),
-            host_failed: failed, error_span: defs.zero_span(), root: root, std_root: display_path(std_root), names: IndexMap.new(), files: IndexMap.new(), views: Vec.new(), imports: Vec.new() };
+            host_failed: failed, inputs: source.Inputs.new(), editor: false, error_span: defs.zero_span(), root: root, std_root: display_path(std_root), names: IndexMap.new(), files: IndexMap.new(), views: Vec.new(), imports: Vec.new() };
     }
     void filesystem_failure(&self) {
         self.host_failed = true;
         self.resolver.sink.error(self.error_span, "module filesystem operation failed", "SNX0303");
     }
     bool regular(&self, &const str path) {
+        if (self.inputs.contains(path)) { return true; }
         match regular(path) { Ok(value) => return value, Err(_) => { self.filesystem_failure(); return false; } }
     }
     ast.Ast parse(&self, uint file, bool prelude) {
         var sink = if (prelude) { mem.replace(&self.prelude_sink, DiagnosticSink.new()) } else { mem.replace(&self.resolver.sink, DiagnosticSink.new()) };
         var source = self.sources.get(file as usize).unwrap(); var tokens = lexer.tokenize(source, &sink);
-        var parser = Parser.new(source, tokens, sink); parser.parse_module();
+        var parser = Parser.new(source, tokens, sink); parser.editor = self.editor; parser.parse_module();
         if (prelude) { self.prelude_sink = mem.replace(&parser.sink, DiagnosticSink.new()); }
         else { self.resolver.sink = mem.replace(&parser.sink, DiagnosticSink.new()); }
         return mem.replace(&parser.ast, ast.Ast.new());
@@ -126,14 +130,14 @@ pub struct ModuleLoader {
     }
     ModuleId load(&self, &const str name, &const str path, Span span) {
         String canonical = String.new();
-        match canonical_key(path) { Ok(value) => { canonical = value; }, Err(_) => { self.filesystem_failure(); return ModuleId.none(); } }
+        match if (self.inputs.contains(path)) { Ok(source.path_key(path)) } else { canonical_key(path) } { Ok(value) => { canonical = value; }, Err(_) => { self.filesystem_failure(); return ModuleId.none(); } }
         uint found = self.files.get(canonical);
         if (found != NONE) { self.names.put(name, found); return ModuleId { index: found }; }
         for (entry in &const self.files.entries) {
             match fs.same_file(path, entry.name) { Ok(true) => { self.names.put(name, entry.index); return ModuleId { index: entry.index }; }, _ => {} }
         }
         uint file = self.sources.len() as uint;
-        var source = SourceFile.load(path, file);
+        var source = self.inputs.load(path, file);
         match source {
             Err(_) => { self.resolver.sink.error(span, "cannot read module '{name}'", "SNX0303"); return ModuleId.none(); }
             Ok(value) => { self.sources.push(value); self.trees.push(ast.Ast.new()); }
@@ -245,7 +249,7 @@ pub struct ModuleLoader {
     }
     pub bool run(&self) {
         var prelude_tree = self.parse(1, true); var user_tree = self.parse(0, false);
-        if (self.resolver.sink.has_errors() || self.prelude_sink.has_errors()) { return false; }
+        if ((self.resolver.sink.has_errors() && !self.editor) || self.prelude_sink.has_errors()) { return false; }
         self.resolver.register_builtins();
         if (!user_tree.items.is_empty()) { self.error_span = user_tree.items.get(0).unwrap().span; }
         if (self.host_failed) { self.filesystem_failure(); return false; }
@@ -256,7 +260,7 @@ pub struct ModuleLoader {
         self.resolver.program.module_mut(exported).symbols = symbols;
         var main = self.scope(""); self.resolver.program.root_module = main; self.resolver.program.module_mut(main).file = 0;
         String key = String.new();
-        match canonical_key(self.sources.get(0).unwrap().path()) { Ok(value) => { key = value; }, Err(_) => { self.filesystem_failure(); return false; } }
+        match if (self.inputs.contains(self.sources.get(0).unwrap().path())) { Ok(source.path_key(self.sources.get(0).unwrap().path())) } else { canonical_key(self.sources.get(0).unwrap().path()) } { Ok(value) => { key = value; }, Err(_) => { self.filesystem_failure(); return false; } }
         self.files.put(key, main.index);
         self.visit(main, user_tree); if (self.host_failed) { return false; }
         bool progress = true;

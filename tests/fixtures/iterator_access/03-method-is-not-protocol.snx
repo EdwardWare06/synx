@@ -1,0 +1,4 @@
+// fixture: method-is-not-protocol
+// stage: borrow
+// expect: error Iterator
+struct I { int? next(&self) { return None; } } void main() { for (x in I {}) {} }

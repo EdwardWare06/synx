@@ -1,0 +1,5 @@
+// fixture: or-binding-missing
+// stage: borrow
+// expect: error not bound in all alternatives
+enum E { A(int), B(int) }
+int f(E e) { return match e { E.A(x) | E.B(_) => 0 }; }

@@ -1,0 +1,69 @@
+/// Formatter CLI. All inputs use the same syntax-only formatter as the editor.
+/// Replacements use a same-directory atomic host operation after an exact
+/// original-byte check. No output is published for invalid syntax.
+import format;
+import bytes;
+import source.SourceFile;
+import driver_io;
+import std.fs;
+extern "C" {
+    void synx_rt_driver_binary();
+    int synx_rt_driver_read(*byte data, usize capacity, &usize count);
+    int synx_rt_format_write(*const byte path, usize length, *const usize slices);
+}
+int help(int fd) {
+    driver_io.text(fd, "usage: synx fmt [--check | --stdout] <file.snx>...\n       synx fmt --stdin [--check]\n\nFormats files in place. --check reports changes without writing.\n--stdout accepts one file. --stdin reads source through EOF and writes stdout.\nStyle: four spaces, same-line braces, soft 100-column limit.\n");
+    return if (fd == 1) { 0 } else { 2 };
+}
+int apply(&const SourceFile file, bool check, bool stdout) {
+    var result = format.file(file);
+    if (!result.ok) { Vec<SourceFile> sources = Vec.new(); driver_io.write(2, result.sink.render(file, sources)); return 2; }
+    bool changed = !format.equal(file.data(), result.data);
+    if (check) { if (changed) { driver_io.text(2, "would format: {file.path()}\n"); return 1; } return 0; }
+    if (stdout) { return if (driver_io.write(1, result.data)) { 0 } else { 2 }; }
+    if (!changed) { return 0; }
+    match fs.canonicalize(file.path()) {
+        Err(error) => { driver_io.text(2, "cannot resolve {file.path()} (OS error {error.os_code})\n"); return 2; },
+        Ok(path) => {
+            Vec<usize> slices = Vec.new(); slices.push(file.data().as_ptr() as usize); slices.push(file.data().len()); slices.push(result.data.as_ptr() as usize); slices.push(result.data.len());
+            int code = unsafe { synx_rt_format_write(path.as_str().as_ptr(), path.len(), slices.as_ptr()) };
+            if (code != 0) { driver_io.text(2, "cannot replace {file.path()} (OS error {code}); source was left unchanged\n"); return 2; }
+        }
+    }
+    driver_io.text(2, "formatted: {file.path()}\n"); return 0;
+}
+pub int run(&const Vec<String> args) {
+    unsafe { synx_rt_driver_binary(); }
+    bool check = false; bool stdout = false; bool stdin = false; bool paths = false;
+    Vec<String> files = Vec.new();
+    for (i in 2..args.len()) {
+        var arg = args.get(i).unwrap().as_str();
+        if (!paths && arg == "--") { paths = true; continue; }
+        if (!paths && (arg == "--help" || arg == "-h")) { return help(1); }
+        if (!paths && arg == "--check") { check = true; continue; }
+        if (!paths && arg == "--stdout") { stdout = true; continue; }
+        if (!paths && arg == "--stdin") { stdin = true; continue; }
+        if (!paths && arg.len() > 0 && unsafe { *arg.as_ptr() } == 45) { driver_io.text(2, "unknown fmt option: {arg}\n"); return help(2); }
+        files.push(String.from(arg));
+    }
+    if ((check && stdout) || (stdin && !files.is_empty()) || (!stdin && files.is_empty()) || (stdout && files.len() != 1 && !stdin)) { return help(2); }
+    if (stdin) {
+        Vec<byte> data = Vec.new(); Vec<byte> buffer = Vec.new(); for (i in 0..8192) { buffer.push(0); }
+        loop {
+            usize count = 0; int code = unsafe { synx_rt_driver_read(buffer.as_mut_ptr(), buffer.len(), &count) };
+            if (code != 0) { driver_io.text(2, "cannot read formatter input\n"); return 2; }
+            if (count == 0) { break; }
+            if (data.len() + count > 67108864) { driver_io.text(2, "formatter input exceeds 64 MiB\n"); return 2; }
+            for (i in 0..count) { data.push(bytes.at(buffer, i)); }
+        }
+        var file = SourceFile.new(String.from("<stdin>"), data, 0); return apply(file, check, true);
+    }
+    int status = 0;
+    for (path in &const files) {
+        match SourceFile.load(path.as_str(), 0) {
+            Err(error) => { driver_io.text(2, "cannot read {path} (OS error {error.os_code})\n"); status = 2; },
+            Ok(file) => { int code = apply(file, check, stdout); if (code > status) { status = code; } }
+        }
+    }
+    return status;
+}

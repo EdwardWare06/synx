@@ -1,0 +1,4 @@
+// fixture: iterator-retained-last
+// stage: borrow
+// expect: error borrowed
+import std.iter; void main() { var a = [1,2]; var it = iter.iter_mut(&a[..]); Option<&int> last = None; for (value in &it) { last = Some(value); } *last.unwrap() = 3; }

@@ -1,0 +1,4 @@
+// fixture: shared-filter-needed
+// stage: borrow
+// expect: error type mismatch
+import std.iter; void main() { var filtered = iter.filter(0..3, |&const int n| { return *n > 1; }); }

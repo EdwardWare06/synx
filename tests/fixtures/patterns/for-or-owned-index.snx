@@ -1,0 +1,5 @@
+// fixture: for-or-owned-index
+// stage: borrow
+// expect: error iterating an array by value moves its elements
+enum E { A(String), B(String) }
+main() { E[2] a = [E.A(String.from("a")), E.B(String.from("b"))]; for (E.A(x) | E.B(x) in a) { print(x); } }

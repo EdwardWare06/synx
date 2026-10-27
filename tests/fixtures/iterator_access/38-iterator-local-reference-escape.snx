@@ -1,0 +1,4 @@
+// fixture: iterator-local-reference-escape
+// stage: borrow
+// expect: error SNX0502
+import std.iter; Option<&const int> bad() { var a = [1,2]; var source = iter.iter(&const a[..]); for (value in &source) { return Some(value); } return None; } void main() {}

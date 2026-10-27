@@ -1,0 +1,4 @@
+// fixture: iterator-item-loan
+// stage: borrow
+// expect: error borrowed
+import std.iter; void main() { var a = [1,2]; var it = iter.iter_mut(&a[..]); var first = it.next().unwrap(); var second = it.next().unwrap(); *first = 3; *second = 4; }

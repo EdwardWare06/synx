@@ -1,0 +1,7 @@
+// fixture: into-inner
+// stage: borrow
+// expect: error SNX0411
+trait Read { int read(&const self); }
+struct Number { int value; }
+impl Read for Number { int read(&const self) { return self.value; } }
+main() { Box<dyn Read> p = Box.new(Number { value: 1 }); p.into_inner(); }

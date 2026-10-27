@@ -18,7 +18,7 @@
 #include <direct.h>
 #include <wchar.h>
 #include <windows.h>
-#if defined(SYNX_SHARED_RUNTIME)
+#if (defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME))
 #include <shellapi.h>
 #endif
 #define SYNX_WRITE(fd, p, n) _write(fd, p, (unsigned)(n))
@@ -481,12 +481,12 @@ int synx_rt_current_dir(uint8_t* buffer, uint64_t cap, uint64_t* count) {
 
 /* ---------- entry ---------- */
 
-#if !defined(SYNX_SHARED_RUNTIME)
+#if !(defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME))
 int synx_entry(void);
 #endif
 
 #if defined(_WIN32)
-#if defined(SYNX_SHARED_RUNTIME)
+#if (defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME))
 extern void (*synx_link_thread_entry)(void*);
 int synx_rt_link_start_v1(int (*entry)(void), void (*thread_entry)(void*)) {
   int argc = 0;
@@ -505,7 +505,7 @@ int wmain(int argc, wchar_t** argv) {
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, synx_argv[i], n, NULL, NULL);
   }
 #else
-#if defined(SYNX_SHARED_RUNTIME)
+#if (defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME))
 extern void (*synx_link_thread_entry)(void*);
 int synx_rt_link_start_v1(int argc, char** argv, int (*entry)(void), void (*thread_entry)(void*)) {
   synx_link_thread_entry = thread_entry;
@@ -516,16 +516,21 @@ int main(int argc, char** argv) {
 #endif
   synx_argc = argc;
   int code =
-#if defined(SYNX_SHARED_RUNTIME)
+#if (defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME))
       entry();
 #else
       synx_entry();
 #endif
   fflush(stdout);
-#if defined(SYNX_SHARED_RUNTIME) && defined(_WIN32)
+#if (defined(SYNX_SHARED_RUNTIME) || defined(SYNX_STANDALONE_RUNTIME)) && defined(_WIN32)
   /* Preserve process arguments until process exit; callbacks may still read them. */
   LocalFree(argv);
   exit(code);
-#endif
+#else
   return code;
+#endif
 }
+
+#if defined(SYNX_STANDALONE_RUNTIME)
+#include "exports_rt.inc"
+#endif

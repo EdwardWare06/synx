@@ -1,0 +1,5 @@
+// fixture: non-object-safe-static
+// stage: borrow
+// expect: error SNX0410
+trait Bad { int make(); }
+main() { Box<dyn Bad>? x = None; }

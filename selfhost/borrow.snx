@@ -377,7 +377,7 @@ pub Vec<Effects> infer_write_effects(&Checker ck, &const Module m) {
                     if (sk != 0) { continue; }
                     var r = &const statement.rvalue; uint rk = ir.rvalue_index(r.kind);
                     uint value = 0;
-                    if (rk == 1) { value = pool.join(state.get(r.place.local), pool.single(r.place.local)); }
+                    if (rk == 1 || rk == 12) { value = pool.join(state.get(r.place.local), pool.single(r.place.local)); }
                     else if (rk == 7 || rk == 6) {}
                     else {
                         value = pool.join(operand_origins(&*ck, fn_ref, &state, &const r.a), operand_origins(&*ck, fn_ref, &state, &const r.b));
@@ -566,9 +566,10 @@ pub struct FunctionCheck {
         uint k = ir.rvalue_index(r.kind);
         if (k == 0 || k == 3 || k == 4 || k == 11 || k == 8 || k == 9 || k == 10) { self.operand_accesses(&const r.a, &*out); }
         else if (k == 2) { self.operand_accesses(&const r.a, &*out); self.operand_accesses(&const r.b, &*out); }
-        else if (k == 1) {
+        else if (k == 1 || k == 12) {
             out.push(Access { kind: if (r.is_const) { AccessKind.BorrowShared } else { AccessKind.BorrowMut }, place: r.place.copy() });
             self.index_reads(&const r.place, &*out);
+            if (k == 12) { self.operand_accesses(&const r.a, &*out); self.operand_accesses(&const r.b, &*out); }
         } else if (k == 5) {
             for (e in &const r.elems) { self.operand_accesses(e, &*out); }
             for (e in &const r.captures) { self.operand_accesses(e, &*out); }
@@ -596,6 +597,7 @@ pub struct FunctionCheck {
             TerminatorKind.Switch => { self.operand_accesses(&const t.discr, &out); }
             TerminatorKind.Assert => { self.operand_accesses(&const t.cond, &out); }
             TerminatorKind.Call => {
+                if (t.loan_anchor != NONE) { self.operand_accesses(&const Operand.copy_of(Place.of(t.loan_anchor)), &out); }
                 if (ir.callee_index(t.callee.kind) == 2) { self.operand_accesses(&const t.callee.fn_operand, &out); }
                 for (a in &const t.args) { self.operand_accesses(a, &out); }
                 if (!t.diverges && !t.dest.is_none()) { out.push(Access { kind: AccessKind.Write, place: t.dest.copy() }); self.index_reads(&const t.dest, &out); }
@@ -1096,9 +1098,10 @@ pub struct FunctionCheck {
         for (b in 0..self.f.blocks.len()) {
             for (s in &const self.f.blocks.get(b).unwrap().stmts) {
                 match s.kind { StatementKind.Assign => {
-                    match s.rvalue.kind { RvalueKind.Ref => {
+                    uint rk = ir.rvalue_index(s.rvalue.kind);
+                    if (rk == 1 || rk == 12) {
                         self.loan_list.push(Loan { place: s.rvalue.place.copy(), is_mut: !s.rvalue.is_const, span: s.span, ref_local: s.place.local, external: false });
-                    }, _ => {} }
+                    }
                 }, _ => {} }
             }
         }
@@ -1245,7 +1248,7 @@ pub struct FunctionCheck {
         }
         Vec<uint> incoming = Vec.new();
         var r = &const s.rvalue; uint rk = ir.rvalue_index(r.kind);
-        if (rk == 1) {
+        if (rk == 1 || rk == 12) {
             uint id = self.loan_index_for(s);
             if (id != NONE) { set_add(&incoming, id); }
             if (starts_with_deref(&const r.place) || self.place_has_ref(&*ck, &const r.place)) {
@@ -1367,6 +1370,7 @@ pub struct FunctionCheck {
             }
             if (ir.callee_index(t.callee.kind) == 2) { set_union(&incoming, &const self.operand_loans(&const t.callee.fn_operand, &*state)); }
         }
+        if (t.loan_anchor != NONE && self.place_has_ref(&*ck, &const t.dest)) { set_union(&incoming, state.get(t.loan_anchor as usize).unwrap()); }
         if (t.dest.is_local()) { *state.get_mut(t.dest.local as usize).unwrap() = incoming; }
         else if (starts_with_deref(&const t.dest) && !self.deref_is_raw(&*ck, &const t.dest) && self.place_has_ref(&*ck, &const t.dest)) {
             var receiver_loans = set_copy(state.get(t.dest.local as usize).unwrap());
@@ -1392,6 +1396,7 @@ pub struct FunctionCheck {
                 uint id = *ids.get(n).unwrap(); uint carrier = *carriers.get(n).unwrap();
                 var loan = self.loan_list.get(id as usize).unwrap();
                 if (!overlaps(&const loan.place, &const a.place)) { continue; }
+                if (self.f.locals.get(loan.place.local as usize).unwrap().lifetime_guard && ak != A_WRITE && ak != A_MUT) { continue; }
                 if (ak == A_DEAD && a.place.is_local() && starts_with_deref(&const loan.place)) { continue; }
                 bool ends_owner = !loan.external && a.place.is_local() && a.place.local == loan.place.local && (ak == A_MOVE || ak == A_DROP || ak == A_DEAD);
                 if (!ends_owner && (a.place.local == carrier || set_has(state.get(a.place.local as usize).unwrap(), id))) { continue; }
@@ -1421,7 +1426,7 @@ pub struct FunctionCheck {
         if (local != 0) { set_union(&escaping, self.boundary_stores.get(local as usize).unwrap()); }
         for (id in &const escaping) {
             var loan = self.loan_list.get(*id as usize).unwrap();
-            if (loan.external) { continue; }
+            if (loan.external || self.f.locals.get(loan.place.local as usize).unwrap().lifetime_guard) { continue; }
             if (starts_with_deref(&const loan.place)) {
                 uint boundary = if (local != 0) { *self.boundary_origins.get(local as usize).unwrap() } else { NONE };
                 if (local != 0 && boundary != NONE && set_has(self.boundary_stores.get(local as usize).unwrap(), *id)) {

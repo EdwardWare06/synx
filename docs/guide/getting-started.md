@@ -25,19 +25,18 @@ Hello, world!
 exits with status 0. `print` writes one line to standard output. It is
 available in every file without an import.
 
-`synx run` builds the program and then runs it. `synx build` only builds it:
+`synx run` builds in a private cache and leaves the source folder clear.
+It reuses the executable when the program has not changed. Use `synx build`
+to write an executable for distribution:
 
 ```text
 > synx build hello.snx
 Built hello.exe
 ```
 
-The build writes two files next to the source file:
-
-| File | Contents |
-|------|----------|
-| `hello.exe` (Windows) or `hello` (Linux) | The program. |
-| `synx_rt.dll` (Windows), `libsynx_rt.so` (Linux), or `libsynx_rt.dylib` (macOS) | The runtime library. The program needs it at startup. |
+The build writes `hello.exe` on Windows or `hello` on Linux and macOS. The
+executable includes the Synx runtime. Copy this one file to another computer
+with the same supported OS and architecture.
 
 Use `-o` to choose another output path. The folder must exist:
 

@@ -1,0 +1,4 @@
+// fixture: iterator-owned-reference-escape
+// stage: borrow
+// expect: error does not live
+struct I { int value; } impl Iterator<&const int> for I { (&const int)? next(&self) { return Some(&const self.value); } } (&const int)? first() { for (value in I { value: 1 }) { return Some(value); } return None; } void main() {}

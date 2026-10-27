@@ -1,3 +1,4 @@
+import source;
 /// Owns one compilation. Sources and ASTs remain alive through all passes.
 /// Stage ordinals: declarations=0, signatures=1, check=2, lower=3, borrow=4,
 /// async=5. Each pass runs once and only after the preceding pass succeeds.
@@ -22,16 +23,21 @@ pub struct Compilation {
     pub bool ok;
     pub uint stage;
     pub Result<Compilation, fs.IoError> load(&const str input, Vec<byte> prelude, &const str std_fallback, uint stage, bool require_main) {
-        var user = SourceFile.load(input, 0)?;
+        return Compilation.load_inputs(input, prelude, std_fallback, stage, require_main, source.Inputs.new(), false);
+    }
+    /// Editor mode retains partial declaration/check results. Lowering and borrow
+    /// checking still require a clean frontend; ordinary compilation is unchanged.
+    pub Result<Compilation, fs.IoError> load_inputs(&const str input, Vec<byte> prelude, &const str std_fallback, uint stage, bool require_main, source.Inputs inputs, bool editor) {
+        var user = inputs.load(input, 0)?;
         var prelude_file = SourceFile.new(String.from("<prelude>"), prelude, 1);
         bool std_failed = false; String std_root = String.new();
         match standard_library(std_fallback) { Ok(path) => { std_root = path; }, Err(_) => { std_failed = true; } }
-        var loader = ModuleLoader.new(user, prelude_file, std_root); if (std_failed) { loader.host_failed = true; }
+        var loader = ModuleLoader.new(user, prelude_file, std_root); loader.inputs = inputs; loader.editor = editor; if (std_failed) { loader.host_failed = true; }
         bool ok = loader.run();
         if (loader.prelude_sink.has_errors()) { ok = false; }
-        if (ok && stage >= 1) { ok = loader.resolve_signatures(); }
+        if ((ok || editor) && stage >= 1) { ok = loader.resolve_signatures(); }
         var checker = Checker.new(mem.replace(&loader.resolver, Resolver.new()));
-        if (ok && stage >= 2) { checker.check_program(&loader.trees); ok = !checker.r.sink.has_errors(); }
+        if ((ok || editor) && stage >= 2) { checker.check_program(&loader.trees); ok = !checker.r.sink.has_errors(); }
         if (loader.prelude_sink.has_errors()) { ok = false; }
         var lowerer = Lowerer.new(checker);
         if (ok && stage >= 3) { ok = lowerer.lower_program(&loader.trees, require_main); }
@@ -44,6 +50,9 @@ pub struct Compilation {
     }
     pub Vec<byte> diagnostics(&const self) {
         return self.lowerer.ck.r.sink.render(self.sources.get(0).unwrap(), self.sources);
+    }
+    pub Vec<byte> diagnostics_json(&const self) {
+        return self.lowerer.ck.r.sink.render_json(self.sources.get(0).unwrap(), self.sources);
     }
     pub Vec<byte> prelude_diagnostics(&const self) { return self.prelude_sink.render(self.sources.get(1).unwrap(), self.sources); }
 }

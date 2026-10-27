@@ -1,0 +1,5 @@
+// fixture: recursive-reference-empty
+// stage: borrow
+// expect: error SNX0404
+struct Chain { &const Chain next; }
+int f(&const Chain p) { return match p { _ if false => 0 }; }

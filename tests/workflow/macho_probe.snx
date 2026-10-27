@@ -1,0 +1,15 @@
+/// Host-neutral signer probe. The Python harness checks every CodeDirectory hash.
+import std.env;
+import std.fs;
+import link.standalone_macho;
+import link.linker;
+int main() {
+    var args = env.args();
+    if (args.len() != 3) { return 2; }
+    var data = match fs.read(args.get(1).unwrap()) { Ok(value) => value, Err(_) => return 3 };
+    var prefix = match standalone_macho.strip(data) { Ok(value) => value, Err(_) => return 4 };
+    // Model appended native payload bytes across several code-signing pages.
+    for (i in 0..8201) { prefix.push((i % 251) as byte); }
+    var signed = match standalone_macho.sign(prefix) { Ok(value) => value, Err(_) => return 5 };
+    match linker.publish(args.get(2).unwrap(), signed) { Ok(_) => return 0, Err(_) => return 6 }
+}

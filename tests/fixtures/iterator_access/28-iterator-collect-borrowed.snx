@@ -1,0 +1,4 @@
+// fixture: iterator-collect-borrowed
+// stage: borrow
+// expect: error iterator item lifetime
+import std.iter; void main() { var a = [1,2]; var saved = iter.collect(iter.iter(&const a[..])); var n = *saved[0]; }

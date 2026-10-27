@@ -1,0 +1,5 @@
+// fixture: mut-shared-owner
+// stage: borrow
+// expect: error writable
+trait Change { void change(&self); }
+void f(&const Box<dyn Change> p) { p.change(); }

@@ -38,9 +38,12 @@ ulong address(&const Vec<Object> inputs, &const Vec<Vec<Placement>> placements,
 }
 /// Resolves entry and all selected symbols before allocation of the image.
 /// Returns complete relocated segments or Failure. No file is written.
-pub Result<Image, Failure> build(&const Vec<Object> inputs, &const str entry, ulong base) {
+pub Result<Image, Failure> build(&const Vec<Object> inputs, &const str entry, ulong base) { return build_aligned(inputs, entry, base, 4096); }
+/// Standalone payloads use 64 KiB boundaries for host pages up to that size.
+pub Result<Image, Failure> build_aligned(&const Vec<Object> inputs, &const str entry, ulong base, ulong page) {
+    if (page < 4096 || page > 65536 || (page & (page - 1)) != 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
     var resolved = resolve.run(inputs, entry)?;
-    if (base % 4096 != 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    if (base % page != 0) { return Err(model.fail(Code.Invalid, 0, 0)); }
     Vec<Segment> segments = Vec.new();
     segments.push(Segment { kind: SectionKind.Text, data: Vec.new(), size: 0, rva: 0 });
     segments.push(Segment { kind: SectionKind.ReadOnly, data: Vec.new(), size: 0, rva: 0 });
@@ -70,10 +73,10 @@ pub Result<Image, Failure> build(&const Vec<Object> inputs, &const str entry, ul
         }
         placements.push(row);
     }
-    ulong cursor = 4096;
+    ulong cursor = page;
     for (segment in &segments) {
         segment.rva = cursor;
-        ulong extent = buffer.align(if (segment.size == 0) { 1 } else { segment.size }, 4096)?;
+        ulong extent = buffer.align(if (segment.size == 0) { 1 } else { segment.size }, page)?;
         if (extent > buffer.LIMIT - cursor) { return Err(model.fail(Code.Range, 0, 0)); }
         cursor += extent;
     }
