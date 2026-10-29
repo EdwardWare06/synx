@@ -7,6 +7,7 @@ import driver_paths;
 import build;
 import run_cache;
 import format_driver;
+import myelin.commands;
 import lsp.server;
 import compile.Compilation;
 import prelude_source;
@@ -20,14 +21,20 @@ import ast_print;
 import ir_print;
 import module_dump;
 import bytes;
+import lsp.json.Json;
+
+void json_error(&const str message) {
+    var j = Json.new(); uint root = j.object(); j.put(root, "version", j.number(1)); j.put(root, "ok", j.boolean(false));
+    j.put(root, "error", j.string(message)); j.put(root, "diagnostics", j.array()); driver_io.cstring(1, j.encode(root)); driver_io.text(1, "\n");
+}
 
 void usage() {
-    driver_io.text(1, "usage: synx <command> [options]\ncommands:\n  version            print the compiler version and host platform\n  about              describe this build of the compiler\n  lex <file.snx>     print the token stream of a file\n  parse <file.snx>   print the syntax tree (--strict adds spans and every field)\n  modules <file.snx> print declarations and bound module namespaces (--signatures, --check, --lower, --borrow, --async stop after that stage; --machine adds layouts and registers)\n  check <file.snx>   check names, types, and ownership without building (--json writes the diagnostics as JSON)\n  fmt <file.snx>    format source files (--check, --stdout, --stdin)\n  lsp                start the language server over standard input/output\n  ir <file.snx>      print the Dendrite IR of a program\n  build <file.snx>   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, --standalone, --shared-runtime, -v)\n  run <file.snx>     build privately and run ([options] -- program arguments)\n");
+    driver_io.text(1, "usage: synx <command> [options]\ncommands:\n  version            print the compiler version and host platform\n  about              describe this build of the compiler\n  lex <file.snx>     print the token stream of a file\n  parse <file.snx>   print the syntax tree (--strict adds spans and every field)\n  modules <file.snx> print declarations and bound module namespaces (--signatures, --check, --lower, --borrow, --async stop after that stage; --machine adds layouts and registers)\n  check <file.snx>   check names, types, and ownership without building (--json writes the diagnostics as JSON)\n  fmt <file.snx>    format source files (--check, --stdout, --stdin)\n  lsp                start the language server over standard input/output\n  ir <file.snx>      print the Dendrite IR of a program\n  build [file.snx]   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, --standalone, --shared-runtime, -v)\n  run [file.snx]     build privately and run ([options] -- program arguments)\n  new <directory>   create a project (--lib creates a library)\n  add <alias>       add a dependency (--path or --git; synx add --help)\n  fetch              resolve and fetch dependencies (--locked, --offline)\n\nBuild, run, and check can use the nearest synx.toml project.\n");
 }
 int about() {
     var version = driver_io.VERSION; var host = driver_io.host_name();
     driver_io.text(1, "  o--o--o   Synx {version}\n            Created by Edward Ware\n\n  This build\n    Target      {host} / x86-64\n");
-    driver_io.text(1, "    Compiler    Synx, self-hosted\n    Library     Synx\n    Runtime     C platform adapters\n\n  Origins and direction\n    Started with C and C++.\n    The compiler is written in Synx and builds itself.\n    C remains for startup, allocation, I/O, number conversion/formatting,\n    threads, synchronization, clocks, and host services.\n\n  Toolchain\n    Front end   lexer, parser, modules, and type checking\n    Dendrite    typed IR, borrow and move checks\n    Axon        x86-64 code generation and register allocation\n    Objects     ELF / COFF / Mach-O\n    Linker      built-in (--linker=system uses the host toolchain)\n\n  Planned\n    Myelin package manager; ARM64 targets\n\n  This is not an Arasaka product choom\n");
+    driver_io.text(1, "    Compiler    Synx, self-hosted\n    Library     Synx\n    Runtime     C platform adapters\n\n  Origins and direction\n    Started with C and C++.\n    The compiler is written in Synx and builds itself.\n    C remains for startup, allocation, I/O, number conversion/formatting,\n    threads, synchronization, clocks, and host services.\n\n  Toolchain\n    Front end   lexer, parser, modules, and type checking\n    Dendrite    typed IR, borrow and move checks\n    Axon        x86-64 code generation and register allocation\n    Objects     ELF / COFF / Mach-O\n    Linker      built-in (--linker=system uses the host toolchain)\n    Packages    Myelin\n\n  Planned\n    ARM64 targets\n\n  This is not an Arasaka product choom\n");
     return 0;
 }
 Vec<byte> token_text(&const token.Token item) {
@@ -64,6 +71,7 @@ int build_file(&const Vec<String> args, bool run) {
     match driver_options.parse(args, driver_io.host_target()) {
         Err(message) => { driver_io.text(2, message); return 1; },
         Ok(options) => {
+            match commands.build_options(&options, run) { Ok(_) => {}, Err(message) => { driver_io.text(2, "Myelin: {message}"); return 1; } }
             if (run) { return run_cache.run(options); }
             var result = build.program(options); if (!result.ok) { return 1; }
             driver_io.text(1, "Built {result.executable}\n"); return 0;
@@ -112,10 +120,15 @@ pub int run(&const Vec<String> args) {
     if (command == "version" || command == "--version") { var version = driver_io.VERSION; var host = driver_io.host_name(); driver_io.text(1, "Synx {version} ({host})\n"); return 0; }
     if (command == "about") { return about(); }
     if (command == "fmt") { return format_driver.run(args); }
+    if (command == "new" || command == "add" || command == "fetch") { return commands.run(args); }
     if (command == "build") { return build_file(args, false); } if (command == "run") { return build_file(args, true); }
     if (command == "lsp") { if (args.len() > 2 && *args.get(2).unwrap() == String.from("--probe")) { driver_io.text(1, "synx-lsp-1\n"); return 0; } return server.run(); }
     bool known = command == "lex" || command == "parse" || command == "modules" || command == "check" || command == "ir";
     if (!known) { driver_io.text(2, "unknown command: {command}\n"); usage(); return 1; }
+    if (command == "check" && (args.len() == 2 || (args.len() == 3 && args.get(2).unwrap().as_str() == "--json"))) {
+        var entry = match commands.check_entry() { Ok(v) => v, Err(e) => { if (args.len() == 3) { json_error(e); } else { driver_io.text(2, e); } return 1; } };
+        return inspect(command, entry, if (args.len() == 3) { "--json" } else { "" });
+    }
     if (args.len() < 3) { driver_io.text(2, "{command} needs a file argument\n"); return 1; }
     var input = args.get(2).unwrap().as_str(); var option = if (args.len() > 3) { args.get(3).unwrap().as_str() } else { "" };
     if (command == "lex" || command == "parse") {

@@ -29,6 +29,9 @@ add_test(NAME fmt COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/fmt
          ${SYNX_COMPILER} $<TARGET_FILE:synx_rt_host>)
 set_tests_properties(fmt PROPERTIES TIMEOUT 1800)
 
+add_test(NAME myelin COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/myelin/test_myelin.py ${SYNX_COMPILER})
+set_tests_properties(myelin PROPERTIES TIMEOUT 1800)
+
 # Fixed point: stage 2 builds stage 3, and the two compiler objects must be
 # byte-identical. Then stage 3 builds and runs the workbench example.
 add_test(NAME bootstrap COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/bootstrap/fixed_point.py

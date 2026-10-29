@@ -12,9 +12,11 @@ pub struct BuildOptions {
     pub bool standalone;
     pub bool no_cache;
     pub bool cache_record;
+    pub bool locked;
+    pub bool offline;
     pub Vec<String> program_args;
     pub BuildOptions new(Target target) {
-        return BuildOptions { input: String.new(), output: String.new(), keep_object: false, verbose: false, target: target, linker: -1, standalone: true, no_cache: false, cache_record: false, program_args: Vec.new() };
+        return BuildOptions { input: String.new(), output: String.new(), keep_object: false, verbose: false, target: target, linker: -1, standalone: true, no_cache: false, cache_record: false, locked: false, offline: false, program_args: Vec.new() };
     }
 }
 pub Result<BuildOptions, String> parse(&const Vec<String> args, Target target) {
@@ -28,6 +30,8 @@ pub Result<BuildOptions, String> parse(&const Vec<String> args, Target target) {
         if (*argument == String.from("-o") && i + 1 < args.len()) {
             i += 1; options.output = String.from(args.get(i).unwrap());
         } else if (*argument == String.from("--keep-obj")) { options.keep_object = true; }
+        else if (*argument == String.from("--locked")) { options.locked = true; }
+        else if (*argument == String.from("--offline")) { options.offline = true; }
         else if (*argument == String.from("--no-regalloc")) { options.target.register_allocation = false; }
         else if (*argument == String.from("--standalone")) { options.standalone = true; }
         else if (*argument == String.from("--shared-runtime")) { options.standalone = false; }
@@ -37,9 +41,8 @@ pub Result<BuildOptions, String> parse(&const Vec<String> args, Target target) {
         else if (*argument == String.from("--linker=system")) { options.linker = 1; }
         else if (*argument == String.from("-v") || *argument == String.from("--verbose")) { options.verbose = true; }
         else if (argument.starts_with("-")) { return Err("unknown option: {argument}\n"); }
-        else { options.input = String.from(argument); }
+        else { if (!options.input.is_empty()) { return Err(String.from("build accepts one source file\n")); } options.input = String.from(argument); }
         i += 1;
     }
-    if (options.input.is_empty()) { return Err(String.from("build needs a file argument\n")); }
     return Ok(options);
 }

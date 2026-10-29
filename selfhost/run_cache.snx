@@ -51,7 +51,7 @@ Result<String, String> root() {
 struct Snapshot { String key; String sources; bool valid; }
 Result<Snapshot, String> snapshot(&const BuildOptions options) {
     var loaded = match Compilation.load(options.input, prelude_source.source(), "", 0, false) { Ok(value) => value, Err(_) => return Err("cannot read file: {options.input}\n") };
-    var sources = driver_fingerprint.sources(loaded.sources); Vec<byte> manifest = Vec.new();
+    var sources = loaded.source_hash(); Vec<byte> manifest = Vec.new();
     driver_fingerprint.text(&manifest, "Synx run cache v1"); driver_fingerprint.text(&manifest, sources);
     var exe = match env.exe_path() { Ok(value) => value, Err(_) => return Err(String.from("cannot locate the compiler\n")) };
     driver_fingerprint.text(&manifest, exe);

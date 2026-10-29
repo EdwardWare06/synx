@@ -19,6 +19,7 @@ import std.path.{Path, Style, host_style};
 import std.text;
 import std.env;
 import std.mem;
+import myelin.project;
 
 pub struct ImportSpec { pub Span span; pub ast.Path path; pub Vec<ast.PathSegment> names; pub bool is_pub; }
 pub struct Import { pub ModuleId from; pub ModuleId target; pub ImportSpec spec; pub usize consumed; pub bool done; }
@@ -71,6 +72,8 @@ pub struct ModuleLoader {
     pub bool host_failed;
     pub source.Inputs inputs;
     pub bool editor;
+    pub project.Graph packages;
+    Vec<uint> file_packages;
     Span error_span;
     String root;
     String std_root;
@@ -87,7 +90,7 @@ pub struct ModuleLoader {
         Vec<SourceFile> sources = Vec.new(); sources.push(user); sources.push(prelude);
         Vec<ast.Ast> trees = Vec.new(); trees.push(ast.Ast.new()); trees.push(ast.Ast.new());
         return ModuleLoader { resolver: Resolver.new(), sources: sources, trees: trees, prelude_sink: DiagnosticSink.new(),
-            host_failed: failed, inputs: source.Inputs.new(), editor: false, error_span: defs.zero_span(), root: root, std_root: display_path(std_root), names: IndexMap.new(), files: IndexMap.new(), views: Vec.new(), imports: Vec.new() };
+            host_failed: failed, inputs: source.Inputs.new(), editor: false, packages: project.Graph.new(), file_packages: Vec.new(), error_span: defs.zero_span(), root: root, std_root: display_path(std_root), names: IndexMap.new(), files: IndexMap.new(), views: Vec.new(), imports: Vec.new() };
     }
     void filesystem_failure(&self) {
         self.host_failed = true;
@@ -128,9 +131,13 @@ pub struct ModuleLoader {
         var id = ModuleId { index: self.resolver.program.modules.len() as uint }; self.resolver.program.modules.push(d);
         self.views.push(View { owner: owner, name: String.from(name), module: id }); return id;
     }
-    ModuleId load(&self, &const str name, &const str path, Span span) {
+    ModuleId load(&self, &const str name, &const str path, Span span, uint package) {
         String canonical = String.new();
         match if (self.inputs.contains(path)) { Ok(source.path_key(path)) } else { canonical_key(path) } { Ok(value) => { canonical = value; }, Err(_) => { self.filesystem_failure(); return ModuleId.none(); } }
+        if (package != NONE) {
+            var boundary = self.packages.packages.get(package as usize).unwrap().boundary.as_str();
+            if (boundary.len() > 0 && !text.starts_with(source.path_key(canonical), "{source.path_key(boundary)}/")) { self.resolver.sink.error(span, "package source escapes its Git checkout", "SNX0305"); return ModuleId.none(); }
+        }
         uint found = self.files.get(canonical);
         if (found != NONE) { self.names.put(name, found); return ModuleId { index: found }; }
         for (entry in &const self.files.entries) {
@@ -142,6 +149,7 @@ pub struct ModuleLoader {
             Err(_) => { self.resolver.sink.error(span, "cannot read module '{name}'", "SNX0303"); return ModuleId.none(); }
             Ok(value) => { self.sources.push(value); self.trees.push(ast.Ast.new()); }
         }
+        self.file_packages.push(package);
         var tree = self.parse(file, false); var module = self.scope(name); self.resolver.program.module_mut(module).file = file;
         self.files.put(canonical, module.index); self.visit(module, tree); return module;
     }
@@ -153,20 +161,28 @@ pub struct ModuleLoader {
     }
     void discover(&self, ModuleId module, &const ImportSpec request) {
         ModuleId target = ModuleId.none(); usize consumed = 0; usize n = request.path.segments.len();
+        uint owner = NONE; uint source_file = self.resolver.program.module(module).file;
+        if (source_file as usize < self.file_packages.len()) { owner = *self.file_packages.get(source_file as usize).unwrap(); }
+        var alias = defs.name(request.path.segments.get(0).unwrap().name);
+        uint dependency = self.packages.dependency(owner, alias);
         while (n > 0) {
             var name = prefix(request.path, n);
             if (name == String.from("std.prelude")) { target = self.scope(name); consumed = n; break; }
             bool standard = bytes.equals(request.path.segments.get(0).unwrap().name, "std");
             if (standard && self.std_root.is_empty()) { self.resolver.sink.error(request.span, "standard library not found", "SNX0303"); break; }
-            var relative = String.new(); usize first = if (standard) { 1 } else { 0 };
+            uint package = if (standard) { NONE } else if (dependency != NONE) { dependency } else { owner };
+            var relative = String.new(); usize first = if (standard || dependency != NONE) { 1 } else { 0 };
             for (i in first..n) { if (!relative.is_empty()) { relative.push('/'); } var part = defs.name(request.path.segments.get(i).unwrap().name); relative.push_str(part); }
-            if (relative.is_empty()) { n -= 1; continue; }
-            var base = joined(if (standard) { self.std_root.as_str() } else { self.root.as_str() }, relative);
-            var file = "{base}.snx"; bool is_file = self.regular(file); if (self.host_failed) { return; }
+            var package_root = if (package != NONE) { self.packages.root(package) } else { String.from(self.root) };
+            if (relative.is_empty() && dependency == NONE) { n -= 1; continue; }
+            var base = joined(if (standard) { self.std_root.as_str() } else { package_root.as_str() }, relative);
+            var file = if (dependency != NONE && n == 1) { self.packages.entry(dependency, true) } else { "{base}.snx" }; bool is_file = self.regular(file); if (self.host_failed) { return; }
             if (!is_file) { file = joined(base, "mod.snx"); }
             is_file = self.regular(file); if (self.host_failed) { return; }
             if (!is_file) { n -= 1; continue; }
-            target = self.load(name, file, request.span); consumed = n; break;
+            // Package identity is internal. Importer views keep source spellings.
+            var scoped = if (package == NONE) { String.from(name) } else { "<package:{package}>.{name}" };
+            target = self.load(scoped, file, request.span, package); consumed = n; break;
         }
         if (self.host_failed) { return; }
         if (target.index == NONE) { var name = prefix(request.path, request.path.segments.len()); self.resolver.sink.error(request.span, "cannot find imported module '{name}'", "SNX0303"); return; }
@@ -248,6 +264,7 @@ pub struct ModuleLoader {
         return true;
     }
     pub bool run(&self) {
+        self.file_packages.push(if (self.packages.packages.is_empty()) { NONE } else { 0 }); self.file_packages.push(NONE);
         var prelude_tree = self.parse(1, true); var user_tree = self.parse(0, false);
         if ((self.resolver.sink.has_errors() && !self.editor) || self.prelude_sink.has_errors()) { return false; }
         self.resolver.register_builtins();

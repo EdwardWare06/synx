@@ -1,0 +1,170 @@
+/// Myelin manifest reader. Accepts the documented TOML string/table subset.
+/// Owns decoded fields; rejects duplicate definitions and unsupported syntax.
+/// No filesystem writes or process launches occur in this module.
+import bytes;
+import defs;
+import std.text;
+import std.utf8;
+import std.fs;
+import std.path.Path;
+import myelin.host;
+import token;
+
+pub struct Field { pub String key; pub String value; }
+pub struct Dependency { pub String alias; pub String path; pub String git; pub String reference; pub String subdir; }
+pub struct Manifest {
+    pub String name; pub String version; pub String bin; pub String lib;
+    pub Vec<Dependency> dependencies; pub Vec<byte> original;
+}
+/// Checkout line endings do not change a portable lock identity.
+pub Vec<byte> normalized(&const Vec<byte> input) {
+    Vec<byte> out = Vec.new(); for (i in 0..input.len()) { if (bytes.at(input, i) == 13 && i + 1 < input.len() && bytes.at(input, i + 1) == 10) { continue; } out.push(bytes.at(input, i)); } return out;
+}
+pub bool identifier(&const str value) {
+    if (value.len() == 0 || value.len() > 64 || value == "std") { return false; }
+    for (i in 0..value.len()) { byte c = unsafe { *((value.as_ptr() as usize + i) as *const byte) };
+        if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (i > 0 && c >= 48 && c <= 57))) { return false; }
+    } Vec<byte> word = Vec.new(); bytes.text(&word, value); return !token.is_keyword(token.keyword(word));
+}
+pub bool relative(&const str value) {
+    if (value.len() == 0 || Path.from(value).is_absolute() || text.starts_with(value, "\\") || text.starts_with(value, "/")) { return false; }
+    for (p in text.lines(text.replace(text.replace(value, "\\", "/"), "/", "\n"))) {
+        if (p == String.from("..") || p == String.from(".") || p.is_empty()) { return false; }
+        for (i in 0..p.len()) { byte b = unsafe { *((p.as_str().as_ptr() as usize + i) as *const byte) }; if (b < 32 || b == 58 || b == 127) { return false; } }
+    } return true;
+}
+pub String quote(&const str value) {
+    var out = String.from("\"");
+    for (i in 0..value.len()) { byte b = unsafe { *((value.as_ptr() as usize + i) as *const byte) };
+        if (b == 34 || b == 92) { out.push('\\'); out.push(b as char); }
+        else if (b == 10) { out.push_str("\\n"); } else if (b == 13) { out.push_str("\\r"); } else if (b == 9) { out.push_str("\\t"); }
+        else { out.push_str(unsafe { str_from_raw((value.as_ptr() as usize + i) as *const byte, 1) }); }
+    } out.push('"'); return out;
+}
+struct Reader {
+    Vec<byte> data; usize at; usize line; Vec<Field> fields; Vec<String> tables;
+    Result<bool, String> error(&const self, &const str message) { return Err("line {self.line}: {message}\n"); }
+    byte peek(&const self) { return bytes.at(self.data, self.at); }
+    void spaces(&self) { while (self.peek() == 32 || self.peek() == 9) { self.at += 1; } }
+    Result<bool, String> end(&self) {
+        self.spaces(); if (self.peek() == 35) { while (self.at < self.data.len() && self.peek() != 10 && self.peek() != 13) {
+            if (self.peek() < 32 && self.peek() != 9 || self.peek() == 127) { return self.error("control character in comment"); } self.at += 1;
+        } }
+        if (self.at == self.data.len()) { return Ok(true); }
+        if (self.peek() == 13) { self.at += 1; if (self.peek() != 10) { return self.error("expected LF after CR"); } }
+        if (self.peek() != 10) { return self.error("expected end of line"); } self.at += 1; self.line += 1; return Ok(true);
+    }
+    Result<String, String> string(&self) {
+        byte delimiter = self.peek(); if (delimiter != 34 && delimiter != 39) { return Err("line {self.line}: expected a quoted string\n"); }
+        self.at += 1; Vec<byte> out = Vec.new();
+        while (self.at < self.data.len()) {
+            byte b = self.peek(); self.at += 1;
+            if (b == delimiter) { return Ok(defs.name(out)); }
+            if (b < 32 && b != 9 || b == 127) { return Err("line {self.line}: control character in string\n"); }
+            if (delimiter == 39 || b != 92) { out.push(b); continue; }
+            byte escape = self.peek(); self.at += 1;
+            if (escape == 34 || escape == 92) { out.push(escape); }
+            else if (escape == 98) { out.push(8); } else if (escape == 116) { out.push(9); } else if (escape == 110) { out.push(10); }
+            else if (escape == 102) { out.push(12); } else if (escape == 114) { out.push(13); }
+            else if (escape == 117 || escape == 85) {
+                uint point = 0; usize count = if (escape == 117) { 4 } else { 8 };
+                for (i in 0..count) { byte h = self.peek(); self.at += 1; uint digit = 16;
+                    if (h >= 48 && h <= 57) { digit = (h - 48) as uint; } else if (h >= 65 && h <= 70) { digit = (h - 55) as uint; } else if (h >= 97 && h <= 102) { digit = (h - 87) as uint; }
+                    if (digit == 16 || point > 1114111 / 16) { return Err("line {self.line}: invalid Unicode escape\n"); } point = point * 16 + digit;
+                }
+                match text.from_code_point(point) { Some(s) => bytes.text(&out, s), None => return Err("line {self.line}: invalid Unicode scalar\n") }
+            } else { return Err("line {self.line}: invalid string escape\n"); }
+        } return Err("line {self.line}: unterminated string\n");
+    }
+    Result<String, String> key(&self) {
+        self.spaces(); String value = String.new();
+        if (self.peek() == 34 || self.peek() == 39) { value = self.string()?; }
+        else { usize start = self.at; while (true) { byte b = self.peek(); if (!((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 || b == 45)) { break; } self.at += 1; } value = defs.name(bytes.copy(self.data, start, self.at)); }
+        if (value.is_empty() || text.find(value, ".").is_some()) { return Err("line {self.line}: invalid manifest key\n"); } self.spaces(); return Ok(value);
+    }
+    Result<bool, String> put(&self, String key, String value) {
+        for (f in &const self.fields) { if (f.key == key || text.starts_with(f.key, "{key}.")) { return self.error("duplicate key"); } }
+        // A scalar cannot later become an inline table.
+        var parts = text.lines(text.replace(key, ".", "\n")); var prefix = String.new();
+        for (i in 0..parts.len()) { if (i > 0) { prefix.push('.'); } prefix.push_str(parts.get(i).unwrap());
+            if (i + 1 < parts.len()) { for (f in &const self.fields) { if (f.key == prefix) { return self.error("key already holds a value"); } } }
+        }
+        self.fields.push(Field { key: key, value: value }); return Ok(true);
+    }
+    Result<Vec<Field>, String> read(&self) {
+        var section = String.new();
+        while (self.at < self.data.len()) {
+            self.spaces(); if (self.peek() == 35 || self.peek() == 10 || self.peek() == 13 || self.at == self.data.len()) { self.end()?; continue; }
+            if (self.peek() == 91) {
+                self.at += 1; section = self.key()?;
+                while (self.peek() == 46) { self.at += 1; var next = self.key()?; section.push('.'); section.push_str(next); }
+                if (self.peek() != 93) { return Err("line {self.line}: expected ]\n"); } self.at += 1;
+                for (old in &const self.tables) { if (*old == section) { return Err("line {self.line}: duplicate or sealed table\n"); } }
+                self.tables.push(String.from(section)); self.end()?; continue;
+            }
+            var key = self.key()?; if (!section.is_empty()) { key = "{section}.{key}"; }
+            if (self.peek() != 61) { return Err("line {self.line}: expected =\n"); } self.at += 1; self.spaces();
+            if (self.peek() == 123) {
+                for (old in &const self.tables) { if (*old == key) { return Err("line {self.line}: duplicate inline table\n"); } }
+                self.tables.push(String.from(key));
+                self.at += 1; self.spaces(); if (self.peek() == 125) { return Err("line {self.line}: empty dependency table\n"); }
+                while (true) { var field = self.key()?; if (self.peek() != 61) { return Err("line {self.line}: expected =\n"); } self.at += 1; self.spaces();
+                    var value = self.string()?; self.put("{key}.{field}", value)?; self.spaces();
+                    if (self.peek() == 125) { self.at += 1; break; } if (self.peek() != 44) { return Err("line {self.line}: expected , or closing brace\n"); } self.at += 1;
+                }
+            } else { var value = self.string()?; self.put(key, value)?; }
+            self.end()?;
+        }
+        Vec<Field> out = Vec.new(); for (f in &const self.fields) { out.push(Field { key: String.from(f.key), value: String.from(f.value) }); } return Ok(out);
+    }
+}
+pub Result<Manifest, String> parse(Vec<byte> input) {
+    if (input.len() > 1048576 || utf8.decode(input).is_none()) { return Err(String.from("manifest must be UTF-8 and at most 1 MiB\n")); }
+    var r = Reader { data: input, at: 0, line: 1, fields: Vec.new(), tables: Vec.new() }; var fields = r.read()?;
+    for (table in &const r.tables) {
+        if (*table == String.from("package") || *table == String.from("bin") || *table == String.from("lib") || *table == String.from("dependencies")) { continue; }
+        var parts = text.lines(text.replace(*table, ".", "\n"));
+        if (parts.len() != 2 || *parts.get(0).unwrap() != String.from("dependencies") || !identifier(parts.get(1).unwrap().as_str())) { return Err("unknown manifest table: {table}\n"); }
+        bool nonempty = false; for (f in &const fields) { if (text.starts_with(f.key, "{table}.")) { nonempty = true; } }
+        if (!nonempty) { return Err("dependency table {table} has no source\n"); }
+    }
+    var m = Manifest { name: String.new(), version: String.from("0.1.0"), bin: String.new(), lib: String.new(), dependencies: Vec.new(), original: r.data };
+    for (f in &const fields) {
+        if (f.key == String.from("package.name")) { m.name = String.from(f.value); }
+        else if (f.key == String.from("package.version")) { m.version = String.from(f.value); }
+        else if (f.key == String.from("bin.path")) { m.bin = String.from(f.value); }
+        else if (f.key == String.from("lib.path")) { m.lib = String.from(f.value); }
+        else if (text.starts_with(f.key, "dependencies.")) {
+            var parts = text.lines(text.replace(f.key, ".", "\n")); if (parts.len() != 3) { return Err("invalid dependency field: {f.key}\n"); }
+            var alias = parts.get(1).unwrap(); if (!identifier(*alias)) { return Err("invalid dependency alias: {alias}\n"); }
+            usize index = m.dependencies.len(); for (i in 0..m.dependencies.len()) { if (m.dependencies.get(i).unwrap().alias == *alias) { index = i; break; } }
+            if (index == m.dependencies.len()) { m.dependencies.push(Dependency { alias: String.from(*alias), path: String.new(), git: String.new(), reference: String.new(), subdir: String.new() }); }
+            var d = m.dependencies.get_mut(index).unwrap(); var field = parts.get(2).unwrap();
+            if (*field == String.from("path")) { d.path = String.from(f.value); } else if (*field == String.from("git")) { d.git = String.from(f.value); }
+            else if (*field == String.from("rev") || *field == String.from("branch") || *field == String.from("tag")) {
+                if (!d.reference.is_empty()) { return Err("dependency {alias} has more than one Git selector\n"); }
+                d.reference = if (*field == String.from("branch")) { "refs/heads/{f.value}" } else if (*field == String.from("tag")) { "refs/tags/{f.value}" } else { String.from(f.value) };
+            } else if (*field == String.from("subdir")) { d.subdir = String.from(f.value); } else { return Err("unknown dependency field: {f.key}\n"); }
+        } else { return Err("unknown manifest field: {f.key}\n"); }
+        for (i in 0..f.value.len()) { byte b = unsafe { *((f.value.as_str().as_ptr() as usize + i) as *const byte) }; if (b == 0 || b == 127 || (b < 32 && b != 9)) { return Err("control character in {f.key}\n"); } }
+    }
+    if (!identifier(m.name)) { return Err(String.from("package.name must be an identifier other than std (1-64 ASCII characters)\n")); }
+    var version = text.lines(text.replace(m.version, ".", "\n")); if (version.len() != 3) { return Err(String.from("package.version requires major.minor.patch\n")); }
+    for (p in &const version) { if (text.parse_ulong(*p).is_none() || (p.len() > 1 && text.starts_with(*p, "0"))) { return Err(String.from("package.version requires three unsigned decimal numbers without leading zeroes\n")); } }
+    if ((!m.bin.is_empty() && !relative(m.bin)) || (!m.lib.is_empty() && !relative(m.lib))) { return Err(String.from("entry paths must be relative and cannot contain . or .. components\n")); }
+    for (d in &const m.dependencies) {
+        if (d.path.is_empty() == d.git.is_empty()) { return Err("dependency {d.alias} requires exactly one of path or git\n"); }
+        if (!d.path.is_empty() && (!d.reference.is_empty() || !d.subdir.is_empty())) { return Err("path dependency {d.alias} cannot have Git fields\n"); }
+        if (!d.git.is_empty() && (text.starts_with(d.git, "-") || text.find(d.git, "::").is_some())) { return Err("invalid Git URL for {d.alias}\n"); }
+        if (!d.reference.is_empty() && text.starts_with(d.reference, "-")) { return Err("invalid Git selector for {d.alias}\n"); }
+        if (!d.subdir.is_empty() && !relative(d.subdir)) { return Err("invalid Git package subdir for {d.alias}\n"); }
+    }
+    // Dependency order does not affect graph traversal or lock serialization.
+    for (i in 1..m.dependencies.len()) { usize j = i; while (j > 0 && m.dependencies.get(j).unwrap().alias < m.dependencies.get(j - 1).unwrap().alias) { m.dependencies.swap(j, j - 1); j -= 1; } }
+    return Ok(m);
+}
+pub Result<Manifest, String> load(&const str directory) {
+    var path = Path.from(directory).join("synx.toml");
+    var data = host.bounded(path.as_str(), 1048576)?;
+    match parse(data) { Ok(m) => return Ok(m), Err(e) => return Err("{path.as_str()}: {e}") }
+}

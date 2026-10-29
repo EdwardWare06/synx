@@ -98,6 +98,13 @@ jobs:
           SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory selfhost/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-modules-report.bin
           SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory selfhost/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-signatures-report.bin signatures
           SYNX_STD_PATH="$PWD/std" LD_PRELOAD="$asan" ASAN_OPTIONS=detect_leaks=1 build/selfhost-modules-memory selfhost/prelude.snx std build/selfhost-modules-manifest.txt build/selfhost-all-report.bin all
+      - name: Myelin allocation check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          asan="$(cc -print-file-name=libasan.so)"
+          test -f "$asan"
+          SYNX_MYELIN_ASAN="$asan" SYNX_LSP_ASAN="$asan" python3 -B tests/myelin/test_myelin.py build/selfhost-stages/synx-stage2 --memory
       - name: Version
         shell: bash
         run: |

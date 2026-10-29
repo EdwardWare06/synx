@@ -14,3 +14,5 @@ dist/
 
 .vscode-test/
 __pycache__/
+# Myelin project synchronization (synx.lock stays tracked).
+.synx-myelin.lock

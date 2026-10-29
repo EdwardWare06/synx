@@ -186,6 +186,18 @@ def relocated(synx, runtime_dir, work):
     if code == 0:
         code, out, err = run(literal, [], work, env)
         check(code == 7 and out == "driver café\n", "relocated package: the program runs", out + err)
+    # Myelin works from the installed tree with developer tools absent.
+    env['PATH'] = str(work / 'no-tools')
+    app, library = work / 'myelin_app', work / 'myelin_math'
+    for name, flags in ((app, []), (library, ['--lib'])):
+        code, out, err = run(installed, ['new', str(name), *flags], work, env)
+        check(code == 0, 'relocated package: creates project', out + err)
+    (app / 'src/main.snx').write_bytes(b'import math.answer; int main() { return answer(); }\n')
+    for arguments in (['add', 'math', '--path', str(library)], ['fetch', '--offline'], ['build', '--locked', '--offline']):
+        code, out, err = run(installed, arguments, app, env)
+        check(code == 0, 'relocated package: Myelin without Git/toolchain', out + err)
+    code, out, err = run(installed, ['run', '--locked', '--offline'], app, env)
+    check(code == 42, 'relocated package: runs package dependency', out + err)
 
 
 if __name__ == "__main__":

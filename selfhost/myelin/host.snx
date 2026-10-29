@@ -1,0 +1,81 @@
+/// Myelin host boundary. Paths and process arguments remain separate strings.
+/// Cache locks own native handles; Drop releases them on every exit path.
+import std.fs;
+import std.path.{Path, host_style};
+import std.env;
+import std.process.Command;
+import std.text;
+import bytes;
+extern "C" {
+    int synx_rt_myelin_write(*const byte path, usize length, *const byte data, usize count);
+    int synx_rt_cache_prepare(*const byte path, usize length);
+    int synx_rt_cache_lock(*const byte path, usize length, &(*byte) handle);
+    void synx_rt_cache_unlock(*byte handle);
+    ulong synx_rt_cache_nonce();
+}
+pub Result<String, String> canonical(&const str path) {
+    var value = match fs.canonicalize(path) { Ok(v) => v, Err(_) => return Err("cannot resolve {path}\n") };
+    match host_style() { Windows => { value = text.replace(value, "\\", "/"); }, Unix => return Ok(value) }
+    if (text.starts_with(value, "//?/UNC/")) { return Ok("//{text.slice(value, 8, value.len()).unwrap()}"); }
+    if (text.starts_with(value, "//?/")) { return Ok(text.slice(value, 4, value.len()).unwrap()); } return Ok(value);
+}
+pub bool exists(&const str path) { match fs.exists(path) { Ok(v) => return v, Err(_) => return false } }
+pub Result<Vec<byte>, String> bounded(&const str path, usize limit) {
+    var file = match fs.File.open(path) { Ok(v) => v, Err(_) => return Err("cannot read {path}\n") }; Vec<byte> out = Vec.new();
+    while (out.len() <= limit) {
+        usize count = limit + 1 - out.len(); if (count > 65536) { count = 65536; }
+        var chunk = match file.read(count) { Ok(v) => v, Err(_) => return Err("cannot read {path}\n") };
+        if (chunk.is_empty()) { return Ok(out); } bytes.append(&out, chunk);
+    } return Err("file exceeds {limit} bytes: {path}\n");
+}
+/// Render a portable path relative to an existing manifest directory.
+pub Result<String, String> relative_path(&const str base, &const str target) {
+    var left = canonical(base)?; var right = canonical(target)?;
+    var a = text.lines(text.replace(left, "/", "\n")); var b = text.lines(text.replace(right, "/", "\n")); usize common = 0;
+    while (common < a.len() && common < b.len() && *a.get(common).unwrap() == *b.get(common).unwrap()) { common += 1; }
+    if (common == 0) { return Ok(right); } var out = String.new();
+    for (i in common..a.len()) { if (!out.is_empty()) { out.push('/'); } out.push_str(".."); }
+    for (i in common..b.len()) { if (!out.is_empty()) { out.push('/'); } out.push_str(b.get(i).unwrap()); }
+    if (out.is_empty()) { out = String.from("."); } return Ok(out);
+}
+pub Result<String, String> read(&const str path) { match fs.read_text(path) { Ok(v) => return Ok(v), Err(_) => return Err("cannot read UTF-8 file: {path}\n") } }
+pub Result<bool, String> write(&const str path, &const Vec<byte> data) {
+    int code = unsafe { synx_rt_myelin_write(path.as_ptr(), path.len(), data.as_ptr(), data.len()) };
+    if (code != 0) { return Err("cannot publish {path} (OS error {code})\n"); } return Ok(true);
+}
+pub Result<bool, String> write_text(&const str path, &const str value) { Vec<byte> data = Vec.new(); bytes.text(&data, value); return write(path, data); }
+pub Result<bool, String> mkdir(&const str path) {
+    match fs.create_dir(path) { Ok(_) => return Ok(true), Err(e) => match e.kind { fs.ErrorKind.AlreadyExists => { match fs.metadata(path) { Ok(m) => { if (m.is_dir) { return Ok(true); } }, Err(_) => {} } }, _ => {} } }
+    return Err("cannot create directory: {path}\n");
+}
+pub Result<String, String> cache() {
+    var path = match env.get("SYNX_MYELIN_CACHE") { Ok(Some(v)) => v, _ => String.new() };
+    if (path.is_empty()) {
+        var base = match env.get("LOCALAPPDATA") { Ok(Some(v)) => v, _ => String.new() };
+        if (!base.is_empty()) { path = String.from(Path.from(base).join("Synx").join("cache").join("myelin").as_str()); }
+        else { var home = match env.get("HOME") { Ok(Some(v)) => v, _ => return Err(String.from("set SYNX_MYELIN_CACHE to a private directory\n")) }; path = String.from(Path.from(home).join(".cache").join("synx").join("myelin").as_str()); }
+    }
+    var absolute = match fs.absolute(path) { Ok(v) => v, Err(_) => return Err(String.from("cannot resolve Myelin cache\n")) };
+    if (unsafe { synx_rt_cache_prepare(absolute.as_str().as_ptr(), absolute.len()) } != 0) { return Err("cannot create private Myelin cache: {absolute}\n"); }
+    return canonical(absolute);
+}
+pub struct Lock {
+    *byte handle;
+    pub Result<Lock, String> acquire(&const str path) {
+        var handle = 0 as *byte; int code = unsafe { synx_rt_cache_lock(path.as_ptr(), path.len(), &handle) };
+        if (code != 0) { return Err("cannot lock {path} (OS error {code})\n"); } return Ok(Lock { handle: handle });
+    }
+    pub Result<Lock, String> optional(&const str path, bool needed) { if (needed) { return Lock.acquire(path); } return Ok(Lock { handle: 0 as *byte }); }
+}
+impl Drop for Lock { void drop(&self) { unsafe { synx_rt_cache_unlock(self.handle); } } }
+pub ulong nonce() { return unsafe { synx_rt_cache_nonce() }; }
+pub Result<bool, String> git(&const Vec<String> args) {
+    var command = Command.new("git");
+    command.arg("-c"); command.arg("core.hooksPath=/dev/null");
+    command.arg("-c"); command.arg("protocol.ext.allow=never");
+    command.arg("-c"); command.arg("advice.detachedHead=false");
+    command.arg("-c"); command.arg("core.autocrlf=false");
+    for (a in args) { command.arg(*a); }
+    match command.status() { Ok(status) => { if (status.success()) { return Ok(true); } }, Err(_) => return Err(String.from("cannot start Git; install Git to fetch Git dependencies\n")) }
+    return Err(String.from("Git dependency operation failed\n"));
+}

@@ -1,0 +1,98 @@
+/// Myelin CLI. Mutations are limited to explicit project/dependency commands
+/// and build preparation. Compilation and editor queries use cached graphs.
+import myelin.manifest;
+import myelin.project;
+import myelin.host;
+import driver_io;
+import driver_options.BuildOptions;
+import std.path.Path;
+import std.fs;
+import std.text;
+import bytes;
+
+pub int help() {
+    driver_io.text(1, "Myelin package manager\nusage: synx new <directory> [--lib]\n       synx add <alias> (--path <directory> | --git <URL>) [--rev <commit> | --branch <name> | --tag <name>] [--subdir <path>]\n       synx fetch [--locked] [--offline]\n       synx build [file.snx] [--locked] [--offline] [build options]\n       synx run [file.snx] [--locked] [--offline] [build options] [-- arguments]\n\nProjects use synx.toml and synx.lock. Git sources require installed Git to fetch.\n"); return 0;
+}
+Result<String, String> current() { match fs.current_dir() { Ok(v) => return Ok(v), Err(_) => return Err(String.from("cannot read working directory\n")) } }
+pub Result<String, String> check_entry() {
+    var root = project.find(current()?)?; if (root.is_empty()) { return Err(String.from("check needs a file argument\n")); }
+    var graph = project.cached(root)?; var entry = graph.entry(0, false); if (entry.is_empty()) { entry = graph.entry(0, true); } return Ok(entry);
+}
+pub Result<project.Graph, String> prepare(&const str root, bool offline, bool locked) {
+    // One lock covers Git publication and lock-file replacement. Local-only
+    // projects use their own project lock without requiring a user cache.
+    var lock = host.Lock.acquire(Path.from(root).join(".synx-myelin.lock").as_str())?;
+    return project.resolve(root, true, offline, locked);
+}
+pub Result<bool, String> build_options(&BuildOptions options, bool run) {
+    var selected = if (options.input.is_empty()) { current()? } else { String.from(options.input) };
+    var root = project.find(selected)?;
+    if (root.is_empty()) {
+        if (options.input.is_empty()) { return Err(String.from("build needs a source file or a synx.toml project\n")); }
+        if (options.locked || options.offline) { return Err(String.from("--locked and --offline require a synx.toml project\n")); }
+        return Ok(true);
+    }
+    var graph = prepare(root, options.offline, options.locked)?;
+    if (options.input.is_empty()) {
+        options.input = graph.entry(0, false);
+        if (options.input.is_empty()) { return Err(String.from("package has no application entry; add src/main.snx or [bin].path\n")); }
+        if (!run && options.output.is_empty()) {
+            var build = Path.from(root).join("build"); host.mkdir(build.as_str())?;
+            var mode = build.join(if (options.target.checked_arithmetic) { "debug" } else { "release" }); host.mkdir(mode.as_str())?;
+            var name = graph.packages.get(0).unwrap().manifest.name.as_str(); var suffix = match options.target.os { Windows => ".exe", _ => "" };
+            options.output = String.from(mode.join("{name}{suffix}").as_str());
+        }
+    }
+    return Ok(true);
+}
+Result<bool, String> create(&const Vec<String> args) {
+    if (args.len() < 3 || args.len() > 4) { return Err(String.from("usage: synx new <directory> [--lib]\n")); }
+    bool library = args.len() == 4;
+    if (library && args.get(3).unwrap().as_str() != "--lib") { return Err(String.from("usage: synx new <directory> [--lib]\n")); }
+    var target = args.get(2).unwrap().as_str(); var path = Path.from(target); var name = path.file_name().unwrap_or(String.new());
+    if (!manifest.identifier(name)) { return Err(String.from("project directory name must be a valid package identifier\n")); }
+    if (host.exists(target)) { return Err("directory already exists: {target}\n"); }
+    host.mkdir(target)?; var src = path.join("src"); host.mkdir(src.as_str())?;
+    host.write_text(path.join("synx.toml").as_str(), "[package]\nname = {manifest.quote(name)}\nversion = \"0.1.0\"\n\n[dependencies]\n")?;
+    host.write_text(path.join(".gitignore").as_str(), "build/\n.synx-myelin.lock\n")?;
+    if (library) { host.write_text(src.join("lib.snx").as_str(), "pub int answer() \{\n    return 42;\n\}\n")?; }
+    else { host.write_text(src.join("main.snx").as_str(), "import std.io.print;\n\nmain() \{\n    print(\"Hello from Synx!\");\n\}\n")?; }
+    driver_io.text(1, "Created {name}\n"); return Ok(true);
+}
+Result<bool, String> add(&const Vec<String> args) {
+    if (args.len() < 5) { return Err(String.from("synx add needs an alias and --path or --git source\n")); }
+    var alias = args.get(2).unwrap().as_str(); if (!manifest.identifier(alias)) { return Err(String.from("invalid dependency alias\n")); }
+    var path = String.new(); var git = String.new(); var selector = String.new(); var value = String.new(); var subdir = String.new(); usize i = 3;
+    while (i < args.len()) {
+        var flag = args.get(i).unwrap().as_str(); if (i + 1 >= args.len()) { return Err("missing value for {flag}\n"); } var next = args.get(i + 1).unwrap().as_str();
+        if (flag == "--path" && path.is_empty()) { path = String.from(next); }
+        else if (flag == "--git" && git.is_empty()) { git = String.from(next); }
+        else if ((flag == "--rev" || flag == "--branch" || flag == "--tag") && selector.is_empty()) { selector = text.slice(flag, 2, flag.len()).unwrap(); value = String.from(next); }
+        else if (flag == "--subdir" && subdir.is_empty()) { subdir = String.from(next); }
+        else { return Err("unknown or repeated option: {flag}\n"); } i += 2;
+    }
+    if (path.is_empty() == git.is_empty() || (!path.is_empty() && (!selector.is_empty() || !subdir.is_empty()))) { return Err(String.from("choose one path or Git source; selectors and subdir require Git\n")); }
+    var root = project.find(current()?)?; if (root.is_empty()) { return Err(String.from("no synx.toml project found\n")); }
+    var lock = host.Lock.acquire(Path.from(root).join(".synx-myelin.lock").as_str())?; var m = manifest.load(root)?;
+    if (!path.is_empty()) { path = host.relative_path(root, path)?; }
+    for (d in &const m.dependencies) { if (d.alias == String.from(alias)) { return Err("dependency already exists: {alias}\n"); } }
+    var table = "\n[dependencies.{alias}]\n";
+    if (!path.is_empty()) { table.push_str("path = {manifest.quote(path)}\n"); } else { table.push_str("git = {manifest.quote(git)}\n"); }
+    if (!selector.is_empty()) { table.push_str("{selector} = {manifest.quote(value)}\n"); }
+    if (!subdir.is_empty()) { table.push_str("subdir = {manifest.quote(subdir)}\n"); }
+    var data = m.original; bytes.text(&data, table); manifest.parse(bytes.copy(data, 0, data.len()))?;
+    host.write(Path.from(root).join("synx.toml").as_str(), data)?;
+    driver_io.text(1, "Added {alias}; run synx fetch or synx build to resolve dependencies\n"); return Ok(true);
+}
+Result<bool, String> fetch(&const Vec<String> args) {
+    bool offline = false; bool locked = false;
+    for (i in 2..args.len()) { var option = args.get(i).unwrap().as_str(); if (option == "--offline") { offline = true; } else if (option == "--locked") { locked = true; } else { return Err("unknown fetch option: {option}\n"); } }
+    var root = project.find(current()?)?; if (root.is_empty()) { return Err(String.from("no synx.toml project found\n")); }
+    var graph = prepare(root, offline, locked)?; driver_io.text(1, "Resolved {graph.packages.len()} package(s)\n"); return Ok(true);
+}
+pub int run(&const Vec<String> args) {
+    if (args.len() >= 3 && args.get(2).unwrap().as_str() == "--help") { return help(); }
+    var command = args.get(1).unwrap().as_str();
+    var result = if (command == "new") { create(args) } else if (command == "add") { add(args) } else { fetch(args) };
+    match result { Ok(_) => return 0, Err(message) => { driver_io.text(2, "Myelin: {message}"); return 1; } }
+}

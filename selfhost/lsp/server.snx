@@ -20,6 +20,9 @@ import driver_io;
 import lexer;
 import format;
 import token;
+import myelin.project;
+import myelin.manifest;
+import myelin.host;
 import std.fs;
 import std.path.Path;
 import std.text;
@@ -62,6 +65,11 @@ pub struct Server {
             if (std.text.starts_with(path, prefix) && prefix.len() > nearest) { entry = String.from(*candidate); nearest = prefix.len(); }
         }
         for (candidate in &const self.entries) { var parent = Path.from(*candidate).parent(); match parent { Some(dir) => { var prefix = "{dir.as_str()}/"; if (std.text.starts_with(path, prefix)) { entry = String.from(*candidate); break; } }, None => {} } }
+        match project.find(path) { Ok(root) => { if (!root.is_empty()) { match manifest.load(root) { Ok(m) => {
+            var candidate = if (!m.bin.is_empty()) { Path.from(root).join(m.bin) } else if (host.exists(Path.from(root).join("src/main.snx").as_str())) { Path.from(root).join("src/main.snx") }
+                else if (!m.lib.is_empty()) { Path.from(root).join(m.lib) } else { Path.from(root).join("src/lib.snx") };
+            entry = source.path_key(candidate.as_str());
+        }, Err(_) => {} } } }, Err(_) => {} }
         if (entry != String.from(path)) {
             bool cached = false; for (a in &const self.analyses) { if (a.entry == entry) { cached = true; break; } }
             if (!cached) {
@@ -250,7 +258,7 @@ pub struct Server {
         if (self.stopped) { self.error(request, -32600, "Server is shutting down"); return true; }
         if (method == "initialized" || method == "$/setTrace" || method == "$/cancelRequest") { return true; }
         if (method == "textDocument/didOpen" || method == "textDocument/didChange" || method == "textDocument/didClose" || method == "textDocument/didSave") { self.change(request, method); return true; }
-        if (method == "workspace/didChangeWatchedFiles") { self.invalidate(); uint p = request.get(request.root, "params"); uint changes = request.get(p, "changes"); for (i in 0..request.len(changes)) { uint change = request.at(changes, i); match wire.path(request.str(request.get(change, "uri"))) { Some(path) => { bool found = false; for (s in &const self.workspace) { if (*s == path) { found = true; break; } } if (!found && request.integer(request.get(change, "type"), 0) != 3) { self.workspace.push(path); } }, None => {} } } self.diagnostics(); return true; }
+        if (method == "workspace/didChangeWatchedFiles") { self.invalidate(); uint p = request.get(request.root, "params"); uint changes = request.get(p, "changes"); for (i in 0..request.len(changes)) { uint change = request.at(changes, i); match wire.path(request.str(request.get(change, "uri"))) { Some(path) => { bool found = false; for (s in &const self.workspace) { if (*s == path) { found = true; break; } } if (!found && std.text.ends_with(path, ".snx") && request.integer(request.get(change, "type"), 0) != 3) { self.workspace.push(path); } }, None => {} } } self.diagnostics(); return true; }
         if (method == "textDocument/formatting") {
             uint p = request.get(request.root, "params"); uint td = request.get(p, "textDocument");
             match wire.path(request.str(request.get(td, "uri"))) {

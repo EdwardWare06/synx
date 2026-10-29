@@ -355,6 +355,22 @@ embedded prelude (`prelude_source.snx`, generated from `prelude.snx` by
 `embed_prelude.snx`), host discovery, inspection serializers, and CLI
 transport adapters are in the `driver*.snx` modules.
 
+## Myelin
+
+`myelin/manifest.snx` reads the documented TOML subset into owned manifest
+records. `myelin/project.snx` resolves a bounded package graph and version-1
+JSON lock files. `myelin/host.snx` owns process arguments, cache locks, bounded
+reads, and atomic data-file publication. `myelin/commands.snx` implements
+project creation, dependency addition, fetch, and build preparation.
+
+Compilation loads cached graphs without fetching. `ModuleLoader.file_packages`
+maps source file IDs to package IDs; standard-library files have no package.
+Package IDs scope internal module names. Importer views retain source spellings.
+Run-cache identities include the resolved graph and normalized manifest hashes.
+`tests/myelin/test_myelin.py` covers four parser modes, package isolation, local
+Git pins, offline operation, and language-server invalidation. The CLI relocation
+test checks project builds without Git or developer tools.
+
 ## Bootstrap
 
 CMake builds stage 1 with the seed release and stage 2 with stage 1. Both

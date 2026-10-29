@@ -1,4 +1,4 @@
 exit 1
 --- stdout
 --- stderr
-build needs a file argument
+Myelin: build needs a source file or a synx.toml project

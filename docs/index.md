@@ -19,6 +19,8 @@ macOS.
   and environment variable.
 - [Formatting source](guide/formatting.md): style rules, CLI modes, and
   Format Document in VS Code.
+- [Projects and dependencies](guide/packages.md): Myelin manifests, Git and
+  local dependencies, lock files, and offline builds.
 
 ## Learning the language
 

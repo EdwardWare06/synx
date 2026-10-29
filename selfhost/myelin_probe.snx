@@ -1,0 +1,14 @@
+/// Manifest parser probe used by tests/myelin; never part of the driver.
+import myelin.manifest;
+import myelin.project;
+import std.env;
+import std.fs;
+import driver_io;
+int main() {
+    var args = env.args(); if (args.len() != 2) { return 2; }
+    var input = match fs.read(args.get(1).unwrap().as_str()) { Ok(v) => v, Err(_) => return 2 };
+    match manifest.parse(input) {
+        Err(e) => { driver_io.text(1, e); return 1; },
+        Ok(m) => { driver_io.text(1, "{m.name} {m.version} {m.bin} {m.lib}\n"); for (d in &const m.dependencies) { driver_io.text(1, "{d.alias}|{d.path}|{d.git}|{d.reference}|{d.subdir}\n"); } }
+    } return 0;
+}

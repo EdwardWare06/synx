@@ -19,9 +19,10 @@ def check(value, label, detail=''):
         raise AssertionError(label + ('\n' + str(detail) if detail else ''))
 
 class Client:
-    def __init__(self, compiler, args):
+    def __init__(self, compiler, args, env_overrides=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith('SYNX_')}
         env['SYNX_STD_PATH'] = str(ROOT / 'std')
+        env.update(env_overrides or {})
         if os.environ.get('SYNX_LSP_ASAN'):
             env['LD_PRELOAD'] = os.environ['SYNX_LSP_ASAN']
             env['ASAN_OPTIONS'] = 'detect_leaks=1:halt_on_error=1'

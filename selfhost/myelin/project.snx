@@ -1,0 +1,146 @@
+/// Deterministic package graph and version-1 JSON lock files.
+/// Resolution traverses sorted dependency aliases. Cached mode never runs Git.
+/// Git packages are pinned before traversal; path dependencies stay live.
+import myelin.manifest.{Manifest, Dependency};
+import myelin.manifest;
+import myelin.host;
+import lsp.json.{Json, NONE};
+import driver_fingerprint;
+import std.fs;
+import std.path.Path;
+import std.text;
+import bytes;
+
+pub struct Edge { pub String alias; pub uint package; }
+pub struct Package {
+    pub String directory; pub String source; pub String boundary;
+    pub Manifest manifest; pub Vec<Edge> dependencies; pub bool complete;
+}
+pub struct Graph {
+    pub Vec<Package> packages; pub Json pins; bool fetch; bool offline; bool locked;
+    pub Graph new() { var pins = Json.new(); uint root = pins.array(); pins.root = root; return Graph { packages: Vec.new(), pins: pins, fetch: false, offline: true, locked: false }; }
+    pub uint dependency(&const self, uint owner, &const str alias) {
+        if (owner as usize >= self.packages.len()) { return NONE; }
+        for (edge in &const self.packages.get(owner as usize).unwrap().dependencies) { if (edge.alias == String.from(alias)) { return edge.package; } } return NONE;
+    }
+    pub String root(&const self, uint package) {
+        var p = self.packages.get(package as usize).unwrap();
+        var entry = if (package == 0 && !p.manifest.bin.is_empty()) { p.manifest.bin.as_str() } else { p.manifest.lib.as_str() };
+        return String.from(Path.from(p.directory).join(entry).parent().unwrap().as_str());
+    }
+    pub String entry(&const self, uint package, bool library) {
+        var p = self.packages.get(package as usize).unwrap(); var entry = if (library) { p.manifest.lib.as_str() } else { p.manifest.bin.as_str() };
+        if (entry.len() == 0) { return String.new(); } return String.from(Path.from(p.directory).join(entry).as_str());
+    }
+    Result<String, String> git_package(&self, &const Dependency d) {
+        var reference = if (d.reference.is_empty()) { "HEAD" } else { d.reference.as_str() }; var revision = String.new();
+        for (i in 0..self.pins.len(self.pins.root)) { uint p = self.pins.at(self.pins.root, i);
+            if (self.pins.str(self.pins.get(p, "git")) == d.git.as_str() && self.pins.str(self.pins.get(p, "ref")) == reference) { revision = String.from(self.pins.str(self.pins.get(p, "rev"))); break; }
+        }
+        if (revision.is_empty() && (!self.fetch || self.offline || self.locked)) { return Err("Git dependency {d.alias} has no locked revision; run synx fetch\n"); }
+        var cache = host.cache()?; var guard = host.Lock.optional(Path.from(cache).join("fetch.lock").as_str(), self.fetch)?;
+        Vec<byte> url = Vec.new(); bytes.text(&url, d.git); var identity = driver_fingerprint.hash(url);
+        var directory = String.new();
+        if (!revision.is_empty()) { directory = String.from(Path.from(cache).join("{identity}-{revision}").as_str()); }
+        bool ready = !directory.is_empty() && host.exists(Path.from(directory).join(".myelin-ready").as_str());
+        if (!ready) {
+            if (!self.fetch || self.offline) { return Err("Git dependency {d.alias} is not fetched; run synx fetch\n"); }
+            var temporary = String.from(Path.from(cache).join("fetch-{host.nonce()}").as_str());
+            Vec<String> args = Vec.new(); args.push(String.from("clone")); args.push(String.from("--quiet")); args.push(String.from("--no-checkout")); args.push(String.from("--no-hardlinks")); args.push(String.from("--")); args.push(String.from(d.git)); args.push(String.from(temporary)); host.git(args)?;
+            args.clear(); args.push(String.from("-C")); args.push(String.from(temporary)); args.push(String.from("log")); args.push(String.from("-1")); args.push(String.from("--format=%H"));
+            var output = String.from(Path.from(temporary).join(".myelin-revision").as_str()); args.push("--output={output}");
+            var fetch_args = Vec.new(); fetch_args.push(String.from("-C")); fetch_args.push(String.from(temporary)); fetch_args.push(String.from("fetch")); fetch_args.push(String.from("--quiet")); fetch_args.push(String.from("--no-tags")); fetch_args.push(String.from("origin")); fetch_args.push(if (!revision.is_empty()) { String.from(revision) } else { String.from(reference) }); host.git(fetch_args)?;
+            args.push(String.from("FETCH_HEAD")); args.push(String.from("--")); host.git(args)?;
+            var resolved = host.read(output)?; resolved = text.replace(text.replace(resolved, "\n", ""), "\r", "");
+            if (!commit(resolved) || (!revision.is_empty() && resolved != revision)) { return Err("cannot resolve locked Git revision for {d.alias}\n"); }
+            revision = resolved; directory = String.from(Path.from(cache).join("{identity}-{revision}").as_str());
+            args.clear(); args.push(String.from("-C")); args.push(String.from(temporary)); args.push(String.from("checkout")); args.push(String.from("--quiet")); args.push(String.from("--detach")); args.push(String.from(revision)); args.push(String.from("--")); host.git(args)?;
+            host.write_text(Path.from(temporary).join(".myelin-ready").as_str(), revision)?;
+            if (!host.exists(directory)) { match fs.rename(temporary, directory) { Ok(_) => {}, Err(_) => return Err("cannot publish Git checkout: {directory}\n") } }
+            uint pin = self.pins.object(); self.pins.put(pin, "git", self.pins.string(d.git)); self.pins.put(pin, "ref", self.pins.string(reference)); self.pins.put(pin, "rev", self.pins.string(revision));
+            // Only append new pins; existing selectors always retain their revision.
+            bool known = false; for (i in 0..self.pins.len(self.pins.root)) { uint old = self.pins.at(self.pins.root, i); if (self.pins.str(self.pins.get(old, "git")) == d.git.as_str() && self.pins.str(self.pins.get(old, "ref")) == reference) { known = true; } }
+            if (!known) { uint root = self.pins.root; self.pins.push(root, pin); }
+        }
+        if (host.read(Path.from(directory).join(".myelin-ready").as_str())? != revision) { return Err("invalid cached Git checkout for {d.alias}\n"); }
+        return Ok(directory);
+    }
+    Result<uint, String> visit(&self, &const str directory, String source, String boundary, usize depth) {
+        if (depth > 64) { return Err(String.from("package graph exceeds 64 dependency levels\n")); }
+        var canonical = host.canonical(directory)?;
+        if (!boundary.is_empty() && canonical != boundary && !text.starts_with(canonical, "{boundary}/")) { return Err("Git path dependency escapes its checkout: {directory}\n"); }
+        for (i in 0..self.packages.len()) { var p = self.packages.get(i).unwrap();
+            bool same = p.directory == canonical; if (!same) { match fs.same_file(p.directory, canonical) { Ok(v) => { same = v; }, Err(_) => {} } }
+            if (same) { if (!p.complete) { return Err("dependency cycle at {canonical}\n"); } return Ok(i as uint); }
+        }
+        if (self.packages.len() >= 1024) { return Err(String.from("package graph exceeds 1024 packages\n")); }
+        var m = manifest.load(canonical)?;
+        if (m.bin.is_empty() && host.exists(Path.from(canonical).join("src/main.snx").as_str())) { m.bin = String.from("src/main.snx"); }
+        if (m.lib.is_empty() && host.exists(Path.from(canonical).join("src/lib.snx").as_str())) { m.lib = String.from("src/lib.snx"); }
+        if (m.bin.is_empty() && m.lib.is_empty()) { return Err("package {m.name} has no entry file; add src/main.snx or src/lib.snx\n"); }
+        for (entry in &const [String.from(m.bin), String.from(m.lib)]) {
+            if (entry.is_empty()) { continue; } var resolved = host.canonical(Path.from(canonical).join(*entry).as_str())?;
+            if (!text.starts_with(resolved, "{canonical}/")) { return Err("package entry escapes its directory: {entry}\n"); }
+        }
+        uint id = self.packages.len() as uint;
+        self.packages.push(Package { directory: String.from(canonical), source: source, boundary: String.from(boundary), manifest: m, dependencies: Vec.new(), complete: false });
+        usize count = self.packages.get(id as usize).unwrap().manifest.dependencies.len();
+        for (i in 0..count) {
+            var raw = self.packages.get(id as usize).unwrap().manifest.dependencies.get(i).unwrap();
+            var d = Dependency { alias: String.from(raw.alias), path: String.from(raw.path), git: String.from(raw.git), reference: String.from(raw.reference), subdir: String.from(raw.subdir) };
+            var child = String.new(); var origin = String.new(); var limit = String.from(boundary);
+            if (!d.path.is_empty()) { child = String.from(Path.from(canonical).join(d.path).as_str()); origin = "path:{id}:{d.path}"; }
+            else { var checkout = self.git_package(d)?; limit = host.canonical(checkout)?; child = if (d.subdir.is_empty()) { String.from(checkout) } else { String.from(Path.from(checkout).join(d.subdir).as_str()) }; origin = "git:{d.git}:{host.read(Path.from(checkout).join(".myelin-ready").as_str())?}:{d.subdir}"; }
+            uint target = self.visit(child, origin, limit, depth + 1)?;
+            if (self.packages.get(target as usize).unwrap().manifest.lib.is_empty()) { return Err("dependency {d.alias} requires a library entry\n"); }
+            self.packages.get_mut(id as usize).unwrap().dependencies.push(Edge { alias: String.from(d.alias), package: target });
+        }
+        self.packages.get_mut(id as usize).unwrap().complete = true; return Ok(id);
+    }
+    pub Vec<byte> lock_bytes(&const self) {
+        var j = Json.new(); uint root = j.object(); j.put(root, "version", j.number(1)); uint packages = j.array();
+        for (p in &const self.packages) { uint record = j.object(); j.put(record, "source", j.string(p.source)); j.put(record, "name", j.string(p.manifest.name)); j.put(record, "version", j.string(p.manifest.version));
+            j.put(record, "manifest", j.string(driver_fingerprint.hash(manifest.normalized(p.manifest.original)))); uint deps = j.object(); for (edge in &const p.dependencies) { j.put(deps, edge.alias, j.number(edge.package as long)); }
+            j.put(record, "dependencies", deps); j.push(packages, record);
+        }
+        j.put(root, "packages", packages); uint pins = j.array();
+        // Traverse only the pins used by this graph, in package traversal order.
+        Vec<String> used = Vec.new();
+        for (p in &const self.packages) { for (d in &const p.manifest.dependencies) { if (d.git.is_empty()) { continue; }
+            var reference = if (d.reference.is_empty()) { "HEAD" } else { d.reference.as_str() }; var key = "{d.git}\n{reference}"; bool seen = false; for (old in &const used) { if (*old == key) { seen = true; } } if (seen) { continue; } used.push(key);
+            for (i in 0..self.pins.len(self.pins.root)) { uint pin = self.pins.at(self.pins.root, i); if (self.pins.str(self.pins.get(pin, "git")) == d.git.as_str() && self.pins.str(self.pins.get(pin, "ref")) == reference) { j.push(pins, j.copy(self.pins, pin)); break; } }
+        } }
+        j.put(root, "pins", pins); var out = j.encode(root); out.push(10); return out;
+    }
+}
+bool commit(&const str value) {
+    if (value.len() != 40 && value.len() != 64) { return false; } for (i in 0..value.len()) { byte b = unsafe { *((value.as_ptr() as usize + i) as *const byte) }; if (!((b >= 48 && b <= 57) || (b >= 97 && b <= 102))) { return false; } } return true;
+}
+pub Result<String, String> find(&const str input) {
+    var absolute = match fs.absolute(input) { Ok(v) => v, Err(_) => return Err("cannot resolve {input}\n") };
+    var path = Path.from(absolute); match fs.metadata(absolute) { Ok(m) => { if (!m.is_dir) { path = path.parent().unwrap_or(Path.from(".")); } }, Err(_) => { path = path.parent().unwrap_or(Path.from(".")); } }
+    for (i in 0..256) { var file = path.join("synx.toml"); if (host.exists(file.as_str())) { return host.canonical(path.as_str()); } match path.parent() { Some(p) => { path = p; }, None => break } }
+    return Ok(String.new());
+}
+pub Result<Graph, String> resolve(&const str directory, bool fetch, bool offline, bool locked) {
+    var graph = Graph.new(); graph.fetch = fetch; graph.offline = offline; graph.locked = locked;
+    var lock_path = String.from(Path.from(directory).join("synx.lock").as_str()); var old = Vec.new();
+    if (locked && !host.exists(lock_path)) { return Err(String.from("synx.lock is missing; run synx fetch\n")); }
+    if (host.exists(lock_path)) {
+        old = host.bounded(lock_path, 4194304)?;
+        var j = Json.parse(bytes.copy(old, 0, old.len())); uint pins = j.get(j.root, "pins");
+        if (!j.ok || j.integer(j.get(j.root, "version"), 0) != 1 || j.kind(pins) != 4) { return Err(String.from("invalid synx.lock; expected Myelin lock version 1\n")); }
+        for (i in 0..j.len(pins)) { uint p = j.at(pins, i); if (j.kind(j.get(p, "git")) != 3 || j.kind(j.get(p, "ref")) != 3 || !commit(j.str(j.get(p, "rev")))) { return Err(String.from("invalid Git pin in synx.lock\n")); }
+            for (n in 0..i) { uint other = j.at(pins, n); if (j.str(j.get(other, "git")) == j.str(j.get(p, "git")) && j.str(j.get(other, "ref")) == j.str(j.get(p, "ref"))) { return Err(String.from("duplicate Git pin in synx.lock\n")); } }
+        }
+        uint root = graph.pins.copy(j, pins); graph.pins.root = root;
+    }
+    graph.visit(directory, String.from("root"), String.new(), 0)?;
+    var current = graph.lock_bytes(); bool same = false;
+    if (!old.is_empty()) { var j = Json.parse(bytes.copy(old, 0, old.len())); var k = Json.parse(bytes.copy(current, 0, current.len())); same = driver_fingerprint.hash(j.encode(j.root)) == driver_fingerprint.hash(k.encode(k.root)); }
+    bool needed = !graph.packages.get(0).unwrap().manifest.dependencies.is_empty();
+    if (!same && (locked || !fetch) && (needed || !old.is_empty() || locked)) { return Err(String.from("synx.lock is missing or stale; run synx fetch\n")); }
+    if (fetch && !same && !locked) { host.write(lock_path, current)?; }
+    return Ok(graph);
+}
+pub Result<Graph, String> cached(&const str input) { var root = find(input)?; if (root.is_empty()) { return Ok(Graph.new()); } return resolve(root, false, true, false); }

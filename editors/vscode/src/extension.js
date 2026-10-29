@@ -74,7 +74,7 @@ function activate(context) {
         vscode.workspace.onDidCloseTextDocument(document => languageServer?.close(document).catch(e => output.appendLine(e.message))),
         { dispose: () => languageServer?.dispose() },
     );
-    const watcher = vscode.workspace.createFileSystemWatcher('**/*.snx');
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*.{snx,toml,lock}');
     context.subscriptions.push(watcher);
     for (const [event, type] of [['onDidCreate', 1], ['onDidChange', 2], ['onDidDelete', 3]]) {
         context.subscriptions.push(watcher[event](uri => {

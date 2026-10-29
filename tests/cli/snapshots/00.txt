@@ -11,6 +11,11 @@ commands:
   fmt <file.snx>    format source files (--check, --stdout, --stdin)
   lsp                start the language server over standard input/output
   ir <file.snx>      print the Dendrite IR of a program
-  build <file.snx>   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, --standalone, --shared-runtime, -v)
-  run <file.snx>     build privately and run ([options] -- program arguments)
+  build [file.snx]   compile to a native executable (-o out, --release, --keep-obj, --no-regalloc, --linker=builtin, --linker=system, --standalone, --shared-runtime, -v)
+  run [file.snx]     build privately and run ([options] -- program arguments)
+  new <directory>   create a project (--lib creates a library)
+  add <alias>       add a dependency (--path or --git; synx add --help)
+  fetch              resolve and fetch dependencies (--locked, --offline)
+
+Build, run, and check can use the nearest synx.toml project.
 --- stderr

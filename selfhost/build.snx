@@ -40,7 +40,7 @@ pub BuildResult program(&const BuildOptions options) {
         Err(_) => { driver_io.text(2, "cannot read file: {options.input}\n"); return BuildResult.failed(); },
         Ok(compilation) => {
             if (prelude_error(compilation)) { return BuildResult.failed(); }
-            var source_hash = if (options.cache_record) { driver_fingerprint.sources(compilation.sources) } else { String.new() };
+            var source_hash = if (options.cache_record) { compilation.source_hash() } else { String.new() };
             var ax = Axon.new(options.target);
             if (compilation.ok) {
                 compilation.ok = ax.generate(&compilation.lowerer.ck, &const compilation.trees, &compilation.lowerer.module);

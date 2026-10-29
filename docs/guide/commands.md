@@ -21,12 +21,18 @@ unknown command prints an error and the usage summary and exits with status 1.
 ## build
 
 ```text
-synx build <file.snx> [options]
+synx build [file.snx] [options]
 ```
 
 Compiles the program whose `main` is in *file.snx* and writes a native
 executable. Modules imported by the program are found relative to the folder
 of *file.snx*. The `std` modules are found in the installation.
+
+With no source argument, Myelin uses the nearest `synx.toml` project. It resolves
+dependencies and writes the application under `build/debug` or `build/release`.
+`synx run` and `synx check` also accept project defaults. See
+[Projects and dependencies](packages.md) for `new`, `add`, `fetch`, manifests,
+lock files, `--locked`, and `--offline`.
 
 The default output is the input path with the extension removed, plus `.exe`
 on Windows: `src/game.snx` builds `src/game.exe` or `src/game`. On success,
@@ -215,6 +221,7 @@ builds and tests. An installed compiler needs none of them.
 | `SYNX_STD_PATH` | Folder that holds the `std` modules. |
 | `SYNX_RUNTIME_HOST` | Path to the native runtime template used for standalone builds. |
 | `SYNX_CACHE_DIR` | Private output folder for `synx run`. |
+| `SYNX_MYELIN_CACHE` | Private Git checkout cache for Myelin. |
 | `SYNX_RUNTIME_SHARED` | Path to the runtime library that `--shared-runtime` uses and copies next to the program. |
 | `SYNX_RUNTIME_LIB` | Path to the static runtime library (`synx_rt.lib` or `libsynx_rt.a`). When it is set, the default linker is the system linker. |
 | `SYNX_LINKER` | `builtin` or `system`. Selects the linker when no `--linker` option is given. |

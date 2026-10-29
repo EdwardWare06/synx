@@ -36,9 +36,10 @@ static wchar_t* publication_target(const wchar_t* path) {
   free(absolute); return extended;
 }
 #endif
-int synx_rt_link_write(const uint8_t* path, uint64_t length, const uint8_t* bytes, uint64_t size) {
+static int publication_write(const uint8_t* path, uint64_t length, const uint8_t* bytes, uint64_t size, int executable) {
   if (!length || length >= INT_MAX || memchr(path, 0, (size_t)length)) return EINVAL;
 #if defined(_WIN32)
+  (void)executable;
   int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)path, (int)length, NULL, 0);
   if (!count) return EINVAL;
   wchar_t* decoded = (wchar_t*)malloc(((size_t)count + 1) * sizeof(wchar_t));
@@ -99,12 +100,20 @@ int synx_rt_link_write(const uint8_t* path, uint64_t length, const uint8_t* byte
      linker would create them. The compiler links on one thread, so reading
      the umask by setting and restoring it is safe here. */
   mode_t mask = umask(022); umask(mask);
-  if (!error && fchmod(file, 0777 & ~mask)) error = errno;
+  if (!error && fchmod(file, (executable ? 0777 : 0666) & ~mask)) error = errno;
+  if (!error && fsync(file)) error = errno;
   if (file >= 0 && close(file) && !error) error = errno;
   if (!error && rename(temporary, target)) error = errno;
   if (error && file >= 0) unlink(temporary);
   free(target); free(temporary); return error;
 #endif
+}
+int synx_rt_link_write(const uint8_t* path, uint64_t length, const uint8_t* bytes, uint64_t size) {
+  return publication_write(path, length, bytes, size, 1);
+}
+/* Atomic manifest/lock publication uses ordinary data-file permissions. */
+int synx_rt_myelin_write(const uint8_t* path, uint64_t length, const uint8_t* bytes, uint64_t size) {
+  return publication_write(path, length, bytes, size, 0);
 }
 int synx_rt_link_executable(const uint8_t* path, uint64_t length) {
 #if defined(_WIN32)

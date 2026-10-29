@@ -130,6 +130,11 @@ a file without building it, and `synx about` describes the compiler.
 `synx fmt hello.snx` formats the file. Use `synx fmt --check hello.snx` to
 check its format without changing it.
 
+`synx new hello` creates a project with `synx.toml`. Inside the project,
+`synx build` and `synx run` use its entry file. Myelin manages local and Git
+dependencies with `synx add`, `synx fetch`, and `synx.lock`. See
+[Projects and dependencies](docs/guide/packages.md).
+
 ## How it's built
 
 Everything between the source file and the executable is part of this
@@ -157,7 +162,7 @@ the compiler that was compiled by itself.
 The component names come from my interest in neuroscience. A dendrite takes
 in signals for a neuron and an axon sends them out, so Dendrite is where the
 program comes in and Axon is where machine code goes out. Myelin speeds up
-signals along an axon, and that's the name saved for the package manager.
+signals along an axon, and that's the name of the package manager.
 
 The examples have more of me in them. The tutorial uses songs I listen to
 and gym math in pounds: sets, reps, plates, and adding weight each set. There are also a few small details involving one of my favorite video games hidden around the toolchain if you go looking.
@@ -196,7 +201,7 @@ Synx is at 0.2.0. It's a working language, but it's still early.
 - Values shared between threads with `Arc` or sent over channels have to own
   their data. They can't hold references.
 - `?.` supports optional fields and calls.
-- The Myelin package manager is planned, not built.
+- Myelin supports local and Git dependencies. A hosted registry is planned.
 
 ## Documentation
 

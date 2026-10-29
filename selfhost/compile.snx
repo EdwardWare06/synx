@@ -14,6 +14,8 @@ import async_frame;
 import bytes;
 import std.fs;
 import std.mem;
+import myelin.project;
+import driver_fingerprint;
 
 pub struct Compilation {
     pub Vec<SourceFile> sources;
@@ -22,6 +24,11 @@ pub struct Compilation {
     pub Lowerer lowerer;
     pub bool ok;
     pub uint stage;
+    String packages_hash;
+    pub String source_hash(&const self) {
+        var sources = driver_fingerprint.sources(self.sources); if (self.packages_hash.is_empty()) { return sources; }
+        Vec<byte> data = Vec.new(); bytes.text(&data, sources); bytes.text(&data, self.packages_hash); return driver_fingerprint.hash(data);
+    }
     pub Result<Compilation, fs.IoError> load(&const str input, Vec<byte> prelude, &const str std_fallback, uint stage, bool require_main) {
         return Compilation.load_inputs(input, prelude, std_fallback, stage, require_main, source.Inputs.new(), false);
     }
@@ -33,6 +40,8 @@ pub struct Compilation {
         bool std_failed = false; String std_root = String.new();
         match standard_library(std_fallback) { Ok(path) => { std_root = path; }, Err(_) => { std_failed = true; } }
         var loader = ModuleLoader.new(user, prelude_file, std_root); loader.inputs = inputs; loader.editor = editor; if (std_failed) { loader.host_failed = true; }
+        String packages_hash = String.new();
+        match project.cached(input) { Ok(graph) => { if (!graph.packages.is_empty()) { packages_hash = driver_fingerprint.hash(graph.lock_bytes()); } loader.packages = graph; }, Err(message) => { loader.resolver.sink.error(source.Span { file: 0, start: 0, end: 0 }, message, "SNX0305"); } }
         bool ok = loader.run();
         if (loader.prelude_sink.has_errors()) { ok = false; }
         if ((ok || editor) && stage >= 1) { ok = loader.resolve_signatures(); }
@@ -46,7 +55,7 @@ pub struct Compilation {
         var sources = mem.replace(&loader.sources, Vec.new()); var trees = mem.replace(&loader.trees, Vec.new());
         var prelude_sink = mem.replace(&loader.prelude_sink, DiagnosticSink.new());
         return Ok(Compilation { sources: sources, trees: trees, prelude_sink: prelude_sink,
-            lowerer: lowerer, ok: ok, stage: stage });
+            lowerer: lowerer, ok: ok, stage: stage, packages_hash: packages_hash });
     }
     pub Vec<byte> diagnostics(&const self) {
         return self.lowerer.ck.r.sink.render(self.sources.get(0).unwrap(), self.sources);
