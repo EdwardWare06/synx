@@ -9,7 +9,8 @@ pub struct Target {
     pub TargetOs os;
     pub bool register_allocation;
     pub bool checked_arithmetic;
-    pub Target new(TargetOs os) { return Target { os: os, register_allocation: true, checked_arithmetic: true }; }
+    pub bool debug_info;
+    pub Target new(TargetOs os) { return Target { os: os, register_allocation: true, checked_arithmetic: true, debug_info: match os { Linux => true, Windows => true, _ => false } }; }
     pub ObjectFormat format(&const self) {
         match self.os { Linux => return ObjectFormat.Elf, Windows => return ObjectFormat.Coff, MacOs => return ObjectFormat.MachO }
     }

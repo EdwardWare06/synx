@@ -618,7 +618,8 @@ never panic(&const str message)
 ```
 
 Writes `Synx panic: `, *message*, and a line feed to standard error. Then
-ends the process with exit status 101. Destructors do not run.
+ends the process with exit status 101. Destructors, C exit hooks, and library
+cleanup callbacks do not run.
 
 `never` is the type of an expression that does not return. A `panic` call can
 stand where a value of any type is expected.

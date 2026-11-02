@@ -32,6 +32,22 @@ set_tests_properties(fmt PROPERTIES TIMEOUT 1800)
 add_test(NAME myelin COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/myelin/test_myelin.py ${SYNX_COMPILER})
 set_tests_properties(myelin PROPERTIES TIMEOUT 1800)
 
+add_test(NAME debug_info COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/debug/test_debug.py
+         ${SYNX_COMPILER} ${CMAKE_BINARY_DIR}/runtime)
+set_tests_properties(debug_info PROPERTIES TIMEOUT 1800)
+if(WIN32)
+  add_executable(test_windows_debug debug/windows.cpp)
+  target_link_libraries(test_windows_debug PRIVATE dbghelp)
+  add_executable(test_windows_variables debug/variables.cpp)
+  target_link_libraries(test_windows_variables PRIVATE dbghelp)
+endif()
+add_test(NAME pdb_info COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/debug/test_pdb.py
+         ${SYNX_COMPILER} ${CMAKE_BINARY_DIR}/runtime ${CMAKE_BINARY_DIR}/tests)
+set_tests_properties(pdb_info PROPERTIES TIMEOUT 1800)
+add_test(NAME debug_variables COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/debug/test_variables.py
+         ${SYNX_COMPILER} ${CMAKE_BINARY_DIR}/runtime ${CMAKE_BINARY_DIR}/tests)
+set_tests_properties(debug_variables PROPERTIES TIMEOUT 1800)
+
 # Fixed point: stage 2 builds stage 3, and the two compiler objects must be
 # byte-identical. Then stage 3 builds and runs the workbench example.
 add_test(NAME bootstrap COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/bootstrap/fixed_point.py
@@ -97,6 +113,21 @@ if(APPLE)
 endif()
 add_test(NAME host_runtime COMMAND test_host_runtime)
 set_tests_properties(host_runtime PROPERTIES TIMEOUT 30)
+
+# Panic is immediate process termination, including from a worker. A C exit
+# hook must never replace status 101 or execute user cleanup after the panic.
+add_executable(test_panic_termination panic/termination.c ../runtime/synx_rt.c)
+target_compile_definitions(test_panic_termination PRIVATE SYNX_SHARED_RUNTIME _CRT_SECURE_NO_WARNINGS)
+if(WIN32)
+  target_link_libraries(test_panic_termination PRIVATE shell32)
+elseif(APPLE)
+  set_target_properties(test_panic_termination PROPERTIES OSX_ARCHITECTURES x86_64)
+else()
+  target_link_libraries(test_panic_termination PRIVATE pthread)
+endif()
+add_test(NAME panic_termination COMMAND ${Python3_EXECUTABLE} -B
+         ${CMAKE_SOURCE_DIR}/tests/panic/test_termination.py $<TARGET_FILE:test_panic_termination>)
+set_tests_properties(panic_termination PROPERTIES TIMEOUT 90)
 
 # Wake race regression: a runtime variant with a test hook forces the waker
 # drop between the executor's readiness and retention checks.

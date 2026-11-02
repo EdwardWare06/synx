@@ -1,0 +1,19 @@
+/// Windows x64 fixed-stack unwind descriptions. RBP addresses stack slots;
+/// unwind uses RSP because large frames cannot fit SET_FPREG's 4-bit offset.
+import debug.data;
+import bytes;
+pub struct Frame { pub String symbol; pub ulong size; pub Vec<byte> info; }
+pub struct Step { pub usize end; pub byte op; pub byte reg; pub ulong value; }
+pub Vec<byte> encode(&const Vec<Step> steps) {
+    Vec<byte> codes = Vec.new(); usize prolog = 0;
+    for (i in 0..steps.len()) { var s = steps[steps.len() - i - 1]; if (s.end > 255) { panic("Windows unwind prologue exceeds 255 bytes"); } if (s.end > prolog) { prolog = s.end; }
+        codes.push(s.end as byte);
+        if (s.op == 0) { codes.push(s.reg << 4); }
+        else if (s.op == 1) {
+            if (s.value <= 128) { codes.push((((s.value - 8) / 8) << 4 | 2) as byte); }
+            else if (s.value <= 524280) { codes.push(1); data.word(&codes, s.value / 8, 2); }
+            else { codes.push(17); data.word(&codes, s.value, 4); }
+        } else { bool far = s.value / 8 > 65535; codes.push((s.reg << 4) | (if (far) { 5 as byte } else { 4 as byte })); data.word(&codes, if (far) { s.value } else { s.value / 8 }, if (far) { 4 } else { 2 }); }
+    }
+    Vec<byte> out = Vec.new(); out.push(1); out.push(prolog as byte); out.push((codes.len() / 2) as byte); out.push(0); bytes.append(&out, codes); while (out.len() % 4 != 0) { out.push(0); } return out;
+}

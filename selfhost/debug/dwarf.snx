@@ -1,0 +1,143 @@
+/// DWARF v4 line programs and minimal compilation/subprogram DIEs.
+/// Address fixups are ELF relocations in objects and load-base patches in JIT
+/// symbol images. Section-offset fixups remain separate from target addresses.
+import debug.data.{Unit, Function};
+import debug.data;
+import bytes;
+import std.mem;
+import debug.values.Variable;
+import debug.scopes;
+import ids.NONE;
+pub struct Fixup { pub usize offset; pub String symbol; pub ulong addend; pub int kind; }
+pub struct Section { pub String name; pub Vec<byte> data; pub Vec<Fixup> fixups; }
+struct Buffer {
+    Vec<byte> data; Vec<Fixup> fixups;
+    Buffer new() { return Buffer { data: Vec.new(), fixups: Vec.new() }; }
+    void word(&self, ulong value, usize width) { data.word(&self.data, value, width); }
+    void uleb(&self, ulong value) { ulong n = value; while (n >= 128) { self.word((n & 127) | 128, 1); n >>= 7; } self.word(n, 1); }
+    void sleb(&self, long value) { long n = value; while (true) { ulong b = (n as ulong) & 127; n >>= 7; bool done = (n == 0 && b & 64 == 0) || (n == -1 && b & 64 != 0); self.word(b | if (done) { 0 } else { 128 }, 1); if (done) { break; } } }
+    void string(&self, &const str value) { bytes.text(&self.data, value); self.word(0, 1); }
+    void patch(&self, usize offset, ulong value) { for (i in 0..4) { *self.data.get_mut(offset + i).unwrap() = ((value >> (i * 8)) & 255) as byte; } }
+    void address(&self, &const Function f, ulong addend) { self.fixups.push(Fixup { offset: self.data.len(), symbol: String.from(f.symbol), addend: addend, kind: 0 }); self.word(f.address + addend, 8); }
+    void section(&self, &const str name) { self.fixups.push(Fixup { offset: self.data.len(), symbol: String.from(name), addend: 0, kind: 1 }); self.word(0, 4); }
+    void section_at(&self, &const str name, ulong offset) { self.fixups.push(Fixup { offset: self.data.len(), symbol: String.from(name), addend: offset, kind: 1 }); self.word(offset, 4); }
+    Section finish(self, &const str name) { return Section { name: String.from(name), data: mem.replace(&self.data, Vec.new()), fixups: mem.replace(&self.fixups, Vec.new()) }; }
+}
+void attribute(&Buffer b, ulong name, ulong form) { b.uleb(name); b.uleb(form); }
+struct Ref { usize offset; uint type; }
+void reference(&Buffer b, &Vec<Ref> refs, uint type) { refs.push(Ref { offset: b.data.len(), type: type }); b.word(0, 4); }
+void abbreviation(&Buffer b, ulong code, ulong tag, bool children, &const ulong[] attrs) {
+    b.uleb(code); b.uleb(tag); b.word(if (children) { 1 } else { 0 }, 1);
+    usize i = 0; while (i < attrs.len()) { attribute(&*b, attrs[i], attrs[i + 1]); i += 2; } attribute(&*b, 0, 0);
+}
+void variable(&Buffer info, &Vec<Ref> refs, &const Variable v, ulong loc, bool parameter) {
+    info.uleb(if (parameter) { 12 } else { 13 }); info.string(v.name); reference(&*info, &*refs, v.type); info.section_at(".debug_loc", loc);
+}
+ulong dwarf_register(int reg) {
+    return if (reg == 1) { 2 } else if (reg == 2) { 1 } else if (reg == 4) { 7 } else if (reg == 5) { 6 } else if (reg == 6) { 4 } else if (reg == 7) { 5 } else { reg as ulong };
+}
+Section frames(&const Unit unit) {
+    var b = Buffer.new(); b.word(0, 4); b.word(0xffffffff, 4); b.word(4, 1); b.string(""); b.word(8, 1); b.word(0, 1); b.uleb(1); b.sleb(-8); b.uleb(16);
+    b.word(0x0c, 1); b.uleb(7); b.uleb(8); b.word(0x90, 1); b.uleb(1);
+    for (r in &const [3 as ulong, 6, 12, 13, 14, 15]) { b.word(8, 1); b.uleb(*r); }
+    for (r in &const [0 as ulong, 1, 2, 4, 5, 8, 9, 10, 11]) { b.word(7, 1); b.uleb(*r); }
+    while (b.data.len() % 8 != 0) { b.word(0, 1); } b.patch(0, b.data.len() as ulong - 4);
+    for (f in &const unit.functions) { if (f.values.cfi.is_empty()) { continue; }
+        usize start = b.data.len(); b.word(0, 4); b.section(".debug_frame"); b.address(f, 0); b.word(f.size, 8); ulong pc = 0;
+        for (c in &const f.values.cfi) {
+            if (c.pc > pc) { b.word(4, 1); b.word(c.pc - pc, 4); pc = c.pc; }
+            if (c.reg == -2) { b.word(0x0e, 1); b.uleb(16); }
+            else if (c.reg == -3) { b.word(0x0c, 1); b.uleb(6); b.uleb(16); }
+            else if (c.reg == -4) { b.word(0x0c, 1); b.uleb(7); b.uleb(8); }
+            else if (c.offset == 2147483647) { b.word(8, 1); b.uleb(dwarf_register(c.reg)); }
+            else { b.word(0x80 + dwarf_register(c.reg), 1); b.uleb(((16 - c.offset as long) / 8) as ulong); }
+        }
+        while (b.data.len() % 8 != 0) { b.word(0, 1); } b.patch(start, (b.data.len() - start - 4) as ulong);
+    } return b.finish(".debug_frame");
+}
+pub Vec<Section> emit(&const Unit unit) {
+    Vec<Section> out = Vec.new(); if (unit.empty()) { return out; }
+    var abbrev = Buffer.new();
+    abbrev.uleb(1); abbrev.uleb(0x11); abbrev.word(1, 1); // compile_unit, children
+    attribute(&abbrev, 0x25, 8); attribute(&abbrev, 0x13, 5); attribute(&abbrev, 3, 8); attribute(&abbrev, 0x10, 0x17); attribute(&abbrev, 0x11, 1); attribute(&abbrev, 0x12, 1); attribute(&abbrev, 0, 0);
+    abbreviation(&abbrev, 2, 0x2e, true, [3, 8, 0x3a, 0x0f, 0x3b, 0x0f, 0x11, 1, 0x12, 6, 0x3f, 0x19, 0x49, 0x13]);
+    abbreviation(&abbrev, 3, 0x24, false, [3, 8, 0x0b, 0x0f, 0x3e, 0x0b]);
+    abbreviation(&abbrev, 4, 0x0f, false, [3, 8, 0x0b, 0x0f, 0x49, 0x13]);
+    abbreviation(&abbrev, 5, 0x01, true, [0x49, 0x13, 0x0b, 0x0f]);
+    abbreviation(&abbrev, 6, 0x21, false, [0x37, 0x0f]);
+    abbreviation(&abbrev, 7, 0x13, true, [3, 8, 0x0b, 0x0f]);
+    abbreviation(&abbrev, 8, 0x17, true, [3, 8, 0x0b, 0x0f]);
+    abbreviation(&abbrev, 9, 0x0d, false, [3, 8, 0x49, 0x13, 0x38, 0x0f]);
+    abbreviation(&abbrev, 10, 0x04, true, [3, 8, 0x0b, 0x0f]);
+    abbreviation(&abbrev, 11, 0x28, false, [3, 8, 0x1c, 0x0f]);
+    abbreviation(&abbrev, 12, 0x05, false, [3, 8, 0x49, 0x13, 0x02, 0x17]);
+    abbreviation(&abbrev, 13, 0x34, false, [3, 8, 0x49, 0x13, 0x02, 0x17]);
+    abbreviation(&abbrev, 14, 0x0b, true, [0x11, 1, 0x12, 6]);
+    abbreviation(&abbrev, 15, 0x26, false, [0x49, 0x13]);
+    abbreviation(&abbrev, 16, 0x3b, false, [3, 8]); abbrev.uleb(0);
+    var info = Buffer.new(); info.word(0, 4); info.word(4, 2); info.section(".debug_abbrev"); info.word(8, 1);
+    info.uleb(1); info.string("Synx Axon"); info.word(2, 2); // C debugger expression mode
+    info.string(unit.files.get(0).unwrap().as_str()); info.section(".debug_line");
+    usize first = 0; usize last = 0; for (i in 0..unit.functions.len()) { if (unit.functions.get(i).unwrap().address < unit.functions.get(first).unwrap().address) { first = i; } if (unit.functions.get(i).unwrap().address + unit.functions.get(i).unwrap().size > unit.functions.get(last).unwrap().address + unit.functions.get(last).unwrap().size) { last = i; } }
+    info.address(unit.functions.get(first).unwrap(), 0); info.address(unit.functions.get(last).unwrap(), unit.functions.get(last).unwrap().size);
+    Vec<Ref> refs = Vec.new(); Vec<ulong> offsets = Vec.new();
+    for (t in &const unit.types) {
+        offsets.push(info.data.len() as ulong);
+        if (t.kind >= 1 && t.kind <= 4) { info.uleb(3); info.string(t.name); info.uleb(t.size); info.word(if (t.kind == 1) { 5 } else if (t.kind == 2) { 7 } else if (t.kind == 3) { 2 } else { 4 }, 1); }
+        else if (t.kind == 5) { info.uleb(4); info.string(t.name); info.uleb(t.size); reference(&info, &refs, t.inner); }
+        else if (t.kind == 6) { info.uleb(5); reference(&info, &refs, t.inner); info.uleb(t.size); info.uleb(6); info.uleb(t.count); info.uleb(0); }
+        else if (t.kind == 7 || t.kind == 8) { info.uleb(if (t.kind == 7) { 7 } else { 8 }); info.string(t.name); info.uleb(t.size);
+            for (f in &const t.fields) { info.uleb(9); info.string(f.name); reference(&info, &refs, f.type); info.uleb(f.offset); } info.uleb(0);
+        } else if (t.kind == 9) { info.uleb(10); info.string(t.name); info.uleb(t.size); for (f in &const t.fields) { info.uleb(11); info.string(f.name); info.uleb(f.offset); } info.uleb(0); }
+        else if (t.kind == 10) { info.uleb(15); reference(&info, &refs, t.inner); }
+        else { info.uleb(16); info.string(t.name); }
+    }
+    ulong void_type = info.data.len() as ulong; info.uleb(16); info.string("void"); var locations = Buffer.new();
+    for (f in &const unit.functions) {
+        if (f.rows.is_empty()) { continue; } var row = f.rows.get(0).unwrap(); info.uleb(2); info.string(f.name); info.uleb(row.file as ulong + 1); info.uleb(row.line as ulong); info.address(f, 0); info.word(f.size, 4); reference(&info, &refs, f.values.ret);
+        Vec<ulong> locs = Vec.new();
+        for (v in &const f.values.variables) {
+            locs.push(locations.data.len() as ulong);
+            // A base-selection entry makes each range relative to this function.
+            locations.word(18446744073709551615, 8); locations.address(f, 0);
+            for (r in &const v.locations) {
+                locations.word(r.begin, 8); locations.word(r.end, 8); var expr = Buffer.new();
+                if (r.reg >= 0) { expr.word(0x50 + dwarf_register(r.reg), 1); }
+                else { expr.word(0x76, 1); expr.sleb(r.offset as long); }
+                locations.word(expr.data.len() as ulong, 2); bytes.append(&locations.data, expr.data);
+            } locations.word(0, 8); locations.word(0, 8);
+        }
+        for (i in 0..f.values.variables.len()) { var v = f.values.variables.get(i).unwrap(); if (v.parameter) { variable(&info, &refs, v, locs[i], true); } }
+        for (scope in &const scopes.split(f.values)) {
+            info.uleb(14); info.address(f, scope.begin); info.word(scope.end - scope.begin, 4);
+            for (i in &const scope.variables) { variable(&info, &refs, f.values.variables.get(*i as usize).unwrap(), locs[*i as usize], false); } info.uleb(0);
+        } info.uleb(0);
+    }
+    for (r in &const refs) { info.patch(r.offset, if (r.type == NONE) { void_type } else { offsets[r.type as usize] }); }
+    info.uleb(0); info.patch(0, info.data.len() as ulong - 4);
+    var line = Buffer.new(); line.word(0, 4); line.word(4, 2); line.word(0, 4); usize header = line.data.len();
+    line.word(1, 1); line.word(1, 1); line.word(1, 1); line.word(251, 1); line.word(14, 1); line.word(13, 1);
+    for (n in &const [0 as ulong, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]) { line.word(*n, 1); }
+    line.word(0, 1); // directories: absolute file names
+    for (file in &const unit.files) { line.string(*file); line.uleb(0); line.uleb(0); line.uleb(0); } line.word(0, 1); line.patch(6, (line.data.len() - header) as ulong);
+    for (f in &const unit.functions) {
+        if (f.rows.is_empty()) { continue; }
+        line.word(0, 1); line.uleb(9); line.word(2, 1); line.address(f, 0);
+        var first_row = f.rows.get(0).unwrap();
+        ulong pc = 0; long source_line = first_row.line as long; uint file = first_row.file; uint column = 0; bool prologue = true;
+        // A non-statement entry row lets GDB discover source at the call target
+        // before it skips the prologue. The first real row marks prologue_end.
+        line.word(4, 1); line.uleb(file as ulong + 1); line.word(3, 1); line.sleb(source_line - 1);
+        line.word(6, 1); line.word(1, 1); line.word(6, 1);
+        for (r in &const f.rows) {
+            if (r.offset != pc) { line.word(2, 1); line.uleb(r.offset - pc); pc = r.offset; }
+            if (r.file != file) { line.word(4, 1); line.uleb(r.file as ulong + 1); file = r.file; }
+            if (r.line as long != source_line) { line.word(3, 1); line.sleb(r.line as long - source_line); source_line = r.line as long; }
+            if (r.column != column) { line.word(5, 1); line.uleb(r.column as ulong); column = r.column; }
+            if (prologue) { line.word(10, 1); prologue = false; } line.word(1, 1);
+        }
+        line.word(2, 1); line.uleb(f.size - pc); line.word(0, 1); line.uleb(1); line.word(1, 1);
+    }
+    line.patch(0, line.data.len() as ulong - 4);
+    out.push(info.finish(".debug_info")); out.push(abbrev.finish(".debug_abbrev")); out.push(line.finish(".debug_line")); out.push(locations.finish(".debug_loc")); out.push(frames(unit)); return out;
+}

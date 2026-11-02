@@ -1,13 +1,13 @@
 # Synx documentation
 
-Synx 0.2.0. Synx is a compiled language for systems code, applications,
+Synx 0.3.0. Synx is a compiled language for systems code, applications,
 tools, and games. It uses ownership and borrowing in place of a garbage
 collector, and it compiles to native x86-64 programs for Windows, Linux, and
 macOS.
 
 ## Using Synx
 
-- [Synx 0.2.0 release notes](guide/releases/0.2.0.md).
+- [Synx 0.3.0 release notes](guide/releases/0.3.0.md).
 
 - [Installing Synx](guide/install.md): packages for Windows, Linux, and macOS,
   `PATH` setup, and building from source.
@@ -19,6 +19,7 @@ macOS.
   and environment variable.
 - [Formatting source](guide/formatting.md): style rules, CLI modes, and
   Format Document in VS Code.
+- [Debugging](guide/debugging.md): Linux and Windows source debugging, variables, and types.
 - [Projects and dependencies](guide/packages.md): Myelin manifests, Git and
   local dependencies, lock files, and offline builds.
 

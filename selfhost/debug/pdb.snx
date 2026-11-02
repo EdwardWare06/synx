@@ -1,0 +1,159 @@
+/// Deterministic MSF 7 / PDB source-level symbols for AMD64 PE images.
+/// Owns all streams. No filesystem or native PDB-writing dependency.
+/// Format references: llvm.org/docs/PDB/{MsfFile,PdbStream,DbiStream}.html.
+import debug.cv.{Buffer, Files};
+import debug.cv;
+import debug.cv_types;
+import debug.cv_types.Types;
+import debug.data.Unit;
+import debug.data;
+import bytes;
+import std.binary;
+import std.utf8;
+import std.text;
+import link.model.{Failure, Code};
+import link.model;
+
+pub ulong hash(&const Vec<byte> name, usize start, usize end) {
+    ulong value = 0; usize at = start;
+    while (end - at >= 4) { value ^= binary.read_uint(name, at, 4, true).unwrap(); at += 4; }
+    if (end - at >= 2) { value ^= binary.read_uint(name, at, 2, true).unwrap(); at += 2; }
+    if (at < end) { value ^= name[at] as ulong; }
+    value |= 0x20202020; value ^= value >> 11; value ^= value >> 16; return value;
+}
+Vec<byte> info(&const Vec<byte> guid) {
+    var out = Buffer.new(); out.word(20000404, 4); out.word(binary.read_uint(guid, 0, 4, true).unwrap(), 4); out.word(1, 4); out.append(guid);
+    out.word(7, 4); out.string("/names"); out.word(1, 4); out.word(2, 4);
+    out.word(1, 4); var name = utf8.encode("/names"); out.word(1 << (hash(name, 0, name.len()) % 2), 4);
+    out.word(0, 4); out.word(0, 4); out.word(5, 4); out.word(0, 4); out.word(20140508, 4); return out.data;
+}
+Vec<byte> types(&const Types types, bool empty) {
+    var out = Buffer.new(); usize count = if (empty) { 0 } else { types.offsets.len() }; usize size = if (empty) { 0 } else { types.data.len() };
+    out.word(20040203, 4); out.word(56, 4); out.word(0x1000, 4); out.word(0x1000 + count as ulong, 4); out.word(size as ulong, 4);
+    out.word(if (empty) { 65535 } else { 11 }, 2); out.word(65535, 2); out.word(4, 4); out.word(0x3ffff, 4);
+    out.word(0, 4); out.word(count as ulong * 4, 4); out.word(count as ulong * 4, 4); out.word(count as ulong * 8, 4); out.word(count as ulong * 12, 4); out.word(0, 4);
+    if (!empty) { out.append(types.data); } return out.data;
+}
+ulong type_hash(&const Vec<byte> record, usize start, usize end) {
+    // CodeView hashBufferV8 is reflected CRC32 with an initial value of zero
+    // and no final complement (JamCRC). The record includes its length field.
+    ulong crc = 0; for (i in start..end) { crc ^= record[i] as ulong;
+        for (bit in 0..8) { crc = (crc >> 1) ^ if ((crc & 1) != 0) { 0xedb88320 } else { 0 }; }
+    } return crc % 0x3ffff;
+}
+Vec<byte> type_hashes(&const Types types) {
+    var out = Buffer.new();
+    for (i in 0..types.offsets.len()) { usize end = if (i + 1 < types.offsets.len()) { types.offsets[i + 1] } else { types.data.len() };
+        ulong value = type_hash(types.data, types.offsets[i], end);
+        if (!types.hashes[i].is_empty()) { var raw = utf8.encode(types.hashes[i]); value = hash(raw, 0, raw.len()) % 0x3ffff; }
+        out.word(value, 4);
+    }
+    for (i in 0..types.offsets.len()) { out.word(0x1000 + i as ulong, 4); out.word(types.offsets[i] as ulong, 4); } return out.data;
+}
+Vec<byte> names(&const Files files) {
+    var offsets = Vec.new(); usize at = 1;
+    while (at < files.strings.len()) { offsets.push(at); while (at < files.strings.len() && files.strings[at] != 0) { at += 1; } at += 1; }
+    usize capacity = offsets.len() * 2 + 1; Vec<ulong> table = Vec.new(); for (i in 0..capacity) { table.push(0); }
+    for (offset in &const offsets) { usize end = *offset; while (end < files.strings.len() && files.strings[end] != 0) { end += 1; }
+        usize bucket = (hash(files.strings, *offset, end) % capacity as ulong) as usize;
+        while (table[bucket] != 0) { bucket = (bucket + 1) % capacity; } *table.get_mut(bucket).unwrap() = *offset as ulong;
+    }
+    var out = Buffer.new(); out.word(0xeffeeffe, 4); out.word(1, 4); out.word(files.strings.len() as ulong, 4); out.append(files.strings);
+    out.word(capacity as ulong, 4); for (value in &const table) { out.word(*value, 4); } out.word(offsets.len() as ulong, 4); return out.data;
+}
+struct Public { String name; ulong offset; ulong address; }
+bool before(&const Public a, &const Public b) {
+    if (a.name.len() != b.name.len()) { return a.name.len() < b.name.len(); }
+    return text.to_ascii_lowercase(a.name) < text.to_ascii_lowercase(b.name);
+}
+Vec<byte> gsi(&const Vec<Public> entries) {
+    Vec<Vec<usize>> buckets = Vec.new(); for (i in 0..4096) { buckets.push(Vec.new()); }
+    for (i in 0..entries.len()) { var raw = utf8.encode(entries[i].name); usize bucket = (hash(raw, 0, raw.len()) % 4096) as usize;
+        var items = buckets.get_mut(bucket).unwrap(); items.push(i); usize j = items.len() - 1;
+        while (j > 0 && before(entries[items[j]], entries[items[j - 1]])) { items.swap(j, j - 1); j -= 1; }
+    }
+    var records = Buffer.new(); var bitmap = Buffer.new(); var starts = Buffer.new();
+    for (word in 0..129) { ulong bits = 0;
+        for (bit in 0..32) { usize bucket = word * 32 + bit; if (bucket >= 4096 || buckets[bucket].is_empty()) { continue; }
+            bits |= 1 << bit; starts.word(records.data.len() as ulong / 8 * 12, 4);
+            for (idx in &const buckets[bucket]) { records.word(entries[*idx].offset + 1, 4); records.word(1, 4); }
+        } bitmap.word(bits, 4);
+    }
+    var out = Buffer.new(); out.word(0xffffffff, 4); out.word(0xf12f091a, 4); out.word(records.data.len() as ulong, 4); out.word((bitmap.data.len() + starts.data.len()) as ulong, 4);
+    out.append(records.data); out.append(bitmap.data); out.append(starts.data); return out.data;
+}
+void contribution(&Buffer out, uint segment, ulong size) {
+    out.word(segment as ulong, 2); out.word(0, 2); out.word(0, 4); out.word(size, 4); out.word(0x60000020, 4); out.word(0, 2); out.word(0, 2); out.word(0, 4); out.word(0, 4);
+}
+Vec<byte> dbi(&const Unit unit, &const Vec<byte> sections, uint segment, ulong size, usize sym_bytes, usize line_bytes) {
+    var mods = Buffer.new(); mods.word(0, 4); contribution(&mods, segment, size); mods.word(0, 2); mods.word(6, 2);
+    mods.word(sym_bytes as ulong, 4); mods.word(0, 4); mods.word(line_bytes as ulong, 4); mods.word(unit.files.len() as ulong, 2); mods.word(0, 2);
+    mods.word(0, 4); mods.word(0, 4); mods.word(0, 4); mods.string("Synx"); mods.string("Synx.obj"); mods.align();
+    var contributions = Buffer.new(); contributions.word(0xf12eba2d, 4); contribution(&contributions, segment, size);
+    var map = Buffer.new(); usize count = sections.len() / 40; map.word(count as ulong, 2); map.word(count as ulong, 2);
+    for (i in 0..count) {
+        ulong flags = binary.read_uint(sections, i * 40 + 36, 4, true).unwrap();
+        map.word(0x108 | (if ((flags & 0x40000000) != 0) { 1 } else { 0 }) | (if ((flags & 0x80000000) != 0) { 2 } else { 0 }) | (if ((flags & 0x20000000) != 0) { 4 } else { 0 }), 2);
+        map.word(0, 2); map.word(0, 2); map.word((i + 1) as ulong, 2); map.word(65535, 2); map.word(65535, 2); map.word(0, 4); map.word(binary.read_uint(sections, i * 40 + 8, 4, true).unwrap(), 4);
+    }
+    var sources = Buffer.new(); var source_names = Buffer.new(); sources.word(1, 2); sources.word(unit.files.len() as ulong, 2); sources.word(0, 2); sources.word(unit.files.len() as ulong, 2);
+    for (file in &const unit.files) { sources.word(source_names.data.len() as ulong, 4); source_names.string(*file); } sources.append(source_names.data); sources.align();
+    var empty_files = cv.files(Unit.new(), Vec.new()); var ec = names(empty_files);
+    var out = Buffer.new(); out.word(0xffffffff, 4); out.word(19990903, 4); out.word(1, 4); out.word(9, 2); out.word(0x8e00, 2); out.word(10, 2); out.word(0, 2); out.word(8, 2); out.word(0, 2);
+    out.word(mods.data.len() as ulong, 4); out.word(contributions.data.len() as ulong, 4); out.word(map.data.len() as ulong, 4); out.word(sources.data.len() as ulong, 4);
+    out.word(0, 4); out.word(0, 4); out.word(22, 4); out.word(ec.len() as ulong, 4); out.word(0, 2); out.word(0x8664, 2); out.word(0, 4);
+    out.append(mods.data); out.append(contributions.data); out.append(map.data); out.append(sources.data);
+    out.append(ec); for (i in 0..11) { out.word(if (i == 5) { 7 } else { 65535 }, 2); } return out.data;
+}
+usize block(&Buffer out) {
+    while (out.data.len() / 4096 % 4096 == 1 || out.data.len() / 4096 % 4096 == 2) { for (i in 0..4096) { out.word(0, 1); } }
+    usize idx = out.data.len() / 4096; for (i in 0..4096) { out.word(0, 1); } return idx;
+}
+Vec<uint> pages(&Buffer out, &const Vec<byte> stream) {
+    Vec<uint> result = Vec.new(); usize at = 0;
+    while (at < stream.len()) { usize idx = block(&*out); result.push(idx as uint); usize n = if (stream.len() - at < 4096) { stream.len() - at } else { 4096 };
+        for (j in 0..n) { *out.data.get_mut(idx * 4096 + j).unwrap() = stream[at + j]; } at += n;
+    } return result;
+}
+Result<Vec<byte>, Failure> msf(&const Vec<Vec<byte>> streams) {
+    ulong total = 16384; for (s in streams) { total += (s.len() as ulong + 4095) / 4096 * 4096; }
+    if (total > 260046848) { return Err(model.fail(Code.Range, 0, 0)); }
+    var out = Buffer.new(); for (i in 0..12288) { out.word(0, 1); }
+    var directory = Buffer.new(); directory.word(streams.len() as ulong, 4); for (s in streams) { directory.word(s.len() as ulong, 4); }
+    for (s in streams) { var list = pages(&out, *s); for (idx in &const list) { directory.word(*idx as ulong, 4); } }
+    var dirs = pages(&out, directory.data); var map = Buffer.new(); for (idx in &const dirs) { map.word(*idx as ulong, 4); }
+    var maps = pages(&out, map.data); if (maps.len() != 1) { return Err(model.fail(Code.Range, 0, 0)); }
+    var magic = utf8.encode("Microsoft C/C++ MSF 7.00\r\n"); magic.push(26); bytes.text(&magic, "DS\0\0\0");
+    for (i in 0..32) { *out.data.get_mut(i).unwrap() = magic[i]; }
+    out.patch(32, 4096, 4); out.patch(36, 1, 4); out.patch(40, (out.data.len() / 4096) as ulong, 4); out.patch(44, directory.data.len() as ulong, 4); out.patch(52, maps[0] as ulong, 4);
+    // MSF readers require unused bitmap bits to be free, including bits beyond
+    // EOF. Each bitmap covers 32768 blocks; its page is spaced by 4096 blocks.
+    usize count = out.data.len() / 4096;
+    for (i in 0..count) { if (i % 4096 == 1 || i % 4096 == 2) { for (j in 0..4096) { *out.data.get_mut(i * 4096 + j).unwrap() = 255; } } }
+    for (i in 0..count) { usize map_page = 1 + (i / 32768) * 4096; usize at = map_page * 4096 + (i % 32768) / 8;
+        byte bits = (255 ^ (1 << (i % 8))) as byte; *out.data.get_mut(at).unwrap() &= bits; *out.data.get_mut(at + 4096).unwrap() &= bits;
+    }
+    return Ok(out.data);
+}
+pub Result<Vec<byte>, Failure> write(&const Unit unit, &const Vec<Vec<byte>> hashes, &const Vec<byte> sections, uint segment, ulong base, &const Vec<byte> guid) {
+    if (!cv_types.supported(unit)) { return Err(model.fail(Code.Range, 0, 0)); }
+    if (guid.len() != 16 || sections.len() % 40 != 0 || segment == 0 || segment as usize > sections.len() / 40 || unit.files.len() > 65535 || unit.functions.len() > 1000000) { return Err(model.fail(Code.Range, 0, 0)); }
+    ulong size = 0;
+    for (f in &const unit.functions) { if (f.address < base || f.address - base > 0xffffffff || f.size > 0xffffffff - (f.address - base) || f.name.len() > 60000) { return Err(model.fail(Code.Range, 0, 0)); }
+        if (f.address - base + f.size > size) { size = f.address - base + f.size; }
+        for (r in &const f.rows) { if (r.line > 0xffffff || r.file as usize >= unit.files.len() || r.offset >= f.size) { return Err(model.fail(Code.Range, 0, 0)); } }
+    }
+    var files = cv.files(unit, hashes); var syms = cv.symbols(unit, segment, base, false); var lines = cv.lines(unit, files, segment, base, false);
+    var module = Buffer.new(); module.append(syms.data); module.append(lines.data); module.word(0, 4);
+    var records = Buffer.new(); Vec<Public> publics = Vec.new();
+    for (f in &const unit.functions) { ulong at = records.data.len() as ulong; usize rec = records.record(0x110e); records.word(2, 4); records.word(f.address - base, 4); records.word(segment as ulong, 2); records.string(f.name); records.end(rec);
+        publics.push(Public { name: String.from(f.name), offset: at, address: f.address });
+    }
+    var public_hash = gsi(publics); var public_stream = Buffer.new(); public_stream.word(public_hash.len() as ulong, 4); public_stream.word(publics.len() as ulong * 4, 4); for (i in 0..5) { public_stream.word(0, 4); } public_stream.append(public_hash);
+    // Address order is independent of the symbol-record order.
+    Vec<usize> order = Vec.new(); for (i in 0..publics.len()) { order.push(i); usize j = order.len() - 1; while (j > 0 && publics[order[j]].address < publics[order[j - 1]].address) { order.swap(j, j - 1); j -= 1; } }
+    for (i in &const order) { public_stream.word(publics[*i].offset, 4); }
+    var type_records = cv_types.emit(unit); Vec<Vec<byte>> streams = Vec.new(); streams.push(Vec.new()); streams.push(info(guid)); streams.push(types(type_records, false)); streams.push(dbi(unit, sections, segment, size, syms.data.len(), lines.data.len())); streams.push(types(type_records, true));
+    streams.push(names(files)); streams.push(module.data); streams.push(bytes.copy(sections, 0, sections.len())); streams.push(records.data); streams.push(gsi(Vec.new())); streams.push(public_stream.data); streams.push(type_hashes(type_records));
+    return msf(streams);
+}

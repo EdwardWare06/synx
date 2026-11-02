@@ -183,11 +183,12 @@ pub struct Local {
     pub bool is_arg;
     pub Span span;
     pub bool escape_boundary;
+    pub bool debug_user;
     /// Compiler-only write barrier for advancing a reference-yielding iterator.
     /// This marker contributes no data to an item and does not restrict escape.
     pub bool lifetime_guard;
     pub Local new(TypeId type, &const str name, bool is_arg, Span span) {
-        return Local { type: type, name: String.from(name), is_arg: is_arg, span: span, escape_boundary: false, lifetime_guard: false };
+        return Local { type: type, name: String.from(name), is_arg: is_arg, span: span, escape_boundary: false, debug_user: false, lifetime_guard: false };
     }
 }
 /// Sorted map entries; maps stay ordered by key like std::map.

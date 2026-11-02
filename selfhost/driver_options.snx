@@ -20,7 +20,7 @@ pub struct BuildOptions {
     }
 }
 pub Result<BuildOptions, String> parse(&const Vec<String> args, Target target) {
-    var options = BuildOptions.new(target); usize i = 2;
+    var options = BuildOptions.new(target); usize i = 2; bool debug_explicit = false;
     while (i < args.len()) {
         var argument = args.get(i).unwrap();
         if (*argument == String.from("--")) {
@@ -36,6 +36,8 @@ pub Result<BuildOptions, String> parse(&const Vec<String> args, Target target) {
         else if (*argument == String.from("--standalone")) { options.standalone = true; }
         else if (*argument == String.from("--shared-runtime")) { options.standalone = false; }
         else if (*argument == String.from("--no-cache")) { options.no_cache = true; }
+        else if (*argument == String.from("-g")) { options.target.debug_info = true; debug_explicit = true; }
+        else if (*argument == String.from("--no-debug")) { options.target.debug_info = false; debug_explicit = true; }
         else if (*argument == String.from("--release")) { options.target.checked_arithmetic = false; }
         else if (*argument == String.from("--linker=builtin")) { options.linker = 0; }
         else if (*argument == String.from("--linker=system")) { options.linker = 1; }
@@ -44,5 +46,7 @@ pub Result<BuildOptions, String> parse(&const Vec<String> args, Target target) {
         else { if (!options.input.is_empty()) { return Err(String.from("build accepts one source file\n")); } options.input = String.from(argument); }
         i += 1;
     }
+    if (!debug_explicit && !options.target.checked_arithmetic) { options.target.debug_info = false; }
+    match options.target.os { Linux => {}, Windows => {}, _ => { if (options.target.debug_info && debug_explicit) { return Err(String.from("-g currently supports Linux and Windows x86-64\n")); } options.target.debug_info = false; } }
     return Ok(options);
 }

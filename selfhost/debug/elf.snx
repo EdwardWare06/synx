@@ -1,0 +1,74 @@
+/// ELF debug sections for resolved executables and GDB in-memory symbol files.
+/// Sections do not consume image memory. JIT patches name only 64-bit target
+/// addresses; section offsets and line deltas never receive the load base.
+import debug.data.Unit;
+import debug.dwarf;
+import link.buffer.{Buffer, align};
+import link.model.Failure;
+import bytes;
+import std.binary;
+
+pub struct Symbols { pub Vec<byte> data; pub Vec<ulong> patches; }
+struct Part { uint name; ulong offset; ulong size; }
+void section(&Buffer out, ulong name, ulong kind, ulong flags, ulong address,
+             ulong offset, ulong size, ulong alignment) {
+    out.word(name, 4); out.word(kind, 4); out.word(flags, 8); out.word(address, 8);
+    out.word(offset, 8); out.word(size, 8); out.word(0, 4); out.word(0, 4);
+    out.word(alignment, 8); out.word(0, 8);
+}
+Result<Symbols, Failure> sections(Vec<byte> image, &const Unit unit) {
+    var out = Buffer.new(); out.data = image; Vec<ulong> patches = Vec.new();
+    if (unit.empty()) { return Ok(Symbols { data: out.data, patches: patches }); }
+    var names = Buffer.new(); names.word(0, 1); Vec<Part> parts = Vec.new();
+    for (s in &const dwarf.emit(unit)) {
+        uint name = names.data.len() as uint; bytes.text(&names.data, s.name); names.word(0, 1);
+        ulong offset = out.data.len() as ulong;
+        for (fix in &const s.fixups) { if (fix.kind == 0) { patches.push(offset + fix.offset as ulong); } }
+        out.append(s.data); parts.push(Part { name: name, offset: offset, size: s.data.len() as ulong });
+    }
+    uint text_name = names.data.len() as uint; bytes.text(&names.data, ".text"); names.word(0, 1);
+    uint sym_name = names.data.len() as uint; bytes.text(&names.data, ".symtab"); names.word(0, 1);
+    uint str_name = names.data.len() as uint; bytes.text(&names.data, ".strtab"); names.word(0, 1);
+    var strings = Buffer.new(); strings.word(0, 1); Vec<ulong> symbol_names = Vec.new();
+    for (f in &const unit.functions) { symbol_names.push(strings.data.len() as ulong); bytes.text(&strings.data, f.symbol); strings.word(0, 1); }
+    var sym_pad = out.pad(align(out.data.len() as ulong, 8)?)?;
+    ulong sym_offset = out.data.len() as ulong; for (i in 0..24) { out.word(0, 1); }
+    for (i in 0..unit.functions.len()) { var f = unit.functions.get(i).unwrap();
+        out.word(*symbol_names.get(i).unwrap(), 4); out.word(0x12, 1); out.word(0, 1); out.word((parts.len() + 1) as ulong, 2);
+        patches.push(out.data.len() as ulong); out.word(f.address, 8); out.word(f.size, 8);
+    }
+    ulong str_offset = out.data.len() as ulong; out.append(strings.data);
+    uint names_name = names.data.len() as uint; bytes.text(&names.data, ".shstrtab"); names.word(0, 1);
+    ulong names_offset = out.data.len() as ulong; out.append(names.data);
+    var padded = out.pad(align(out.data.len() as ulong, 8)?)?;
+    ulong table = out.data.len() as ulong;
+    section(&out, 0, 0, 0, 0, 0, 0, 0);
+    for (p in &const parts) { section(&out, p.name as ulong, 1, 0, 0, p.offset, p.size, 1); }
+    ulong low = unit.functions.get(0).unwrap().address; ulong high = low;
+    for (f in &const unit.functions) { if (f.address < low) { low = f.address; } if (f.address + f.size > high) { high = f.address + f.size; } }
+    patches.push(out.data.len() as ulong + 16);
+    ulong text_kind = 8; ulong text_offset = 0;
+    ulong phoff = binary.read_uint(out.data, 32, 8, true).unwrap_or(0);
+    ulong phnum = binary.read_uint(out.data, 56, 2, true).unwrap_or(0);
+    for (i in 0..phnum as usize) {
+        usize at = phoff as usize + i * 56;
+        if (binary.read_uint(out.data, at, 4, true).unwrap_or(0) != 1) { continue; }
+        ulong address = binary.read_uint(out.data, at + 16, 8, true).unwrap_or(0);
+        ulong size = binary.read_uint(out.data, at + 32, 8, true).unwrap_or(0);
+        if (low >= address && high >= low && high - address <= size) { text_kind = 1; text_offset = binary.read_uint(out.data, at + 8, 8, true).unwrap_or(0) + low - address; break; }
+    }
+    section(&out, text_name as ulong, text_kind, 6, low, text_offset, high - low, 16);
+    section(&out, sym_name as ulong, 2, 0, 0, sym_offset, (unit.functions.len() as ulong + 1) * 24, 8);
+    out.patch(out.data.len() - 24, (parts.len() + 3) as ulong, 4); out.patch(out.data.len() - 20, 1, 4); out.patch(out.data.len() - 8, 24, 8);
+    section(&out, str_name as ulong, 3, 0, 0, str_offset, strings.data.len() as ulong, 1);
+    section(&out, names_name as ulong, 3, 0, 0, names_offset, names.data.len() as ulong, 1);
+    out.patch(40, table, 8); out.patch(58, 64, 2); out.patch(60, (parts.len() + 5) as ulong, 2); out.patch(62, (parts.len() + 4) as ulong, 2);
+    return Ok(Symbols { data: out.data, patches: patches });
+}
+pub Result<Vec<byte>, Failure> attach(Vec<byte> image, &const Unit unit) { var result = sections(image, unit)?; return Ok(result.data); }
+pub Result<Symbols, Failure> symbols(&const Unit unit) {
+    var out = Buffer.new(); out.word(0x464c457f, 4); out.word(2, 1); out.word(1, 1); out.word(1, 1);
+    var ident = out.pad(16)?; out.word(2, 2); out.word(62, 2); out.word(1, 4);
+    var header = out.pad(64)?; out.patch(52, 64, 2);
+    return sections(out.data, unit);
+}

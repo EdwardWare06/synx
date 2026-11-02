@@ -4,6 +4,9 @@ import link.model;
 import link.reader;
 import link.buffer;
 import std.utf8;
+import debug.data;
+import bytes;
+import std.collections.HashMap;
 struct Header { ulong kind; ulong flags; ulong offset; ulong size; usize link; usize info; ulong alignment; ulong entry_size; }
 Failure bad(usize at) { return model.fail(Code.Invalid, 0, at); }
 Failure unsupported(usize at) { return model.fail(Code.Unsupported, 0, at); }
@@ -120,6 +123,26 @@ pub Result<Object, Failure> read(&const Vec<byte> data, &const str object_name, 
             RelocKind normalized = match kind { 1 => RelocKind.Abs64, 2 => RelocKind.Pc32, 4 => RelocKind.Pc32, 10 => RelocKind.Abs32, 11 => RelocKind.Signed32, _ => return Err(unsupported(at)) };
             var mapped_symbol = *symbol_map.get(symbol).unwrap(); if (mapped_symbol.is_none()) { return Err(unsupported(at)); }
             out.relocations.push(Relocation { section: target_map.unwrap(), offset: offset, symbol: mapped_symbol.unwrap(), kind: normalized, addend: raw_addend as long });
+        }
+    }
+    if (section_names != 0) {
+        bool found = false; var names = headers.get(section_names).unwrap();
+        for (i in 0..count) {
+            if (!bytes.equals(name(data, names, word(data, table as usize + i * 64, 4)?)?, ".synx.debug")) { continue; }
+            var h = headers.get(i).unwrap(); if (found || h.kind != 1 || h.flags != 0 || h.size > 67108864) { return Err(bad(i)); } found = true;
+            match debug.data.decode(copy(data, h.offset, h.size)?) { Some(unit) => { out.debug = unit; }, None => return Err(bad(i)) }
+        }
+        HashMap<String, usize> defs = HashMap.new();
+        for (i in 0..out.symbols.len()) { defs.insert(model.key(out.symbols.get(i).unwrap().name), i); }
+        HashMap<String, bool> seen = HashMap.new();
+        for (f in &const out.debug.functions) {
+            var key = model.key(utf8.encode(f.symbol)); if (seen.contains_key(key)) { return Err(bad(0)); } seen.insert(String.from(key), true);
+            var index = match defs.get(key) { Some(n) => *n, None => return Err(bad(0)) };
+            var symbol = out.symbols.get(index).unwrap(); match symbol.binding { Global => {}, _ => return Err(bad(index)) }
+            match symbol.definition {
+                Section(section, offset) => { var s = out.sections.get(section).unwrap(); match s.kind { Text => {}, _ => return Err(bad(index)) } if (f.address != offset || f.size > s.size - offset) { return Err(bad(index)); } },
+                _ => return Err(bad(index))
+            }
         }
     }
     var valid = model.validate(out, 0)?; return Ok(out);

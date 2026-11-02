@@ -3,6 +3,8 @@
 /// The shared runtime owns CRT setup, TLS and native library dependencies.
 import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
 import link.model;
+import debug.data;
+import debug.elf;
 import link.imports.Import;
 import link.image;
 import link.buffer.{Buffer, align};
@@ -24,6 +26,7 @@ Object copy_object(&const Object source) {
         out.relocations.push(Relocation { section: reloc.section, offset: reloc.offset,
             symbol: reloc.symbol, kind: reloc.kind, addend: reloc.addend });
     }
+    out.debug = data.copy(source.debug);
     return out;
 }
 void text(&Buffer out, &const str value) {
@@ -164,5 +167,5 @@ pub Result<Vec<byte>, Failure> write(&const Vec<Object> inputs, &const str entry
         if (segment.size == 0) { continue; }
         var padding = out.pad(segment.rva)?; out.append(segment.data);
     }
-    return Ok(out.data);
+    return elf.attach(out.data, linked.debug);
 }

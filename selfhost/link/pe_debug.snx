@@ -1,0 +1,136 @@
+/// PE debug publication. Standalone debug code belongs to ordinary image
+/// sections, so Windows debuggers can match RSDS identity and module RVAs.
+/// Preserves the prelinked host's imports, CRT, TLS, and exception functions.
+import link.model.{Failure, Code};
+import link.model;
+import link.image.RuntimeFunction;
+import link.buffer.{Buffer, align, LIMIT};
+import link.reader;
+import link.pe;
+import link.macho_sha256;
+import debug.data.Unit;
+import debug.data;
+import debug.pdb;
+import bytes;
+import std.binary;
+import std.collections.sort;
+import std.utf8;
+import std.path.Path;
+import std.text;
+pub struct Output { pub Vec<byte> exe; pub Vec<byte> pdb; }
+pub String path(&const str executable) {
+    var lower = text.to_ascii_lowercase(executable);
+    usize size = if (text.ends_with(lower, ".exe")) { executable.len() - 4 } else { executable.len() };
+    return "{unsafe { str_from_raw(executable.as_ptr(), size) }}.pdb";
+}
+pub String name(&const str executable) { return Path.from(path(executable)).file_name().unwrap_or(String.from("program.pdb")); }
+ulong get(&const Vec<byte> d, usize at, usize width) { return binary.read_uint(d, at, width, true).unwrap_or(0); }
+struct Header { usize pe; usize opt; usize table; usize count; }
+Result<Header, Failure> header(&const Vec<byte> d) {
+    if (d.len() < 64 || get(d, 0, 2) != 0x5a4d) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    usize pe = get(d, 60, 4) as usize;
+    if (pe > d.len() || d.len() - pe < 264 || get(d, pe, 4) != 0x4550 || get(d, pe + 4, 2) != 0x8664 || get(d, pe + 20, 2) != 240 || get(d, pe + 24, 2) != 0x20b) { return Err(model.fail(Code.Invalid, 0, pe)); }
+    usize count = get(d, pe + 6, 2) as usize; usize table = pe + 264;
+    if (count == 0 || count > 90 || table > d.len() || count > (d.len() - table) / 40 || get(d, pe + 24 + 32, 4) != 4096 || get(d, pe + 24 + 36, 4) != 512) { return Err(model.fail(Code.Unsupported, 0, pe)); }
+    if (get(d, pe + 24 + 144, 8) != 0 || (get(d, pe + 24 + 70, 2) & 0x4000) != 0 || (get(d, pe + 22, 2) & 1) != 0 || (get(d, pe + 24 + 70, 2) & 0x40) == 0) { return Err(model.named(Code.Unsupported, 0, pe, "signed, CFG, or non-relocatable runtime host")); }
+    return Ok(Header { pe: pe, opt: pe + 24, table: table, count: count });
+}
+Result<usize, Failure> file_offset(&const Vec<byte> d, &const Header h, ulong rva, ulong size) {
+    for (i in 0..h.count) { usize at = h.table + i * 40; ulong start = get(d, at + 12, 4); ulong raw = get(d, at + 20, 4); ulong n = get(d, at + 16, 4);
+        if (rva >= start && rva - start <= n && size <= n - (rva - start) && raw <= d.len() as ulong && n <= d.len() as ulong - raw) { return Ok((raw + rva - start) as usize); }
+    } return Err(model.fail(Code.Invalid, 0, rva as usize));
+}
+/// Make room for new section headers. Adjust every physical pointer affected by
+/// insertion; virtual addresses and all host relocations remain unchanged.
+Result<usize, Failure> reserve(&Buffer out, &const Header h, usize extra, usize desc) {
+    ulong required = align((h.table + (h.count + extra) * 40) as ulong, 512)?; ulong old = get(out.data, h.opt + 60, 4);
+    if (old > out.data.len() as ulong || old < (h.table + h.count * 40) as ulong) { return Err(model.fail(Code.Invalid, 0, h.opt)); }
+    if (required <= old) { return Ok(desc); }
+    usize delta = (required - old) as usize;
+    // A host debug directory contains a raw-file pointer into its RSDS record.
+    ulong dbg = get(out.data, h.opt + 112 + 6 * 8, 4); ulong dbg_size = get(out.data, h.opt + 116 + 6 * 8, 4);
+    if (dbg_size % 28 != 0) { return Err(model.fail(Code.Invalid, 0, h.opt)); }
+    if (dbg_size != 0) { usize at = file_offset(out.data, h, dbg, dbg_size)?; for (i in 0..(dbg_size / 28) as usize) { usize p = at + i * 28 + 24; ulong value = get(out.data, p, 4); if (value >= old && value != 0) { out.patch(p, value + delta as ulong, 4); } } }
+    for (i in 0..h.count) { usize at = h.table + i * 40;
+        for (field in &const [20 as usize, 24, 28]) { ulong value = get(out.data, at + *field, 4); if (value != 0 && value >= old) { out.patch(at + *field, value + delta as ulong, 4); } }
+    }
+    ulong symbols = get(out.data, h.pe + 12, 4); if (symbols != 0 && symbols >= old) { out.patch(h.pe + 12, symbols + delta as ulong, 4); }
+    var previous = bytes.copy(out.data, 0, out.data.len()); out.data.clear(); out.append(bytes.copy(previous, 0, old as usize)); var padding = out.pad(required)?; out.append(bytes.copy(previous, old as usize, previous.len())); out.patch(h.opt + 60, required, 4);
+    return Ok(if (desc >= old as usize) { desc + delta } else { desc });
+}
+void section(&Buffer out, usize at, &const str name, ulong size, ulong rva, ulong raw_size, ulong raw, ulong flags) {
+    for (j in 0..40) { out.patch(at + j, 0, 1); }
+    var n = utf8.encode(name); for (j in 0..n.len()) { out.patch(at + j, n[j] as ulong, 1); }
+    out.patch(at + 8, size, 4); out.patch(at + 12, rva, 4); out.patch(at + 16, raw_size, 4); out.patch(at + 20, raw, 4); out.patch(at + 36, flags, 4);
+}
+Result<Vec<ulong>, Failure> relocations(&const Vec<byte> d, &const Header h) {
+    Vec<ulong> sites = Vec.new(); ulong rva = get(d, h.opt + 152, 4); ulong size = get(d, h.opt + 156, 4);
+    if (size == 0) { return Ok(sites); } usize at = file_offset(d, h, rva, size)?; usize end = at + size as usize;
+    while (at < end) { if (end - at < 8) { return Err(model.fail(Code.Invalid, 0, at)); } ulong page = get(d, at, 4); ulong n = get(d, at + 4, 4);
+        if (n < 8 || n % 4 != 0 || n > (end - at) as ulong) { return Err(model.fail(Code.Invalid, 0, at)); }
+        for (j in 0..((n - 8) / 2) as usize) { ulong v = get(d, at + 8 + j * 2, 2); if (v >> 12 == 10) { sites.push(page + (v & 4095)); } else if (v >> 12 != 0) { return Err(model.fail(Code.Unsupported, 0, at)); } } at += n as usize;
+    } return Ok(sites);
+}
+Result<Vec<byte>, Failure> exceptions(&const Vec<byte> d, &const Header h, &const Vec<RuntimeFunction> functions, ulong base) {
+    var out = Buffer.new(); ulong rva = get(d, h.opt + 136, 4); ulong size = get(d, h.opt + 140, 4);
+    if (size % 12 != 0) { return Err(model.fail(Code.Invalid, 0, h.opt)); }
+    if (size != 0) { usize at = file_offset(d, h, rva, size)?; out.append(bytes.copy(d, at, at + size as usize)); }
+    Vec<usize> order = Vec.new(); for (i in 0..functions.len()) { order.push(i); usize j = order.len() - 1; while (j > 0 && functions[order[j]].begin < functions[order[j - 1]].begin) { order.swap(j, j - 1); j -= 1; } }
+    ulong last = if (out.data.is_empty()) { 0 } else { get(out.data, out.data.len() - 8, 4) };
+    for (index in &const order) { var f = functions[*index]; if (f.begin + base < last || f.begin >= f.end) { return Err(model.fail(Code.Invalid, 0, *index)); } out.word(f.begin + base, 4); out.word(f.end + base, 4); out.word(f.info + base, 4); last = f.end + base; }
+    return Ok(out.data);
+}
+Result<Output, Failure> finish(&Buffer out, &const Header h, &const Unit unit, uint segment, ulong text_base, &const Vec<ulong> sites, &const Vec<byte> unwind, ulong metadata_rva, &const str pdb_name) {
+    if (pdb_name.len() == 0 || pdb_name.len() > 32768) { return Err(model.fail(Code.Range, 0, 0)); }
+    // Identity includes source snapshots, source map, all executable bytes and
+    // target layout. No clock or random values enter emitted debug artifacts.
+    var identity = data.encode(unit); var exe_hash = macho_sha256.digest(out.data, 0, out.data.len()); bytes.append(&identity, exe_hash); var digest = macho_sha256.digest(identity, 0, identity.len()); var guid = bytes.copy(digest, 0, 16);
+    var meta = Buffer.new(); meta.append(unwind); while (meta.data.len() % 4 != 0) { meta.word(0, 1); }
+    ulong exception_size = unwind.len() as ulong; ulong reloc_at = meta.data.len() as ulong; var relocs = pe.base_relocations(sites)?; meta.append(relocs);
+    ulong rsds_at = meta.data.len() as ulong; meta.word(0x53445352, 4); meta.append(guid); meta.word(1, 4); bytes.text(&meta.data, pdb_name); meta.word(0, 1); ulong rsds_size = meta.data.len() as ulong - rsds_at;
+    while (meta.data.len() % 4 != 0) { meta.word(0, 1); } ulong dir_at = meta.data.len() as ulong; ulong raw = align(out.data.len() as ulong, 512)?;
+    meta.word(0, 4); meta.word(0, 4); meta.word(0, 2); meta.word(0, 2); meta.word(2, 4); meta.word(rsds_size, 4); meta.word(metadata_rva + rsds_at, 4); meta.word(raw + rsds_at, 4);
+    var pad = out.pad(raw)?; out.append(meta.data); ulong raw_size = align(meta.data.len() as ulong, 512)?; var padding = out.pad(raw + raw_size)?;
+    section(&*out, h.table + h.count * 40, ".snxdb", meta.data.len() as ulong, metadata_rva, raw_size, raw, 0x40000040); out.patch(h.pe + 6, (h.count + 1) as ulong, 2);
+    out.patch(h.opt + 56, align(metadata_rva + meta.data.len() as ulong, 4096)?, 4); out.patch(h.opt + 64, 0, 4);
+    out.patch(h.opt + 136, if (exception_size == 0) { 0 } else { metadata_rva }, 4); out.patch(h.opt + 140, exception_size, 4);
+    out.patch(h.opt + 152, if (relocs.is_empty()) { 0 } else { metadata_rva + reloc_at }, 4); out.patch(h.opt + 156, relocs.len() as ulong, 4);
+    out.patch(h.opt + 160, metadata_rva + dir_at, 4); out.patch(h.opt + 164, 28, 4);
+    var sections = bytes.copy(out.data, h.table, h.table + (h.count + 1) * 40); var symbols = pdb.write(unit, unit.hashes, sections, segment, text_base, guid)?;
+    return Ok(Output { exe: bytes.copy(out.data, 0, out.data.len()), pdb: symbols });
+}
+pub Result<Output, Failure> attach(Vec<byte> exe, &const Unit unit, &const Vec<RuntimeFunction> functions, &const str pdb_name) {
+    if (unit.empty()) { return Ok(Output { exe: exe, pdb: Vec.new() }); }
+    var h = header(exe)?; var out = Buffer.new(); out.data = exe; var ignored = reserve(&out, h, 1, 0)?;
+    var sites = relocations(out.data, h)?; var unwind = exceptions(out.data, h, functions, 0)?;
+    ulong text = get(out.data, h.table + 12, 4) + get(out.data, h.opt + 24, 8);
+    ulong metadata = get(out.data, h.opt + 56, 4); return finish(&out, h, unit, 1, text, sites, unwind, metadata, pdb_name);
+}
+pub Result<Output, Failure> standalone(Vec<byte> host, usize desc, Vec<byte> program, &const Unit unit, &const Vec<RuntimeFunction> functions, &const str pdb_name) {
+    bool feature = false; for (i in 0..host.len()) { if (reader.matches(host, i, "SNXPE001")) { feature = true; break; } }
+    if (!feature) { return Err(model.named(Code.Unsupported, 0, 0, "runtime host lacks Windows debugger support; rebuild it or use --no-debug")); }
+    var h = header(host)?; var out = Buffer.new(); out.data = host; usize locator = reserve(&out, h, 5, desc)?;
+    ulong base = align(get(out.data, h.opt + 56, 4), 65536)?; ulong preferred = get(out.data, h.opt + 24, 8);
+    ulong image_size = get(program, 40, 8); if (base + image_size > LIMIT) { return Err(model.fail(Code.Range, 0, 0)); }
+    var sites = relocations(out.data, h)?; var unwind = exceptions(out.data, h, functions, base)?;
+    ulong nrel = get(program, 72, 8); if (nrel > program.len() as ulong / 8 || 248 + nrel * 8 > program.len() as ulong) { return Err(model.fail(Code.Invalid, 0, 0)); }
+    var payload = Buffer.new(); payload.data = program;
+    for (i in 0..nrel as usize) { ulong site = get(payload.data, 248 + i * 8, 8); bool found = false;
+        for (j in 0..3) { usize at = 88 + j * 40; ulong rva = get(payload.data, at, 8); ulong count = get(payload.data, at + 16, 8); if (site >= rva && site - rva <= count && 8 <= count - (site - rva)) {
+            usize p = (get(payload.data, at + 24, 8) + site - rva) as usize; ulong value = get(payload.data, p, 8); if (value > image_size) { return Err(model.fail(Code.Invalid, 0, p)); } payload.patch(p, value + preferred + base, 8); sites.push(base + site); found = true; break;
+        } } if (!found) { return Err(model.fail(Code.Invalid, 0, i)); }
+    }
+    ulong start = align(out.data.len() as ulong, 512)?; var pad = out.pad(start)?;
+    out.patch(locator + 40, start, 8); out.patch(locator + 48, (payload.data.len() + 24) as ulong, 8);
+    out.append(payload.data); bytes.text(&out.data, "SNXPE001"); out.word(base, 8); out.word(image_size, 8);
+    // The Windows image loader requires adjacent page-rounded sections. Extend
+    // the host's final section through the alignment gap before native text.
+    usize last_header = h.table + (h.count - 1) * 40;
+    out.patch(last_header + 8, base + get(payload.data, 88, 8) - get(out.data, last_header + 12, 4), 4);
+    for (i in 0..4) { usize at = 88 + i * 40; ulong size = get(payload.data, at + 8, 8); ulong count = get(payload.data, at + 16, 8); ulong raw_size = align(count, 512)?; ulong raw = start + get(payload.data, at + 24, 8);
+        section(&out, h.table + (h.count + i) * 40, if (i == 0) { ".snxtext" } else if (i == 1) { ".snxro" } else if (i == 2) { ".snxdata" } else { ".snxbss" }, align(if (size == 0) { 1 } else { size }, 65536)?, base + get(payload.data, at, 8), raw_size, if (count == 0) { 0 } else { raw }, if (i == 0) { 0x60000020 } else if (i == 1) { 0x40000040 } else if (i == 2) { 0xc0000040 } else { 0xc0000080 });
+    }
+    out.patch(h.pe + 6, (h.count + 4) as ulong, 2); var expanded = header(out.data)?;
+    var adjusted = data.copy(unit); for (f in &adjusted.functions) { f.address += preferred + base; }
+    return finish(&out, expanded, adjusted, (h.count + 1) as uint, preferred + base + get(payload.data, 88, 8), sites, unwind, base + image_size, pdb_name);
+}

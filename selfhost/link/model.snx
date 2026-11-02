@@ -3,6 +3,7 @@
 /// Unsupported weak/common symbols fail before resolution. No TLS input yet.
 /// Tests: selfhost/link/native_checks.snx, tests/linker/native_test.py.
 import std.utf8;
+import debug.data;
 
 pub enum Code { Invalid, Unsupported, Duplicate, Unresolved, Range, Entry }
 pub struct Failure { pub Code code; pub usize input; pub usize record; pub String symbol; }
@@ -54,9 +55,11 @@ pub struct Object {
     pub Vec<Section> sections;
     pub Vec<Symbol> symbols;
     pub Vec<Relocation> relocations;
+    pub data.Unit debug;
+    pub Vec<usize> pdata;
     pub Object new(&const str name, bool archive_member) {
         return Object { name: String.from(name), archive_member: archive_member,
-            sections: Vec.new(), symbols: Vec.new(), relocations: Vec.new() };
+            sections: Vec.new(), symbols: Vec.new(), relocations: Vec.new(), debug: data.Unit.new(), pdata: Vec.new() };
     }
 }
 /// Reversible ASCII key for arbitrary symbol bytes. No UTF-8 assumption.

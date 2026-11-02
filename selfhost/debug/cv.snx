@@ -1,0 +1,127 @@
+/// CodeView C13 source lines and procedure symbols. Object address fields use
+/// SECTION/SECREL fixups; PDB records use resolved section-relative addresses.
+import debug.data.{Unit, Function};
+import debug.data;
+import bytes;
+import std.mem;
+import debug.values.Variable;
+import debug.cv_types;
+import debug.cv_types.Types;
+import debug.scopes;
+
+pub struct Fixup { pub usize offset; pub String symbol; pub uint kind; }
+pub struct Records { pub Vec<byte> data; pub Vec<Fixup> fixups; }
+pub struct Files { pub Vec<byte> strings; pub Vec<byte> checksums; pub Vec<uint> offsets; }
+pub struct Buffer {
+    pub Vec<byte> data; pub Vec<Fixup> fixups;
+    pub Buffer new() { return Buffer { data: Vec.new(), fixups: Vec.new() }; }
+    pub void word(&self, ulong value, usize width) { data.word(&self.data, value, width); }
+    pub void string(&self, &const str value) { bytes.text(&self.data, value); self.word(0, 1); }
+    pub void align(&self) { while (self.data.len() % 4 != 0) { self.word(0, 1); } }
+    pub void patch(&self, usize at, ulong value, usize width) { for (i in 0..width) { *self.data.get_mut(at + i).unwrap() = ((value >> (i * 8)) & 255) as byte; } }
+    pub void append(&self, &const Vec<byte> value) { bytes.append(&self.data, value); }
+    pub usize record(&self, uint kind) { usize at = self.data.len(); self.word(0, 2); self.word(kind as ulong, 2); return at; }
+    pub void end(&self, usize start) { self.align(); self.patch(start, (self.data.len() - start - 2) as ulong, 2); }
+    pub void address(&self, &const Function f, uint segment, ulong base, bool object) {
+        if (object) {
+            self.fixups.push(Fixup { offset: self.data.len(), symbol: String.from(f.symbol), kind: 11 }); self.word(0, 4);
+            self.fixups.push(Fixup { offset: self.data.len(), symbol: String.from(f.symbol), kind: 10 }); self.word(0, 2);
+        } else { self.word(f.address - base, 4); self.word(segment as ulong, 2); }
+    }
+    pub void address_at(&self, &const Function f, uint segment, ulong base, bool object, ulong relative) {
+        usize at = self.data.len(); self.address(f, segment, base, object); self.patch(at, if (object) { relative } else { f.address - base + relative }, 4);
+    }
+    pub Records finish(self) { return Records { data: mem.replace(&self.data, Vec.new()), fixups: mem.replace(&self.fixups, Vec.new()) }; }
+}
+pub Files files(&const Unit unit, &const Vec<Vec<byte>> hashes) {
+    var strings = Buffer.new(); strings.word(0, 1); var checksums = Buffer.new(); Vec<uint> offsets = Vec.new();
+    for (i in 0..unit.files.len()) {
+        offsets.push(checksums.data.len() as uint); checksums.word(strings.data.len() as ulong, 4); strings.string(unit.files[i]);
+        bool hash = i < hashes.len() && hashes[i].len() == 32;
+        checksums.word(if (hash) { 32 } else { 0 }, 1); checksums.word(if (hash) { 3 } else { 0 }, 1);
+        if (hash) { checksums.append(hashes[i]); } checksums.align();
+    }
+    return Files { strings: strings.data, checksums: checksums.data, offsets: offsets };
+}
+pub Records symbols(&const Unit unit, uint segment, ulong base, bool object) {
+    var types = cv_types.emit(unit);
+    var out = Buffer.new(); out.word(4, 4);
+    usize obj = out.record(0x1101); out.word(0, 4); out.string("Synx"); out.end(obj);
+    usize producer = out.record(0x113c); out.word(0, 4); out.word(0xd0, 2);
+    for (n in &const [0 as ulong, 3, 0, 0, 0, 3, 0, 0]) { out.word(*n, 2); } out.string("Synx Axon"); out.end(producer);
+    // System linkers retain complete definitions named by S_UDT. Recursive
+    // pointers can still refer to their matching forward type records.
+    for (i in 0..unit.types.len()) { var t = unit.types.get(i).unwrap();
+        if ((t.kind == 0 && t.name != String.from("void")) || (t.kind >= 7 && t.kind <= 9)) {
+            usize at = out.record(0x1108); out.word(types.ids[i] as ulong, 4); out.string(t.name); out.end(at);
+        }
+    }
+    for (fi in 0..unit.functions.len()) { var f = unit.functions.get(fi).unwrap();
+        usize at = out.record(0x1110); out.word(0, 4); usize end_at = out.data.len(); out.word(0, 4); out.word(0, 4);
+        out.word(f.size, 4); out.word(if (f.rows.is_empty()) { 0 } else { f.rows[0].offset }, 4); out.word(f.size, 4); out.word(types.functions[fi] as ulong, 4);
+        out.address(f, segment, base, object); out.word(1, 1); out.string(f.name); out.end(at);
+        for (v in &const f.values.variables) { if (v.parameter) { local(&out, types, v, f, segment, base, object, 0, f.size); } }
+        for (scope in &const scopes.split(f.values)) {
+            usize block = out.record(0x1103); out.word(if (object) { 0 } else { at as ulong }, 4); usize block_end = out.data.len(); out.word(0, 4); out.word(scope.end - scope.begin, 4); out.address_at(f, segment, base, object, scope.begin); out.string(""); out.end(block);
+            for (i in &const scope.variables) { local(&out, types, f.values.variables.get(*i as usize).unwrap(), f, segment, base, object, scope.begin, scope.end); }
+            if (!object) { out.patch(block_end, out.data.len() as ulong, 4); } usize end = out.record(6); out.end(end);
+        }
+        if (!object) { out.patch(end_at, out.data.len() as ulong, 4); }
+        usize end = out.record(6); out.end(end);
+    }
+    return out.finish();
+}
+void local(&Buffer out, &const Types types, &const Variable v, &const Function f, uint segment, ulong base, bool object, ulong begin, ulong end) {
+    bool available = false; for (r in &const v.locations) { if (r.begin < end && begin < r.end) { available = true; break; } }
+    usize symbol = out.record(0x113e); out.word(types.get(v.type) as ulong, 4); out.word((if (v.parameter) { 1 } else { 0 }) | if (available) { 0 } else { 0x100 }, 2); out.string(v.name); out.end(symbol);
+    for (r in &const v.locations) {
+        ulong start = if (r.begin > begin) { r.begin } else { begin }; ulong stop = if (r.end < end) { r.end } else { end };
+        while (start < stop) {
+            ulong length = if (stop - start > 65535) { 65535 } else { stop - start };
+            usize rec = out.record(if (r.reg >= 0) { 0x1141 } else { 0x1145 }); out.word(if (r.reg >= 0) { 328 + r.reg as ulong } else { 333 }, 2); out.word(0, 2);
+            if (r.reg < 0) { out.word((r.offset as uint) as ulong, 4); }
+            out.address_at(f, segment, base, object, start); out.word(length, 2); out.end(rec); start += length;
+        }
+    }
+}
+void subsection(&Buffer out, uint kind, Records records) {
+    out.word(kind as ulong, 4); out.word(records.data.len() as ulong, 4); usize base = out.data.len();
+    out.append(records.data); for (fix in &const records.fixups) { out.fixups.push(Fixup { offset: base + fix.offset, symbol: String.from(fix.symbol), kind: fix.kind }); } out.align();
+}
+pub Records lines(&const Unit unit, &const Files files, uint segment, ulong base, bool object) {
+    var out = Buffer.new();
+    for (f in &const unit.functions) {
+        if (f.rows.is_empty()) { continue; }
+        var fragment = Buffer.new(); fragment.address(f, segment, base, object); fragment.word(1, 2); fragment.word(f.size, 4);
+        // One block for each source file referenced by the function.
+        for (file in 0..unit.files.len()) {
+            usize count = 0; for (r in &const f.rows) { if (r.file as usize == file) { count += 1; } }
+            bool entry = f.rows[0].file as usize == file && f.rows[0].offset != 0; if (entry) { count += 1; }
+            if (count == 0) { continue; }
+            fragment.word(files.offsets[file] as ulong, 4); fragment.word(count as ulong, 4); fragment.word(12 + count as ulong * 12, 4);
+            if (entry) { fragment.word(0, 4); fragment.word(f.rows[0].line as ulong, 4); }
+            for (r in &const f.rows) { if (r.file as usize == file) { fragment.word(r.offset, 4); fragment.word((r.line as ulong & 0xffffff) | 0x80000000, 4); } }
+            if (entry) { fragment.word(0, 4); }
+            for (r in &const f.rows) { if (r.file as usize == file) { ulong column = if (r.column <= 65535) { r.column as ulong } else { 0 }; fragment.word(column, 2); fragment.word(column, 2); } }
+        }
+        subsection(&out, 0xf2, fragment.finish());
+    }
+    subsection(&out, 0xf4, Records { data: bytes.copy(files.checksums, 0, files.checksums.len()), fixups: Vec.new() });
+    if (object) { subsection(&out, 0xf3, Records { data: bytes.copy(files.strings, 0, files.strings.len()), fixups: Vec.new() }); }
+    return out.finish();
+}
+pub Records object_symbols(&const Unit unit, &const Vec<Vec<byte>> hashes) {
+    var out = Buffer.new(); out.word(4, 4); var syms = symbols(unit, 1, 0, true);
+    // C13 symbol subsections omit the standalone symbol-stream signature.
+    var fixed = Buffer.new(); fixed.data = bytes.copy(syms.data, 4, syms.data.len());
+    for (fix in &const syms.fixups) { fixed.fixups.push(Fixup { offset: fix.offset - 4, symbol: String.from(fix.symbol), kind: fix.kind }); }
+    subsection(&out, 0xf1, fixed.finish());
+    var source = files(unit, hashes); var info = lines(unit, source, 1, 0, true); usize at = out.data.len(); out.append(info.data);
+    for (fix in &const info.fixups) { out.fixups.push(Fixup { offset: at + fix.offset, symbol: String.from(fix.symbol), kind: fix.kind }); }
+    return out.finish();
+}
+pub Vec<byte> types() {
+    var out = Buffer.new(); out.word(6, 2); out.word(0x1201, 2); out.word(0, 4);
+    out.word(14, 2); out.word(0x1008, 2); out.word(3, 4); out.word(0, 1); out.word(0, 1); out.word(0, 2); out.word(0x1000, 4);
+    return out.data;
+}

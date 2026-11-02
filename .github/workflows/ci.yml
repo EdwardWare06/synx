@@ -16,6 +16,9 @@ jobs:
       - name: MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+      - name: Linux debugger tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gdb binutils
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
       - name: Build
@@ -53,6 +56,15 @@ jobs:
           export SYNX_MYELIN_ASAN="$(cc -print-file-name=libasan.so)"
           test -f "$SYNX_MYELIN_ASAN"
           python3 -B tests/myelin/test_myelin.py build/selfhost-stages/synx-stage2 --memory
+      - name: Debug information allocation check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export SYNX_DEBUG_ASAN="$(cc -print-file-name=libasan.so)"
+          test -f "$SYNX_DEBUG_ASAN"
+          python3 -B tests/debug/test_debug.py build/selfhost-stages/synx-stage2 build/runtime --memory
+          SYNX_PDB_ASAN="$SYNX_DEBUG_ASAN" python3 -B tests/debug/test_pdb.py build/selfhost-stages/synx-stage2 build/runtime build/tests --memory
+          SYNX_VARIABLES_ASAN="$SYNX_DEBUG_ASAN" python3 -B tests/debug/test_variables.py build/selfhost-stages/synx-stage2 build/runtime build/tests --memory
       - name: Failed thread creation cleanup
         if: runner.os == 'Linux'
         shell: bash

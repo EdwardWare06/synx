@@ -56,6 +56,7 @@ Optional member access `expression?.field` and optional method calls
 `expression?.method(args)` return an Option and skip the member operation
 when the base is None. See [Operators](operators.md).
 
-Panics do not run destructors. A worker-thread panic stops the process.
+Panics do not run destructors, C exit hooks, or library cleanup callbacks.
+A worker-thread panic stops the process.
 The compiler reports diagnostics separately with SNX-prefixed codes.
 Use Result for failures the caller is expected to handle.

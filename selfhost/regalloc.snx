@@ -26,6 +26,7 @@ pub struct RegisterAllocation {
     pub Vec<int> registers;
     /// Callee-saved registers in first-use order.
     pub Vec<int> saved;
+    pub Vec<usize> starts; pub Vec<usize> ends;
 }
 
 /// after: read after a call returns (indexes of its destination).
@@ -54,8 +55,8 @@ void add(&Block b, &Vec<usize> calls, &usize pos, Event e) {
 }
 
 pub RegisterAllocation allocate_registers(&Checker ck, &const Function f, &LayoutTable lay) {
-    var result = RegisterAllocation { registers: Vec.new(), saved: Vec.new() };
-    for (i in 0..f.locals.len()) { result.registers.push(-1); }
+    var result = RegisterAllocation { registers: Vec.new(), saved: Vec.new(), starts: Vec.new(), ends: Vec.new() };
+    for (i in 0..f.locals.len()) { result.registers.push(-1); result.starts.push(0); result.ends.push(0); }
     if (f.blocks.is_empty()) { return result; }
     Vec<bool> pinned = Vec.new(); for (i in 0..f.locals.len()) { pinned.push(false); }
     // Common epilogue reads the return slot.
@@ -176,6 +177,7 @@ pub RegisterAllocation allocate_registers(&Checker ck, &const Function f, &Layou
         }
         if (interval.start == ~(0 as usize)) { continue; }
         for (call in &const calls) { if (interval.start <= *call && *call < interval.end) { interval.crosses_call = true; } }
+        *result.starts.get_mut(li).unwrap() = interval.start; *result.ends.get_mut(li).unwrap() = interval.end;
         intervals.push(interval);
     }
     // Sort by start, then local; locals were added in increasing order.

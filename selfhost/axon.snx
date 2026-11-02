@@ -1,3 +1,4 @@
+import debug.values;
 /// Axon: x86-64 instruction selection. Ported from compiler/src/axon.cpp, a
 /// function-by-function port.
 /// Synx to Synx calls copy arguments into an outgoing area at the bottom of
@@ -25,6 +26,11 @@ import x64.{Assembler, Reloc, RelocKind, RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
 import objfile.{ObjectFile, ObjSymbol, ObjReloc, write_object};
 import target.{Target, symbol_for};
 import source.Span;
+import debug.data.{RawFunction, RawRow};
+import debug.unwind.{Step, Frame};
+import debug.unwind;
+import debug.track.Track;
+import debug.type_graph.Graph;
 import bytes;
 import std.collections.HashMap;
 import std.mem;
@@ -58,9 +64,10 @@ pub struct Axon {
     Vec<String> fn_symbols;
     Vec<String> vtable_symbols;
     pub ObjectFile obj;
+    pub Graph debug_types;
     pub Axon new(Target target) {
         return Axon { target: target, lay: LayoutTable.new(), drop_worklist: Vec.new(), drop_index: HashMap.new(), drop_types: HashMap.new(),
-            drop_impls: HashMap.new(), fn_symbols: Vec.new(), vtable_symbols: Vec.new(), obj: ObjectFile.new() };
+            drop_impls: HashMap.new(), fn_symbols: Vec.new(), vtable_symbols: Vec.new(), obj: ObjectFile.new(), debug_types: Graph.new() };
     }
 
     /// Registers the helper before its body exists: recursive owners refer back here.
@@ -119,6 +126,7 @@ pub struct Axon {
                 if (d.is_builtin || d.ast_file == NONE) { continue; }
                 if (trees.get(d.ast_file as usize).unwrap().function(d.ast_index).body == ast.NONE) { continue; }
             }
+            var display_name = String.from(m.functions.get(fi).unwrap().name);
             var f = mem.replace(m.functions.get_mut(fi).unwrap(), Function.new(String.new()));
             var tgt = self.target; var g = Gen.new(mem.replace(&*self, Axon.new(tgt)), f);
             bool done = g.generate(&*ck, TypeId.none());
@@ -126,6 +134,10 @@ pub struct Axon {
             var func = mem.replace(&g.f, Function.new(String.new())); var slot = m.functions.get_mut(fi).unwrap(); *slot = func;
             if (!done) { ok = false; continue; }
             var name = String.from(self.fn_symbols.get(fi).unwrap());
+            if (self.target.debug_info) {
+                self.obj.debug_raw.push(RawFunction { symbol: String.from(name), name: display_name, address: self.obj.text.len() as ulong, size: g.a.code.len() as ulong, rows: mem.replace(&g.debug_rows, Vec.new()), values: mem.replace(&g.debug_track.values, debug.values.Values.new()) });
+            }
+            if (self.target.win64_abi() && self.target.debug_info) { self.obj.unwind.push(Frame { symbol: String.from(name), size: g.a.code.len() as ulong, info: unwind.encode(g.unwind) }); }
             append(&self.obj, name, &const g.a);
         }
         if (!ok) { return false; }
@@ -145,6 +157,8 @@ pub struct Axon {
             i += 1;
             if (!done) { ok = false; continue; }
             var name = self.drop_symbol(t);
+            if (self.target.debug_info) { self.obj.debug_raw.push(RawFunction { symbol: String.from(name), name: String.from(g.f.name), address: self.obj.text.len() as ulong, size: g.a.code.len() as ulong, rows: Vec.new(), values: mem.replace(&g.debug_track.values, debug.values.Values.new()) }); }
+            if (self.target.win64_abi() && self.target.debug_info) { self.obj.unwind.push(Frame { symbol: String.from(name), size: g.a.code.len() as ulong, info: unwind.encode(g.unwind) }); }
             append(&self.obj, name, &const g.a);
         }
         if (!ok) { return false; }
@@ -162,7 +176,9 @@ pub struct Axon {
             a.load(RAX, RAX, 0, 8, false);
             a.call_reg(RAX);
             if (win) { a.load(RSI, RBP, -8, 8, false); a.load(RDI, RBP, -16, 8, false); }
-            a.mov_rr(RSP, RBP); a.pop(RBP); a.ret(); a.finish();
+            if (win && self.target.debug_info) { a.alu_ri(ALU_ADD, RSP, 48); } else { a.mov_rr(RSP, RBP); } a.pop(RBP); a.ret(); a.finish();
+            if (win && self.target.debug_info) { self.obj.unwind.push(bridge_frame("synx_thread_entry", a.code.len())); }
+            if (self.target.debug_info) { self.obj.debug_raw.push(RawFunction { symbol: String.from("synx_thread_entry"), name: String.from("synx_thread_entry"), address: self.obj.text.len() as ulong, size: a.code.len() as ulong, rows: Vec.new(), values: debug.values.Values.new() }); }
             self.obj.symbols.push(ObjSymbol { name: String.from("synx_thread_entry"), offset: self.obj.text.len() as ulong, is_text: true, global: true, defined: true });
             bytes.append(&self.obj.text, &const a.code);
         }
@@ -179,7 +195,9 @@ pub struct Axon {
             a.call_sym(self.fn_symbols.get(m.entry as usize).unwrap().as_str());
             if (ret.index == NONE || ck.is_void(ret)) { a.mov_ri(RAX, 0); } else { a.movsx32(RAX, RAX); }
             if (win) { a.load(RSI, RBP, -8, 8, false); a.load(RDI, RBP, -16, 8, false); }
-            a.mov_rr(RSP, RBP); a.pop(RBP); a.ret(); a.finish();
+            if (win && self.target.debug_info) { a.alu_ri(ALU_ADD, RSP, 48); } else { a.mov_rr(RSP, RBP); } a.pop(RBP); a.ret(); a.finish();
+            if (win && self.target.debug_info) { self.obj.unwind.push(bridge_frame("synx_entry", a.code.len())); }
+            if (self.target.debug_info) { self.obj.debug_raw.push(RawFunction { symbol: String.from("synx_entry"), name: String.from("synx_entry"), address: self.obj.text.len() as ulong, size: a.code.len() as ulong, rows: Vec.new(), values: debug.values.Values.new() }); }
             self.obj.symbols.push(ObjSymbol { name: String.from("synx_entry"), offset: self.obj.text.len() as ulong, is_text: true, global: true, defined: true });
             for (r in &const a.relocs) {
                 self.obj.relocs.push(ObjReloc { offset: self.obj.text.len() + r.offset, symbol: String.from(r.symbol), kind: r.kind, addend: r.addend, is_text: true });
@@ -193,6 +211,11 @@ pub struct Axon {
 
 void word(&ObjectFile out, ulong value) {
     for (i in 0..8) { out.rodata.push(((value >> ((i * 8) as ulong)) & 255) as byte); }
+}
+Frame bridge_frame(&const str name, usize size) {
+    Vec<Step> steps = Vec.new(); steps.push(Step { end: 1, op: 0, reg: RBP, value: 0 }); steps.push(Step { end: 8, op: 1, reg: 0, value: 48 });
+    steps.push(Step { end: 15, op: 2, reg: RSI, value: 40 }); steps.push(Step { end: 22, op: 2, reg: RDI, value: 32 });
+    return Frame { symbol: String.from(name), size: size as ulong, info: unwind.encode(steps) };
 }
 /// Appends one function's code at a 16-byte boundary with its relocations.
 void append(&ObjectFile out, String name, &const Assembler a) {
@@ -232,12 +255,15 @@ struct Gen {
     uint scratch_slots;
     int epilogue_label;
     uint frame_size;
+    Vec<RawRow> debug_rows;
+    Track debug_track;
+    Vec<Step> unwind;
 
     Gen new(Axon ax, Function f) {
         var target = ax.target;
         return Gen { ax: ax, f: f, target: target, a: Assembler.new(), ok: true, slot_off: Vec.new(),
-            allocation: RegisterAllocation { registers: Vec.new(), saved: Vec.new() }, saved_off: Vec.new(), block_labels: Vec.new(),
-            max_out: 0, big_ret: false, scratch_off: 0, scratch_slots: 14, epilogue_label: 0, frame_size: 0 };
+            allocation: RegisterAllocation { registers: Vec.new(), saved: Vec.new(), starts: Vec.new(), ends: Vec.new() }, saved_off: Vec.new(), block_labels: Vec.new(),
+            max_out: 0, big_ret: false, scratch_off: 0, scratch_slots: 14, epilogue_label: 0, frame_size: 0, debug_rows: Vec.new(), unwind: Vec.new(), debug_track: Track.empty() };
     }
 
     void error(&self, &Checker ck, Span span, &const str message) { ck.r.sink.error(span, message, "SNX0601"); self.ok = false; }
@@ -1267,7 +1293,7 @@ struct Gen {
         bool closure = self.f.closure != check_data.NO_KEY;
         if (self.target.register_allocation) { self.allocation = allocate_registers(&*ck, self.f, &self.ax.lay); }
         else {
-            self.allocation = RegisterAllocation { registers: Vec.new(), saved: Vec.new() };
+            self.allocation = RegisterAllocation { registers: Vec.new(), saved: Vec.new(), starts: Vec.new(), ends: Vec.new() };
             for (i in 0..self.f.locals.len()) { self.allocation.registers.push(-1); }
         }
         usize n = self.f.locals.len();
@@ -1313,24 +1339,35 @@ struct Gen {
         self.frame_size = align_up(off as ulong + self.max_out as ulong, 16) as uint;
     }
 
+    void debug_cfi(&self, int reg, int offset) { if (self.target.debug_info) { self.debug_track.values.cfi.push(debug.values.Cfi { pc: self.a.code.len() as ulong, reg: reg, offset: offset }); } }
+    void source_row(&self, usize pc, Span span) {
+        if (self.target.debug_info && self.a.code.len() > pc && span.end > span.start) { self.debug_rows.push(RawRow { offset: pc as ulong, span: span }); }
+    }
     bool generate(&self, &Checker ck, TypeId drop_body) {
         self.compute_frame(&*ck);
+        if (self.target.debug_info) { self.debug_track = Track.new(self.f, self.allocation.registers); }
         if (!self.ok) { return false; }
         for (i in 0..self.f.blocks.len()) { int l = self.a.new_label(); self.block_labels.push(l); }
         self.epilogue_label = self.a.new_label();
 
         self.a.push(RBP);
-        self.a.mov_rr(RBP, RSP);
+        self.debug_cfi(-2, 0); self.debug_cfi(5, 0);
+        self.unwind.push(Step { end: self.a.code.len(), op: 0, reg: RBP, value: 0 });
+        self.a.mov_rr(RBP, RSP); self.debug_cfi(-3, 0);
         self.a.alu_ri(ALU_SUB, RSP, self.frame_size as int);
+        self.unwind.push(Step { end: self.a.code.len(), op: 1, reg: 0, value: self.frame_size as ulong });
         // Windows commits stack pages through one guard page. Touch each page of
         // a large frame from the top down before any access can skip the guard.
         // RAX holds no argument at entry on either ABI.
         if (self.target.win64_abi()) {
-            uint probe = 4096;
-            while (probe <= self.frame_size) { self.a.load(RAX, RBP, -(probe as int), 8, false); probe += 4096; }
+            if (self.target.debug_info && self.frame_size >= 4096) {
+                int probe_label = self.a.new_label(); self.a.lea(RAX, RBP, -4096); self.a.bind(probe_label); self.a.load(RCX, RAX, 0, 8, false); self.a.alu_ri(ALU_SUB, RAX, 4096); self.a.alu_rr(ALU_CMP, RAX, RSP); self.a.jcc(COND_AE, probe_label);
+            } else { uint probe = 4096; while (probe <= self.frame_size) { self.a.load(RAX, RBP, -(probe as int), 8, false); probe += 4096; } }
         }
         for (i in 0..self.allocation.saved.len()) {
             self.a.store(RBP, *self.saved_off.get(i).unwrap(), *self.allocation.saved.get(i).unwrap() as byte, 8);
+            self.debug_cfi(self.allocation.saved[i], self.saved_off[i]);
+            self.unwind.push(Step { end: self.a.code.len(), op: 2, reg: self.allocation.saved[i] as byte, value: (self.frame_size as long + self.saved_off[i] as long) as ulong });
         }
         // Spill before adding any prologue calls (including Windows stack probes).
         if (self.f.closure != check_data.NO_KEY) { self.a.store(RBP, self.slot(1), R10, 8); }
@@ -1347,22 +1384,46 @@ struct Gen {
             self.drop_body_at_slot(&*ck, drop_body, 0);
         }
 
+        usize debug_pos = 0;
         for (bi in 0..self.f.blocks.len()) {
+            if (self.target.debug_info) { self.debug_track.current = self.debug_track.incoming[bi].copy(); }
             self.a.bind(self.label(bi as uint));
             // Copies: generation borrows the generator while it reads them.
             usize count = self.f.blocks.get(bi).unwrap().stmts.len();
             for (si in 0..count) {
                 var s = self.f.blocks.get(bi).unwrap().stmts.get(si).unwrap().copy();
+                usize pc = self.a.code.len();
+                var before = self.debug_track.current.copy();
+                if (self.target.debug_info) { self.debug_track.statement(&const s, false); }
                 match s.kind {
                     StatementKind.Assign => { self.gen_assign(&*ck, &const s); }
                     StatementKind.Drop => { self.gen_drop(&*ck, &const s); }
                     StatementKind.DropIf => { self.gen_drop(&*ck, &const s); }
                     _ => {}
                 }
+                self.source_row(pc, s.span);
+                if (self.target.debug_info) {
+                    usize end = self.a.code.len();
+                    self.debug_track.record(&before, pc, if (end > pc) { pc + 1 } else { pc }, debug_pos, self.allocation, self.slot_off, false, true);
+                    bool call = false; match s.kind { StatementKind.Drop | StatementKind.DropIf => { call = true; }, _ => {} }
+                    var stable = self.debug_track.current.copy();
+                    self.debug_track.record(&stable, if (end > pc) { pc + 1 } else { pc }, end, debug_pos, self.allocation, self.slot_off, call, false);
+                    self.debug_track.current = before.copy(); self.debug_track.statement(&const s, true);
+                } debug_pos += 2;
                 if (!self.ok) { return false; }
             }
             var term = self.f.blocks.get(bi).unwrap().term.copy();
+            usize pc = self.a.code.len();
+            var before = self.debug_track.current.copy();
+            if (self.target.debug_info) { self.debug_track.terminator(&const term, false); }
             self.gen_terminator(&*ck, &const term);
+            if (self.target.debug_info) { usize end = self.a.code.len();
+                self.debug_track.record(&before, pc, if (end > pc) { pc + 1 } else { pc }, debug_pos, self.allocation, self.slot_off, false, true);
+                bool call = false; match term.kind { TerminatorKind.Call => { call = true; }, _ => {} }
+                var stable = self.debug_track.current.copy();
+                    self.debug_track.record(&stable, if (end > pc) { pc + 1 } else { pc }, end, debug_pos, self.allocation, self.slot_off, call, false);
+            } debug_pos += 2;
+            self.source_row(pc, term.span);
             if (!self.ok) { return false; }
         }
 
@@ -1375,12 +1436,17 @@ struct Gen {
             else { self.a.load(RAX, RSI, 0, 8, false); self.a.load(RDX, RSI, 8, 8, false); }
         }
         for (i in 0..self.allocation.saved.len()) {
-            self.a.load(*self.allocation.saved.get(i).unwrap() as byte, RBP, *self.saved_off.get(i).unwrap(), 8, false);
+            self.a.load(*self.allocation.saved.get(i).unwrap() as byte, RBP, *self.saved_off.get(i).unwrap(), 8, false); self.debug_cfi(self.allocation.saved[i], 2147483647);
         }
-        self.a.mov_rr(RSP, RBP);
-        self.a.pop(RBP);
+        if (self.target.win64_abi() && self.target.debug_info) { self.a.alu_ri(ALU_ADD, RSP, self.frame_size as int); } else { self.a.mov_rr(RSP, RBP); }
+        self.a.pop(RBP); self.debug_cfi(-4, 0); self.debug_cfi(5, 2147483647);
         self.a.ret();
         self.a.finish();
+        if (self.target.debug_info) {
+            self.debug_track.values.ret = self.ax.debug_types.get(&*ck, &self.ax.lay, self.f.ret);
+            for (i in 1..self.f.arg_count + 1) { uint ty = self.ax.debug_types.get(&*ck, &self.ax.lay, self.f.locals[i as usize].type); self.debug_track.values.args.push(ty); }
+            for (i in 0..self.debug_track.values.variables.len()) { var id = TypeId { index: self.debug_track.values.variables[i].type }; uint ty = self.ax.debug_types.get(&*ck, &self.ax.lay, id); self.debug_track.values.variables.get_mut(i).unwrap().type = ty; }
+        }
         return self.ok;
     }
 }

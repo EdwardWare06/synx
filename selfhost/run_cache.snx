@@ -9,6 +9,7 @@ import build;
 import compile.Compilation;
 import prelude_source;
 import link.linker;
+import link.pe_debug;
 import std.env;
 import std.fs;
 import std.path.Path;
@@ -62,7 +63,7 @@ Result<Snapshot, String> snapshot(&const BuildOptions options) {
     driver_fingerprint.text(&manifest, asset); driver_fingerprint.text(&manifest, asset_hash);
     var cwd = match fs.current_dir() { Ok(value) => value, Err(_) => return Err(String.from("cannot read the working directory\n")) }; driver_fingerprint.text(&manifest, cwd);
     var target = options.target.name(); driver_fingerprint.text(&manifest, target);
-    manifest.push(if (options.target.register_allocation) { 1 } else { 0 }); manifest.push(if (options.target.checked_arithmetic) { 1 } else { 0 });
+    manifest.push(if (options.target.register_allocation) { 1 } else { 0 }); manifest.push(if (options.target.checked_arithmetic) { 1 } else { 0 }); manifest.push(if (options.target.debug_info) { 1 } else { 0 });
     manifest.push(if (options.standalone) { 1 } else { 0 }); manifest.push(if (options.keep_object) { 1 } else { 0 });
     manifest.push(driver_paths.selected_linker(options) as byte);
     return Ok(Snapshot { key: driver_fingerprint.hash(manifest), sources: sources, valid: loaded.ok });
@@ -91,11 +92,12 @@ Result<String, String> prepare(&BuildOptions options) {
     if (reusable) {
         match fs.read_text(entry.as_str()) { Ok(manifest) => {
             var lines = manifest.split("\n");
-            if (lines.len() == 3 && lines.get(2).unwrap().is_empty() && safe_name(lines.get(0).unwrap().as_str())) {
+            if (lines.len() == 4 && lines.get(3).unwrap().is_empty() && safe_name(lines.get(0).unwrap().as_str())) {
                 var output = folder.join(lines.get(0).unwrap().as_str());
                 match driver_fingerprint.file(output.as_str()) { Ok(hash) => {
                     bool object = true; if (options.keep_object) { object = driver_paths.exists(driver_paths.object_path(output.as_str(), options.target)); }
-                    if (hash == *lines.get(1).unwrap() && object && runtime_valid(&const *options, folder)) { if (options.verbose) { driver_io.text(2, "run cache: hit\n"); } return Ok(String.from(output.as_str())); }
+                    var symbols = symbol_hash(&const *options, output.as_str());
+                    if (hash == *lines.get(1).unwrap() && symbols == *lines.get(2).unwrap() && !symbols.is_empty() && object && runtime_valid(&const *options, folder)) { if (options.verbose) { driver_io.text(2, "run cache: hit\n"); } return Ok(String.from(output.as_str())); }
                 }, Err(_) => {} }
             }
         }, Err(_) => {} }
@@ -108,7 +110,7 @@ Result<String, String> prepare(&BuildOptions options) {
     if (reusable && result.source_hash == initial.sources) {
         match snapshot(&const *options) { Ok(current) => { if (current.valid && current.key == initial.key) {
             var output_hash = match driver_fingerprint.file(result.executable) { Ok(value) => value, Err(_) => return Err(String.from("cannot fingerprint run output\n")) };
-            var name = Path.from(result.executable).file_name().unwrap(); Vec<byte> manifest = Vec.new(); bytes.text(&manifest, "{name}\n{output_hash}\n");
+            var name = Path.from(result.executable).file_name().unwrap(); var symbols = symbol_hash(&const *options, result.executable); if (symbols.is_empty()) { return Err(String.from("cannot fingerprint PDB\n")); } Vec<byte> manifest = Vec.new(); bytes.text(&manifest, "{name}\n{output_hash}\n{symbols}\n");
             match linker.publish(entry.as_str(), manifest) { Ok(_) => {}, Err(_) => return Err(String.from("cannot publish run-cache manifest\n")) }
         } }, Err(_) => {} }
     }
@@ -120,8 +122,12 @@ pub int run(BuildOptions options) {
         Err(message) => { if (!message.is_empty()) { driver_io.text(2, message); } return 1; }
         Ok(executable) => {
             int status = driver_paths.run_arguments(executable, options.program_args);
-            if (temporary && !options.keep_object) { var removed = fs.remove(executable); }
+            if (temporary && !options.keep_object) { var removed = fs.remove(executable); var symbols = fs.remove(pe_debug.path(executable)); }
             return status;
         }
     }
+}
+String symbol_hash(&const BuildOptions options, &const str executable) {
+    if (options.target.win64_abi() && options.target.debug_info) { return match driver_fingerprint.file(pe_debug.path(executable)) { Ok(value) => value, Err(_) => String.new() }; }
+    return String.from("-");
 }

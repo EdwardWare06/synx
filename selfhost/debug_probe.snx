@@ -1,0 +1,85 @@
+/// Cross-host debug fixture driver. Emits Linux objects and resolved ELF debug
+/// sections from real Axon output, without running Linux code on other hosts.
+/// tests/debug/test_debug.py checks transport failures and DWARF independently.
+import compile.Compilation;
+import prelude_source;
+import axon.Axon;
+import target.{Target, TargetOs};
+import objfile.write_object;
+import debug.data;
+import debug.elf.symbols;
+import link.elf_object;
+import link.image;
+import link.elf.write;
+import link.standalone;
+import link.imports;
+import link.model.{Object, Symbol, Definition};
+import link.macho_sha256;
+import std.mem;
+import std.env;
+import std.fs;
+import bytes;
+import link.coff;
+import link.pe;
+
+bool equal(&const Vec<byte> a, &const Vec<byte> b) { if (a.len() != b.len()) { return false; } for (i in 0..a.len()) { if (*a.get(i).unwrap() != *b.get(i).unwrap()) { return false; } } return true; }
+void save(&const str name, &const Vec<byte> value) { match fs.write(name, value) { Ok(_) => {}, Err(_) => panic("debug probe write failed") } }
+int main() {
+    var args = env.args(); if (args.len() != 4) { return 2; }
+    if (args[3] == String.from("read")) { var input = match fs.read(args[1]) { Ok(value) => value, Err(_) => return 2 }; return match elf_object.read(input, "input", false) { Ok(_) => 0, Err(_) => 1 }; }
+    if (args[3] == String.from("read-coff")) { var input = match fs.read(args[1]) { Ok(value) => value, Err(_) => return 2 }; return match coff.read(input, "input", false) { Ok(_) => 0, Err(_) => 1 }; }
+    var compilation = match Compilation.load(args[1], prelude_source.source(), "", 5, true) { Ok(value) => value, Err(_) => return 3 };
+    if (!compilation.ok) { return 4; }
+    bool windows = args[3].starts_with("win");
+    int mode = if (args[3] == String.from("1") || args[3] == String.from("win1")) { 1 } else if (args[3] == String.from("2") || args[3] == String.from("win2")) { 2 } else if (args[3] == String.from("3") || args[3] == String.from("win3")) { 3 } else { 0 };
+    var target = Target.new(if (windows) { TargetOs.Windows } else { TargetOs.Linux }); target.debug_info = true; target.checked_arithmetic = mode < 2; target.register_allocation = mode % 2 == 0;
+    var ax = Axon.new(target); if (!ax.generate(&compilation.lowerer.ck, &const compilation.trees, &compilation.lowerer.module)) { return 5; }
+    ax.obj.debug = data.resolve(ax.obj.debug_raw, compilation.sources); ax.obj.debug.types = mem.replace(&ax.debug_types.types, Vec.new());
+    if (windows) { for (s in &const compilation.sources) { ax.obj.debug.hashes.push(macho_sha256.digest(s.data(), 0, s.data().len())); }
+        var meta = data.encode(ax.obj.debug); save("{args[2]}.meta", meta); var object = write_object(ax.obj, target.format()); save("{args[2]}.obj", object);
+        var loaded = match coff.read(object, "probe", false) { Ok(v) => v, Err(_) => return 16 };
+        if (!equal(meta, data.encode(loaded.debug))) { return 17; }
+        // The probe validates file formats without executing fixture imports.
+        for (s in &loaded.symbols) { match s.definition { Undefined => { s.definition = Definition.Section(0, 0); }, _ => {} } }
+        Vec<Object> inputs = Vec.new(); inputs.push(loaded);
+        var bundle = match pe.write_bundle(inputs, "synx_entry", Vec.new(), "probe.pdb") { Ok(v) => v, Err(_) => return 18 }; save("{args[2]}.exe", bundle.exe); save("{args[2]}.pdb", bundle.pdb);
+        for (i in 0..meta.len()) { if (data.decode(bytes.copy(meta, 0, i)).is_some()) { return 19; } }
+        return 0;
+    }
+    var transport = data.encode(ax.obj.debug);
+    var decoded = data.decode(bytes.copy(transport, 0, transport.len())).unwrap();
+    if (!equal(data.encode(decoded), transport)) { return 6; }
+    save("{args[2]}.meta", transport);
+    // Every truncated transport must fail without panic or excess allocation.
+    for (i in 0..transport.len()) { if (data.decode(bytes.copy(transport, 0, i)).is_some()) { return 7; } }
+    var object = write_object(ax.obj, target.format()); save("{args[2]}.o", object);
+    var loaded = match elf_object.read(object, "probe", false) { Ok(value) => value, Err(_) => return 8 };
+    if (!equal(data.encode(loaded.debug), transport)) { return 8; }
+    // Resolve the real object symbols to a known image range. Runtime imports
+    // remain in the object, so construct resolved source records directly.
+    var unit = data.copy(loaded.debug); for (f in &unit.functions) { f.address += 4198400; }
+    var symbols = match symbols(unit) { Ok(value) => value, Err(_) => return 9 }; save("{args[2]}.elf", symbols.data);
+    Vec<byte> patches = Vec.new(); for (p in &const symbols.patches) { data.word(&patches, *p, 8); } save("{args[2]}.patches", patches);
+    ax.obj.debug = data.Unit.new(); save("{args[2]}.plain.o", write_object(ax.obj, target.format()));
+    // A valid template with an export catalogue exercises standalone payload
+    // construction on every test host. It is never executed.
+    Vec<Object> inputs = Vec.new(); inputs.push(loaded);
+    var catalogue = match imports.collect_for(inputs, "runtime", 0, "synx_entry") { Ok(value) => value, Err(_) => return 10 };
+    Vec<byte> names = Vec.new(); for (item in &const catalogue) { bytes.append(&names, item.name); names.push(10); }
+    var hash = macho_sha256.digest(names, 0, names.len()); names.push(0);
+    Vec<byte> host = Vec.new(); for (i in 0..64) { host.push(0); } *host.get_mut(0).unwrap() = 127; *host.get_mut(1).unwrap() = 69; *host.get_mut(2).unwrap() = 76; *host.get_mut(3).unwrap() = 70; *host.get_mut(4).unwrap() = 2; *host.get_mut(5).unwrap() = 1; *host.get_mut(18).unwrap() = 62;
+    bytes.text(&host, standalone.MARKER); while (host.len() < 96) { host.push(0); }
+    data.word(&host, 1, 4); data.word(&host, 0, 4); data.word(&host, 0, 8); data.word(&host, 0, 8); bytes.append(&host, hash); data.word(&host, names.len() as ulong, 8); bytes.append(&host, names);
+    if (standalone.bytes(Vec.new(), host, 0).is_ok()) { return 11; }
+    var no_feature = match standalone.bytes(inputs, host, 0) { Err(_) => true, Ok(_) => false }; if (!no_feature) { return 12; }
+    // Re-read because the linker consumes its owning input vector.
+    var loaded_again = match elf_object.read(object, "probe", false) { Ok(value) => value, Err(_) => return 13 };
+    inputs = Vec.new(); inputs.push(loaded_again); bytes.text(&host, "SYNX-GDB-JIT-V1\0");
+    var standalone_image = match standalone.bytes(inputs, host, 0) { Ok(value) => value, Err(_) => return 14 }; save("{args[2]}.standalone", standalone_image);
+    var fixed = match elf_object.read(object, "probe", false) { Ok(value) => value, Err(_) => return 15 };
+    fixed.relocations.clear(); Vec<Symbol> defined = Vec.new();
+    for (symbol in &const fixed.symbols) { match symbol.definition { Definition.Undefined => {}, _ => defined.push(Symbol { name: bytes.copy(symbol.name, 0, symbol.name.len()), binding: symbol.binding, definition: symbol.definition }) } }
+    fixed.symbols = defined; Vec<Object> fixed_inputs = Vec.new(); fixed_inputs.push(fixed);
+    var executable = match write(fixed_inputs, "synx_entry") { Ok(value) => value, Err(_) => return 16 }; save("{args[2]}.exe-elf", executable);
+    return 0;
+}

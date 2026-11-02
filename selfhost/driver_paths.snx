@@ -7,6 +7,7 @@ import std.fs;
 import std.env;
 import std.text;
 import std.process.{Command, ExitStatus};
+import link.pe_debug;
 
 pub String display(&const str value) {
     match host_style() { Windows => return text.replace(value, "\\", "/"), Unix => return String.from(value) }
@@ -91,6 +92,7 @@ pub LinkCommand link_command(Target target, &const str object, &const str runtim
     Vec<String> args = Vec.new();
     match target.os {
         Windows => {
+            if (target.debug_info) { args.push(String.from("/DEBUG:FULL")); args.push(String.from("/INCREMENTAL:NO")); var pdb = pe_debug.path(executable); args.push("/PDB:{pdb}"); }
             args.push(String.from("/nologo")); args.push(String.from("/subsystem:console")); args.push(String.from("/stack:8388608"));
             args.push(String.from("/entry:wmainCRTStartup")); args.push(String.from("/include:wmain"));
             args.push(String.from(object)); args.push(String.from(runtime)); args.push(String.from("legacy_stdio_definitions.lib"));
@@ -123,7 +125,7 @@ pub String quoted(&const str value, bool windows) {
 }
 pub String link_text(Target target, &const str object, &const str runtime, &const str executable) {
     bool windows = target.win64_abi(); var o = quoted(object, windows); var r = quoted(runtime, windows); var e = quoted(executable, windows);
-    if (windows) { return "link /nologo /subsystem:console /stack:8388608 /entry:wmainCRTStartup /include:wmain {o} {r} legacy_stdio_definitions.lib /out:{e}"; }
+    if (windows) { var flags = String.new(); if (target.debug_info) { var path = quoted(pe_debug.path(executable), true); flags = "/DEBUG:FULL /INCREMENTAL:NO /PDB:{path} "; } return "link {flags}/nologo /subsystem:console /stack:8388608 /entry:wmainCRTStartup /include:wmain {o} {r} legacy_stdio_definitions.lib /out:{e}"; }
     String result = "cc {o} {r} -pthread -o {e}";
     match target.os { Linux => result.push_str(" -no-pie"), MacOs => result.push_str(" -arch x86_64"), _ => {} }
     return result;

@@ -1,0 +1,22 @@
+import debug.values;
+/// Independent CodeView/PDB format probe. Native consumers validate the output.
+import debug.data.{Unit, Function, Row};
+import debug.cv;
+import debug.pdb;
+import std.env;
+import std.fs;
+int main() {
+    var args = env.args(); if (args.len() != 2 && args.len() != 3) { return 2; }
+    var unit = Unit.new(); unit.files.push(String.from("C:\\synx\\example.snx"));
+    Vec<Row> rows = Vec.new(); rows.push(Row {offset: 4, file: 0, line: 3, column: 5}); rows.push(Row {offset: 16, file: 0, line: 4, column: 5});
+    unit.functions.push(Function {symbol: String.from("@fn.1"), name: String.from("example"), address: 4096, size: 32, rows: rows, values: debug.values.Values.new()});
+    if (args.len() == 3) {
+        usize count = if (args[2] == String.from("huge")) { 18000 } else { 3000 }; usize width = if (count == 18000) { 4096 } else { 3072 };
+        for (i in 0..count) { String name = "C:\\sources\\{i}\\"; while (name.len() < width) { name.push_str("a"); } name.push_str(".snx"); unit.files.push(name); }
+    }
+    var sections = cv.Buffer.new(); sections.string(".text"); while (sections.data.len() < 8) { sections.word(0, 1); }
+    sections.word(32, 4); sections.word(4096, 4); sections.word(512, 4); sections.word(512, 4); for (i in 0..12) { sections.word(0, 1); } sections.word(0x60000020, 4);
+    Vec<byte> guid = Vec.new(); for (i in 0..16) { guid.push((i + 1) as byte); }
+    var output = match pdb.write(unit, Vec.new(), sections.data, 1, 4096, guid) {Ok(v) => v, Err(_) => return 3};
+    return match fs.write(args[1], output) { Ok(_) => 0, Err(_) => 4 };
+}

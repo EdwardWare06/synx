@@ -1,0 +1,89 @@
+/// CodeView type serialization. UDT forward records break recursive graphs;
+/// matching unique names connect them to complete records. Field lists use
+/// LF_INDEX continuation before the 16-bit record-length limit.
+import debug.cv.Buffer;
+import debug.data.Unit;
+import debug.values.Type;
+import ids.NONE;
+import bytes;
+import std.mem;
+pub struct Types {
+    pub Vec<byte> data; pub Vec<uint> ids; pub Vec<uint> functions;
+    pub Vec<usize> offsets; pub Vec<String> hashes;
+    pub uint get(&const self, uint id) { return if (id == NONE) { 3 } else { self.ids[id as usize] }; }
+}
+/// Record counts and strings must fit CodeView's 16-bit record lengths.
+/// The first source path forms UDT identities; field-list continuations bound
+/// each list independently. Callers report unsupported input before emission.
+pub bool supported(&const Unit unit) {
+    if (!unit.types.is_empty() && (unit.files.is_empty() || unit.files[0].len() > 32767)) { return false; }
+    for (t in &const unit.types) { if (t.name.len() > 16384 || t.fields.len() > 65535) { return false; } for (f in &const t.fields) { if (f.name.len() > 16384) { return false; } } }
+    for (f in &const unit.functions) { if (f.name.len() > 60000 || f.values.args.len() > 16000) { return false; } for (v in &const f.values.variables) { if (v.name.len() > 60000) { return false; } } }
+    return true;
+}
+pub struct Builder {
+    Types out; Vec<Vec<byte>> records;
+    Builder new(usize count) { var b = Builder { out: Types { data: Vec.new(), ids: Vec.new(), functions: Vec.new(), offsets: Vec.new(), hashes: Vec.new() }, records: Vec.new() }; for (i in 0..count) { b.out.ids.push(0); } return b; }
+    uint add(&self, &Buffer b, String hash) {
+        usize pad = (4 - b.data.len() % 4) % 4; for (i in 0..pad) { b.word((0xf0 + pad - i) as ulong, 1); }
+        b.patch(0, (b.data.len() - 2) as ulong, 2);
+        uint index = 0x1000 + self.records.len() as uint; self.records.push(mem.replace(&b.data, Vec.new())); self.out.hashes.push(hash); return index;
+    }
+    uint fields(&self, &const Unit unit, &const Type t) {
+        Vec<Vec<byte>> groups = Vec.new(); var list = Buffer.new(); list.record(0x1203);
+        for (f in &const t.fields) {
+            var field = Buffer.new(); field.word(if (t.kind == 9) { 0x1502 } else { 0x150d }, 2); field.word(3, 2);
+            if (t.kind != 9) { field.word(self.get(unit, f.type) as ulong, 4); } numeric(&field, f.offset); field.string(f.name);
+            usize pad = (4 - field.data.len() % 4) % 4; for (i in 0..pad) { field.word((0xf0 + pad - i) as ulong, 1); }
+            if (list.data.len() + field.data.len() > 60000) { groups.push(mem.replace(&list.data, Vec.new())); list.record(0x1203); }
+            list.append(field.data);
+        } groups.push(list.data); uint next = 0; usize i = groups.len();
+        while (i > 0) { i -= 1; var b = Buffer.new(); b.data = mem.replace(groups.get_mut(i).unwrap(), Vec.new());
+            if (next != 0) { b.word(0x1404, 2); b.word(0, 2); b.word(next as ulong, 4); } next = self.add(&b, String.new());
+        } return next;
+    }
+    uint udt(&self, &const Unit unit, usize i, bool forward) {
+        var t = unit.types.get(i).unwrap(); var b = Buffer.new(); b.record(if (t.kind == 8) { 0x1506 } else if (t.kind == 9) { 0x1507 } else { 0x1505 });
+        b.word(if (forward) { 0 } else { t.fields.len() as ulong }, 2); b.word(0x300 | if (forward) { 0x80 } else { 0 }, 2);
+        if (t.kind == 9) { b.word(0x77, 4); }
+        b.word(if (forward) { 0 } else { self.fields(unit, t) as ulong }, 4);
+        if (t.kind != 8 && t.kind != 9) { b.word(0, 4); b.word(0, 4); }
+        if (t.kind != 9) { numeric(&b, if (forward) { 0 } else { t.size }); }
+        b.string(t.name); var unique = ".synx.{unit.files[0]}.{i}"; b.string(unique);
+        return self.add(&b, if (forward) { String.new() } else { unique });
+    }
+    uint get(&self, &const Unit unit, uint id) {
+        if (id == NONE) { return 3; } usize i = id as usize; if (self.out.ids[i] != 0) { return self.out.ids[i]; }
+        var t = unit.types.get(i).unwrap(); uint simple = primitive(t);
+        if (simple != 0) { *self.out.ids.get_mut(i).unwrap() = simple; return simple; }
+        var b = Buffer.new();
+        if (t.kind == 5) { b.record(0x1002); b.word(self.get(unit, t.inner) as ulong, 4); b.word(0x1000c, 4); }
+        else if (t.kind == 6) { b.record(0x1503); b.word(self.get(unit, t.inner) as ulong, 4); b.word(0x77, 4); numeric(&b, t.size); b.string(""); }
+        else if (t.kind == 10) { b.record(0x1001); b.word(self.get(unit, t.inner) as ulong, 4); b.word(1, 2); }
+        else { return 3; }
+        uint index = self.add(&b, String.new()); *self.out.ids.get_mut(i).unwrap() = index; return index;
+    }
+}
+void numeric(&Buffer out, ulong n) { if (n < 0x8000) { out.word(n, 2); } else if (n <= 0xffffffff) { out.word(0x8004, 2); out.word(n, 4); } else { out.word(0x800a, 2); out.word(n, 8); } }
+uint primitive(&const Type t) {
+    if (t.kind == 0 && t.name == String.from("void")) { return 3; }
+    if (t.kind == 1) { return if (t.size == 2) { 0x72 } else if (t.size == 4) { 0x74 } else { 0x76 }; }
+    if (t.kind == 2) { return if (t.size == 1) { 0x20 } else if (t.name == String.from("char")) { 0x7b } else if (t.size == 4) { 0x75 } else { 0x77 }; }
+    if (t.kind == 3) { return 0x30; } if (t.kind == 4) { return if (t.size == 4) { 0x40 } else { 0x41 }; }
+    return 0;
+}
+pub Types emit(&const Unit unit) {
+    var b = Builder.new(unit.types.len());
+    // Keep the historical no-argument void procedure for synthetic symbols.
+    var args = Buffer.new(); args.record(0x1201); args.word(0, 4); b.add(&args, String.new());
+    var proc = Buffer.new(); proc.record(0x1008); proc.word(3, 4); proc.word(0, 1); proc.word(0, 1); proc.word(0, 2); proc.word(0x1000, 4); b.add(&proc, String.new());
+    for (i in 0..unit.types.len()) { var t = unit.types.get(i).unwrap(); if ((t.kind == 0 && t.name != String.from("void")) || (t.kind >= 7 && t.kind <= 9)) { uint index = b.udt(unit, i, true); *b.out.ids.get_mut(i).unwrap() = index; } }
+    for (i in 0..unit.types.len()) { b.get(unit, i as uint); }
+    for (i in 0..unit.types.len()) { var t = unit.types.get(i).unwrap(); if ((t.kind == 0 && t.name != String.from("void")) || (t.kind >= 7 && t.kind <= 9)) { uint full = b.udt(unit, i, false); *b.out.ids.get_mut(i).unwrap() = full; } }
+    for (f in &const unit.functions) {
+        if (f.values.ret == NONE && f.values.args.is_empty()) { b.out.functions.push(0x1001); continue; }
+        var args = Buffer.new(); args.record(0x1201); args.word(f.values.args.len() as ulong, 4); for (t in &const f.values.args) { args.word(b.get(unit, *t) as ulong, 4); } uint ai = b.add(&args, String.new());
+        var proc = Buffer.new(); proc.record(0x1008); proc.word(b.get(unit, f.values.ret) as ulong, 4); proc.word(0, 1); proc.word(0, 1); proc.word(f.values.args.len() as ulong, 2); proc.word(ai as ulong, 4); uint pi = b.add(&proc, String.new()); b.out.functions.push(pi);
+    }
+    for (record in &const b.records) { b.out.offsets.push(b.out.data.len()); bytes.append(&b.out.data, *record); } return b.out;
+}

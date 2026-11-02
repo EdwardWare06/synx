@@ -45,12 +45,16 @@ executable to another computer with the same supported OS and architecture.
 The target computer needs no Synx installation. Normal OS libraries are
 still required. Linux programs require glibc 2.34 or later.
 
+For Linux and Windows source breakpoints and stepping, see [Debugging](debugging.md).
+
 Options can come before or after the file name:
 
 | Option | Effect |
 |--------|--------|
 | `-o <path>` | Write the executable to *path*. The folder must exist. |
 | `--release` | Remove integer overflow checks. Addition, subtraction, multiplication, and negation wrap. Shift counts are masked to the operand width. Division by zero still panics. Bounds checks stay. |
+| `-g` | Include source lines and function names on Linux and Windows x86-64, including with `--release`. Debug builds enable this by default. Windows writes a matching `.pdb` beside the executable. macOS does not yet support `-g`. |
+| `--no-debug` | Omit source debug information. Release builds use this default. |
 | `--keep-obj` | Keep the object file (`<output>.obj` on Windows, `<output>.o` elsewhere). |
 | `--no-regalloc` | Keep all local values on the stack. This option is for compiler testing. |
 | `--standalone` | Include the runtime in the executable. This is the default with the built-in linker. |
@@ -154,7 +158,7 @@ synx --version
 ```
 
 Prints the version and the host operating system, for example
-`Synx 0.2.0 (windows)`. The host is `windows`, `linux`, or `macos`.
+`Synx 0.3.0 (windows)`. The host is `windows`, `linux`, or `macos`.
 
 ## about
 

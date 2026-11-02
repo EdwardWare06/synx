@@ -1,11 +1,18 @@
+import debug.values.Values;
 /// Platform process-entry stubs. Runtime bootstrap receives executable callbacks;
 /// no unresolved callback from a shared runtime points back into the executable.
 import link.model.{Object, Section, Symbol, Definition, Binding, Relocation, RelocKind, SectionKind};
 import x64;
 import std.utf8;
 import std.collections.HashMap;
+import debug.data.{Function, word};
+import debug.unwind;
+import debug.unwind.Step;
 
 pub Object make(int os) {
+    return make_debug(os, false);
+}
+pub Object make_debug(int os, bool debug) {
     var out = Object.new("<startup>", false);
     var a = x64.Assembler.new();
     out.symbols.push(Symbol.new("__synx_start", Binding.Global, Definition.Section(0, 0)));
@@ -44,6 +51,16 @@ pub Object make(int os) {
         var kind = match reloc.kind { Abs64 => RelocKind.Abs64, _ => RelocKind.Pc32 };
         out.relocations.push(Relocation { section: 0, offset: reloc.offset as ulong, symbol: symbol, kind: kind, addend: reloc.addend });
     }
-    out.sections.push(Section.new(SectionKind.Text, 16, a.code));
+    ulong size = a.code.len() as ulong; out.sections.push(Section.new(SectionKind.Text, 16, a.code));
+    if (os == 1 && debug) {
+        Vec<Step> steps = Vec.new(); steps.push(Step { end: 4, op: 1, reg: 0, value: 40 }); var info = unwind.encode(steps);
+        Vec<byte> pd = Vec.new(); word(&pd, 0, 4); word(&pd, size, 4); word(&pd, 0, 4);
+        usize index = out.symbols.len(); out.symbols.push(Symbol.new("startup-unwind", Binding.Local, Definition.Section(2, 0)));
+        out.relocations.push(Relocation { section: 1, offset: 0, symbol: 0, kind: RelocKind.Rva32, addend: 0 });
+        out.relocations.push(Relocation { section: 1, offset: 4, symbol: 0, kind: RelocKind.Rva32, addend: size as long });
+        out.relocations.push(Relocation { section: 1, offset: 8, symbol: index, kind: RelocKind.Rva32, addend: 0 });
+        out.sections.push(Section.new(SectionKind.ReadOnly, 4, pd)); out.sections.push(Section.new(SectionKind.ReadOnly, 4, info)); out.pdata.push(1);
+        out.debug.functions.push(Function { symbol: String.from("__synx_start"), name: String.from("__synx_start"), address: 0, size: size, rows: Vec.new(), values: Values.new() });
+    }
     return out;
 }

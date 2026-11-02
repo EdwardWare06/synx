@@ -1,0 +1,110 @@
+/// Forward must-analysis over source locals only. Visibility survives moves;
+/// availability ends on moves, drops, StorageDead, and destination writes.
+/// Event interiors use the stable state. Entry PCs retain the pre-event state.
+import ir.{Function, Place, ProjKind, Operand, Statement, StatementKind, Terminator, TerminatorKind, CalleeKind};
+import debug.values.{Values, Variable, Range, Location};
+import regalloc.RegisterAllocation;
+import ids.NONE;
+pub struct State {
+    Vec<bool> visible; Vec<bool> valid;
+    State new(usize n) { var s = State { visible: Vec.new(), valid: Vec.new() }; for (i in 0..n) { s.visible.push(false); s.valid.push(false); } return s; }
+    pub State copy(&const self) { var s = State.new(0); for (v in &const self.visible) { s.visible.push(*v); } for (v in &const self.valid) { s.valid.push(*v); } return s; }
+}
+pub struct Track {
+    pub Values values; Vec<uint> locals; Vec<uint> map; Vec<int> registers; pub Vec<State> incoming; pub State current;
+    pub Track empty() { return Track.new(&const Function.new(String.new()), &const Vec<int>.new()); }
+    pub Track new(&const Function f, &const Vec<int> registers) {
+        var out = Track { values: Values.new(), locals: Vec.new(), map: Vec.new(), registers: Vec.new(), incoming: Vec.new(), current: State.new(0) };
+        for (reg in registers) { out.registers.push(*reg); }
+        for (i in 0..f.locals.len()) {
+            var l = f.locals.get(i).unwrap(); uint index = NONE;
+            if (l.debug_user) { index = out.locals.len() as uint; out.locals.push(i as uint);
+                out.values.variables.push(Variable { name: String.from(l.name), type: l.type.index, parameter: l.is_arg, scope: Vec.new(), locations: Vec.new() });
+            } out.map.push(index);
+        }
+        usize n = out.locals.len(); var entry = State.new(n);
+        for (i in 0..n) { bool arg = f.locals[out.locals[i] as usize].is_arg; *entry.visible.get_mut(i).unwrap() = arg; *entry.valid.get_mut(i).unwrap() = arg; }
+        Vec<bool> seen = Vec.new(); Vec<bool> dirty = Vec.new();
+        for (b in &const f.blocks) { out.incoming.push(State.new(n)); seen.push(false); dirty.push(false); }
+        if (f.blocks.is_empty() || n == 0) { out.current = entry; return out; };
+        *out.incoming.get_mut(0).unwrap() = entry.copy(); *seen.get_mut(0).unwrap() = true; *dirty.get_mut(0).unwrap() = true;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (bi in 0..f.blocks.len()) {
+                if (!dirty[bi]) { continue; }; *dirty.get_mut(bi).unwrap() = false;
+                out.current = out.incoming[bi].copy();
+                for (s in &const f.blocks[bi].stmts) { out.statement(s, true); }
+                var t = &const f.blocks[bi].term; out.terminator(t, true); Vec<uint> next = Vec.new();
+                match t.kind { TerminatorKind.Goto | TerminatorKind.Assert => { next.push(t.target); },
+                    TerminatorKind.Call => { if (!t.diverges) { next.push(t.target); } },
+                    TerminatorKind.Switch => { next.push(t.otherwise); for (c in &const t.cases) { next.push(c.block); } }, _ => {} }
+                for (target in &const next) { usize j = *target as usize; bool update = false;
+                    if (!seen[j]) { *out.incoming.get_mut(j).unwrap() = out.current.copy(); *seen.get_mut(j).unwrap() = true; update = true; }
+                    else { var dest = out.incoming.get_mut(j).unwrap(); for (i in 0..n) {
+                        bool v = dest.visible[i] && out.current.visible[i]; bool a = dest.valid[i] && out.current.valid[i];
+                        if (v != dest.visible[i] || a != dest.valid[i]) { *dest.visible.get_mut(i).unwrap() = v; *dest.valid.get_mut(i).unwrap() = a; update = true; }
+                    } }
+                    if (update) { *dirty.get_mut(j).unwrap() = true; changed = true; }
+                }
+            }
+        } out.current = entry; return out;
+    }
+    void kill(&self, &const Place p, bool dead) {
+        if (p.is_none() || p.local as usize >= self.map.len()) { return; }
+        for (pr in &const p.proj) { match pr.kind { ProjKind.Deref => return, _ => {} } }
+        uint i = self.map[p.local as usize]; if (i == NONE) { return; };
+        *self.current.valid.get_mut(i as usize).unwrap() = false;
+        if (dead) { *self.current.visible.get_mut(i as usize).unwrap() = false; }
+    }
+    void moved(&self, &const Operand o) { if (o.is_move()) { self.kill(&const o.place, false); } }
+    /// A later event can reuse a register and then jump to an earlier return
+    /// block inside the old allocation interval. Invalidate the old owner in
+    /// the CFG state, including when the new owner is an unnamed temporary.
+    void written_register(&self, &const Place p) {
+        if (!p.is_local() || p.local as usize >= self.registers.len()) { return; } int reg = self.registers[p.local as usize]; if (reg < 0) { return; }
+        for (i in 0..self.locals.len()) { uint other = self.locals[i]; if (other != p.local && self.registers[other as usize] == reg) { *self.current.valid.get_mut(i).unwrap() = false; } }
+    }
+    void clobber_call(&self) {
+        for (i in 0..self.locals.len()) { int reg = self.registers[self.locals[i] as usize]; if (reg == 8 || reg == 9) { *self.current.valid.get_mut(i).unwrap() = false; } }
+    }
+    void define(&self, &const Place p) {
+        if (!p.is_local() || p.local as usize >= self.map.len()) { return; } uint i = self.map[p.local as usize]; if (i == NONE) { return; };
+        *self.current.valid.get_mut(i as usize).unwrap() = true; *self.current.visible.get_mut(i as usize).unwrap() = true;
+    }
+    pub void statement(&self, &const Statement s, bool complete) {
+        match s.kind {
+            StatementKind.Assign => {
+                self.moved(&const s.rvalue.a); self.moved(&const s.rvalue.b); for (o in &const s.rvalue.elems) { self.moved(o); } for (o in &const s.rvalue.captures) { self.moved(o); }
+                self.written_register(&const s.place); if (!complete || s.place.is_local()) { self.kill(&const s.place, false); } if (complete) { self.define(&const s.place); }
+            }
+            StatementKind.Drop | StatementKind.DropIf => { self.kill(&const s.place, false); self.clobber_call(); }
+            StatementKind.StorageDead => { self.kill(&const s.place, true); }
+            _ => {}
+        }
+    }
+    pub void terminator(&self, &const Terminator t, bool complete) {
+        match t.kind {
+            TerminatorKind.Call => { for (o in &const t.args) { self.moved(o); } self.moved(&const t.callee.fn_operand); self.written_register(&const t.dest); self.clobber_call(); if (!complete || t.dest.is_local()) { self.kill(&const t.dest, false); } if (complete && !t.diverges) { self.define(&const t.dest); } }
+            TerminatorKind.Switch => { self.moved(&const t.discr); }
+            TerminatorKind.Assert => { self.moved(&const t.cond); }
+            _ => {}
+        }
+    }
+    pub void record(&self, &const State state, usize begin, usize end, usize pos, &const RegisterAllocation allocation, &const Vec<int> slots, bool call, bool entry) {
+        if (begin >= end) { return; }
+        for (i in 0..self.locals.len()) {
+            if (!state.visible[i]) { continue; } uint local = self.locals[i]; int reg = allocation.registers[local as usize];
+            var v = self.values.variables.get_mut(i).unwrap();
+            if (!v.scope.is_empty() && v.scope[v.scope.len() - 1].end == begin as ulong) { v.scope.get_mut(v.scope.len() - 1).unwrap().end = end as ulong; }
+            else { v.scope.push(Range { begin: begin as ulong, end: end as ulong }); }
+            if (!state.valid[i]) { continue; }
+            if (reg >= 0 && (pos < allocation.starts[local as usize] || pos > allocation.ends[local as usize] || (!entry && pos >= allocation.ends[local as usize]) || (call && (reg == 8 || reg == 9)))) { continue; }
+            int offset = if (reg < 0) { slots[local as usize] } else { 0 };
+            if (offset == -2147483648) { continue; }
+            if (!v.locations.is_empty()) { var last = v.locations.get_mut(v.locations.len() - 1).unwrap();
+                if (last.end == begin as ulong && last.reg == reg && last.offset == offset) { last.end = end as ulong; continue; }
+            } v.locations.push(Location { begin: begin as ulong, end: end as ulong, reg: reg, offset: offset });
+        }
+    }
+}

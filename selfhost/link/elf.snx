@@ -5,6 +5,7 @@ import link.model.{Object, Failure};
 import link.image;
 import link.buffer.Buffer;
 import link.elf_dynamic;
+import debug.elf;
 import link.imports.Import;
 
 pub Result<Vec<byte>, Failure> write_dynamic(&const Vec<Object> inputs, &const str entry,
@@ -43,5 +44,5 @@ pub Result<Vec<byte>, Failure> write(&const Vec<Object> inputs, &const str entry
         var padding = out.pad(segment.rva)?;
         out.append(segment.data);
     }
-    return Ok(out.data);
+    return elf.attach(out.data, linked.debug);
 }

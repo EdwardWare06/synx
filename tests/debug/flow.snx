@@ -1,0 +1,40 @@
+int identity(int input) { return input + 1; }
+int reuse(int argument) {
+    print("before");
+    int replacement = identity(argument);
+    print("replacement {replacement}");
+    return replacement;
+}
+void branch(bool choose) {
+    String original = String.from("branch");
+    int initialized;
+    if (choose) { String consumed = original; initialized = 41; }
+    else { initialized = 43; }
+    print("joined {initialized}"); // JOIN
+    int value = 55;
+    for (value in 0..1) {
+        print("loop {value}"); // LOOP
+    }
+    print("outer {value}"); // LOOP_END
+    match Some(77) {
+        Some(value) => {
+            print("match {value}"); // MATCH
+        },
+        None => {}
+    }
+    print("outer {value}"); // MATCH_END
+    var boxed = Box<int>.new(81);
+    int extracted = boxed.into_inner();
+    print("box {extracted}"); // BOX
+    String name = String.from("outer");
+    {
+        String name = String.from("inner");
+        String owner = name;
+        print("hidden"); // HIDDEN
+    }
+}
+int main() {
+    int result = reuse(8);
+    branch(true);
+    return result - 9;
+}

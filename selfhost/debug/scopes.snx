@@ -1,0 +1,30 @@
+/// Disjoint PC partitions of source visibility. One block contains all visible
+/// locals; later declarations hide earlier locals with the same name. This
+/// avoids overlapping sibling blocks after CFG layout reorders source scopes.
+import debug.values.Values;
+pub struct Scope { pub ulong begin; pub ulong end; pub Vec<uint> variables; }
+pub Vec<Scope> split(&const Values values) {
+    Vec<ulong> ends = Vec.new();
+    for (v in &const values.variables) { if (v.parameter) { continue; } for (r in &const v.scope) { ends.push(r.begin); ends.push(r.end); } }
+    // Visibility boundaries follow declaration order, usually already sorted.
+    for (i in 0..ends.len()) { usize j = i; while (j > 0 && ends[j] < ends[j - 1]) { ends.swap(j, j - 1); j -= 1; } }
+    Vec<Scope> out = Vec.new();
+    for (i in 1..ends.len()) {
+        ulong begin = ends[i - 1]; ulong end = ends[i]; if (begin == end) { continue; } Vec<uint> visible = Vec.new();
+        for (vi in 0..values.variables.len()) { var v = values.variables.get(vi).unwrap(); if (v.parameter) { continue; }
+            bool active = false; for (r in &const v.scope) { if (r.begin <= begin && r.end >= end) { active = true; break; } }
+            if (!active) { continue; }
+            for (old in &visible) { if (*old != 4294967295 && values.variables[*old as usize].name == v.name) { *old = 4294967295; } }
+            visible.push(vi as uint);
+        }
+        Vec<uint> kept = Vec.new(); for (v in &const visible) { if (*v != 4294967295) { kept.push(*v); } }
+        if (!kept.is_empty()) {
+            bool merge = false;
+            if (!out.is_empty()) { var last = out.get(out.len() - 1).unwrap(); merge = last.end == begin && last.variables.len() == kept.len();
+                if (merge) { for (i in 0..kept.len()) { if (kept[i] != last.variables[i]) { merge = false; break; } } }
+            }
+            if (merge) { out.get_mut(out.len() - 1).unwrap().end = end; }
+            else { out.push(Scope { begin: begin, end: end, variables: kept }); }
+        }
+    } return out;
+}

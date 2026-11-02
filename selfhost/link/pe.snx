@@ -8,8 +8,9 @@ import link.imports.Import;
 import link.pe_dynamic;
 import link.buffer.{Buffer, align};
 import std.collections.sort;
+import link.pe_debug;
 
-Result<Vec<byte>, Failure> base_relocations(&const Vec<ulong> sites) {
+pub Result<Vec<byte>, Failure> base_relocations(&const Vec<ulong> sites) {
     Vec<ulong> sorted = Vec.new(); for (site in sites) { sorted.push(*site); }
     sort(&sorted);
     var out = Buffer.new(); usize cursor = 0;
@@ -40,6 +41,9 @@ pub Result<Vec<byte>, Failure> write(&const Vec<Object> inputs, &const str entry
 /// direct calls, function pointers, and __imp_ indirect calls. Windows loads and
 /// initializes dependent runtime DLLs before the supplied executable entry.
 pub Result<Vec<byte>, Failure> write_dynamic(&const Vec<Object> inputs, &const str entry, &const Vec<Import> catalog) {
+    var output = write_bundle(inputs, entry, catalog, "program.pdb")?; return Ok(output.exe);
+}
+pub Result<pe_debug.Output, Failure> write_bundle(&const Vec<Object> inputs, &const str entry, &const Vec<Import> catalog, &const str pdb_name) {
     var prepared = pe_dynamic.prepare(inputs, catalog)?;
     var linked = image.build(prepared.inputs, entry, 5368709120)?;
     ulong directory = 0; ulong iat = 0;
@@ -47,7 +51,8 @@ pub Result<Vec<byte>, Failure> write_dynamic(&const Vec<Object> inputs, &const s
         directory = image.symbol(linked, "__synx_pe_import_directory").unwrap() - linked.base;
         iat = image.symbol(linked, "__synx_pe_iat_start").unwrap() - linked.base;
     }
-    return serialize(linked, directory, prepared.directory_size, iat, prepared.iat_size);
+    var exe = serialize(linked, directory, prepared.directory_size, iat, prepared.iat_size)?;
+    return pe_debug.attach(exe, linked.debug, linked.unwind, pdb_name);
 }
 Result<Vec<byte>, Failure> serialize(&const image.Image linked, ulong directory, ulong directory_size, ulong iat, ulong iat_size) {
     if (!linked.rebase_safe) { return Err(model.fail(Code.Unsupported, 0, 0)); }

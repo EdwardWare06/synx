@@ -449,6 +449,7 @@ pub struct Lowerer {
             for (i in 0..ids.len()) {
                 var p = node.params.get(i).unwrap(); var pt = self.ck.elem(closure_type, i);
                 self.fun(&c).locals.push(Local.new(pt, defs.name(p.name).as_str(), true, p.span));
+                self.fun(&c).locals.get_mut(self.fun(&c).locals.len() - 1).unwrap().debug_user = true;
             }
             self.fun(&c).arg_count = (ids.len() + 1) as uint;
         } else {
@@ -457,6 +458,7 @@ pub struct Lowerer {
                 var p = self.ck.r.program.def(def).params.get(i).unwrap(); var pt = p.type; var pn = String.from(p.name); Span ps = p.span;
                 var lt = self.subst_type(&c, pt);
                 self.fun(&c).locals.push(Local.new(lt, pn.as_str(), true, ps));
+                self.fun(&c).locals.get_mut(self.fun(&c).locals.len() - 1).unwrap().debug_user = true;
             }
             self.fun(&c).arg_count = np as uint;
         }
@@ -802,6 +804,7 @@ pub struct Lowerer {
                 var lt = self.checker_local(&*c, checker_id).type; var ty = self.subst_type(&*c, lt);
                 uint local = self.new_temp(&*c, ty, s.name_span);
                 self.fun(&*c).locals.get_mut(local as usize).unwrap().name = defs.name(s.text);
+                self.fun(&*c).locals.get_mut(local as usize).unwrap().debug_user = true;
                 self.map_local(&*c, checker_id, local);
                 if (s.b != ast.NONE) { self.lower_into(t, &*c, child(stmt, s.b), Place.of(local)); }
                 self.push_local(&*c, local);
@@ -1947,6 +1950,7 @@ pub struct Lowerer {
         if (first) {
             local = self.new_temp(&*c, lt, span);
             self.fun(&*c).locals.get_mut(local as usize).unwrap().name = String.from(name);
+                self.fun(&*c).locals.get_mut(local as usize).unwrap().debug_user = true;
             self.map_local(&*c, checker_id, local);
             if (c.or_binding_depth > 0) { c.or_bound.push(checker_id); }
             self.push_local(&*c, local);

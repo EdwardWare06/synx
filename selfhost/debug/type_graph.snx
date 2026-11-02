@@ -1,0 +1,73 @@
+/// Copies concrete semantic types into an owned debug graph. Reserve each ID
+/// before visiting fields so pointers to recursive owners terminate normally.
+/// Field offsets and sizes come from the same layouts used by Axon.
+import debug.values.{Type, Field};
+import check.Checker;
+import ids.{TypeId, NONE};
+import types.TypeKind;
+import ast.PrimKind;
+import layout.{LayoutTable, struct_field_types, variant_field_types};
+import std.collections.HashMap;
+pub struct Graph {
+    pub Vec<Type> types; HashMap<uint, uint> indices;
+    pub Graph new() { return Graph { types: Vec.new(), indices: HashMap.new() }; }
+    uint add(&self, Type t) { uint id = self.types.len() as uint; self.types.push(t); return id; }
+    uint pointer(&self, uint inner) { var t = Type.new(5, String.new(), 8); t.inner = inner; return self.add(t); }
+    pub uint get(&self, &Checker ck, &LayoutTable lay, TypeId id) {
+        if (id.index == NONE) { return NONE; }
+        uint key = id.index; match self.indices.get(&key) { Some(i) => return *i, None => {} }
+        uint index = self.add(Type.new(0, ck.show(id), 0)); self.indices.insert(key, index);
+        var layout = lay.of(&*ck, id); var kind = ck.r.types.get(id).kind;
+        var t = Type.new(0, ck.show(id), layout.size);
+        match kind {
+            TypeKind.Prim => { var p = ck.r.types.get(id).prim;
+                match p { PrimKind.Void => {}, PrimKind.Bool => { t.kind = 3; }, PrimKind.Float | PrimKind.Double => { t.kind = 4; },
+                    PrimKind.Int | PrimKind.Long | PrimKind.Short => { t.kind = 1; }, _ => { t.kind = 2; } }
+            }
+            TypeKind.Ref | TypeKind.Ptr => {
+                var inner = ck.r.types.get(id).inner; bool constant = ck.r.types.get(id).is_const;
+                var pointee = inner;
+                if (layout.is_fat_pointer) {
+                    match ck.r.types.get(inner).kind { TypeKind.Str => { pointee = ck.r.types.prim(PrimKind.Byte); }, TypeKind.Slice => { pointee = ck.r.types.get(inner).inner; }, _ => {} }
+                }
+                uint target = self.get(&*ck, &*lay, pointee);
+                if (constant) { var c = Type.new(10, String.new(), self.types[target as usize].size); c.inner = target; target = self.add(c); }
+                if (!layout.is_fat_pointer) { t.kind = 5; t.inner = target; }
+                else { t.kind = 7; uint ptr = self.pointer(target); var usize_id = ck.r.types.prim(PrimKind.Usize); uint len = self.get(&*ck, &*lay, usize_id);
+                    t.fields.push(Field { name: String.from("data"), type: ptr, offset: 0 });
+                    bool dynamic = false; match ck.r.types.get(inner).kind { TypeKind.Dyn => { dynamic = true; }, _ => {} }
+                    t.fields.push(Field { name: String.from(if (dynamic) { "vtable" } else { "len" }), type: if (dynamic) { self.pointer(NONE) } else { len }, offset: 8 });
+                }
+            }
+            TypeKind.Array => { var inner = ck.r.types.get(id).inner; t.count = ck.r.types.get(id).length; t.kind = 6; t.inner = self.get(&*ck, &*lay, inner); }
+            TypeKind.Struct | TypeKind.Tuple => {
+                t.kind = 7; Vec<TypeId> fields = Vec.new(); Vec<String> names = Vec.new();
+                match kind {
+                    TypeKind.Struct => { fields = struct_field_types(&*ck, id); var def = ck.r.types.get(id).def; for (f in &const ck.r.program.def(def).fields) { names.push(String.from(f.name)); } }
+                    _ => { for (f in &const ck.r.types.get(id).elems) { fields.push(*f); } for (i in 0..fields.len()) { names.push("_{i}"); } }
+                }
+                for (i in 0..fields.len()) { uint ty = self.get(&*ck, &*lay, fields[i]); t.fields.push(Field { name: String.from(names[i]), type: ty, offset: layout.field_offsets[i] }); }
+            }
+            TypeKind.Enum => {
+                t.kind = 7; var tag = Type.new(9, "{t.name}.Tag", 8); var payload = Type.new(8, "{t.name}.Payload", layout.size - layout.payload_offset);
+                var def = ck.r.types.get(id).def; usize n = ck.r.program.def(def).variants.len();
+                for (vi in 0..n) {
+                    var name = String.from(ck.r.program.def(def).variants[vi].name); tag.fields.push(Field { name: String.from(name), type: NONE, offset: vi as ulong });
+                    var fields = variant_field_types(&*ck, id, vi as uint); var vl = lay.variant_payload(&*ck, id, vi as uint);
+                    var variant = Type.new(7, "{t.name}.{name}", vl.size); Vec<String> names = Vec.new();
+                    usize tuples = ck.r.program.def(def).variants[vi].tuple_types.len();
+                    for (i in 0..tuples) { names.push("_{i}"); }
+                    for (f in &const ck.r.program.def(def).variants[vi].fields) { names.push(String.from(f.name)); }
+                    for (i in 0..fields.len()) { uint ty = self.get(&*ck, &*lay, fields[i]); variant.fields.push(Field { name: String.from(names[i]), type: ty, offset: vl.field_offsets[i] }); }
+                    uint ty = self.add(variant); payload.fields.push(Field { name: name, type: ty, offset: 0 });
+                }
+                uint tag_id = self.add(tag); uint payload_id = self.add(payload);
+                t.fields.push(Field { name: String.from("tag"), type: tag_id, offset: 0 }); t.fields.push(Field { name: String.from("payload"), type: payload_id, offset: layout.payload_offset });
+            }
+            TypeKind.Fn => { t.kind = 7; uint ptr = self.pointer(NONE); t.fields.push(Field { name: String.from("code"), type: ptr, offset: 0 }); t.fields.push(Field { name: String.from("environment"), type: ptr, offset: 8 }); }
+            _ => {}
+        };
+        *self.types.get_mut(index as usize).unwrap() = t; return index;
+    }
+}
+

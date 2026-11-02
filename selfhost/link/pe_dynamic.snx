@@ -3,6 +3,7 @@
 /// exclude data exports. All source records remain owned by the caller.
 import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, RelocKind, SectionKind, Failure, Code};
 import link.model;
+import debug.data;
 import link.imports.Import;
 import link.buffer.{Buffer, align, LIMIT};
 import std.utf8;
@@ -16,6 +17,7 @@ Vec<byte> bytes(&const Vec<byte> source) {
 }
 Object copy_object(&const Object source) {
     var out = Object.new(source.name.as_str(), source.archive_member);
+    out.debug = data.copy(source.debug); for (p in &const source.pdata) { out.pdata.push(*p); }
     for (section in &const source.sections) {
         out.sections.push(Section { kind: section.kind, alignment: section.alignment,
             data: bytes(section.data), size: section.size });

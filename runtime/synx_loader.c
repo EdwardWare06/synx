@@ -56,6 +56,63 @@ static void* resolve_export(const char* name) {
 }
 static uint64_t word(const uint8_t* p) { uint64_t v=0; for(unsigned i=0;i<8;++i)v|=(uint64_t)p[i]<<(i*8); return v; }
 static int range(uint64_t at,uint64_t n,uint64_t limit){return at<=limit && n<=limit-at;}
+
+#if defined(__linux__)
+/* Standard GDB JIT interface. The compiler has already generated native code;
+ * this interface publishes the source map for its randomized mapping. Startup
+ * registers once, before worker threads exist. Symbols live with the image. */
+struct jit_code_entry {
+  struct jit_code_entry *next_entry, *prev_entry;
+  const char* symfile_addr;
+  uint64_t symfile_size;
+};
+struct jit_descriptor {
+  uint32_t version, action_flag;
+  struct jit_code_entry *relevant_entry, *first_entry;
+};
+__attribute__((visibility("default"),used))
+struct jit_descriptor __jit_debug_descriptor = {1,0,NULL,NULL};
+__attribute__((visibility("default"),noinline,used))
+void __jit_debug_register_code(void) { __asm__ volatile("" ::: "memory"); }
+static struct jit_code_entry debug_entry;
+/* The linker checks this feature marker before appending a debug symbol file. */
+static const volatile char debug_marker[] = "SYNX-GDB-JIT-V1";
+
+static int register_debug(const uint8_t* data,uint64_t size,uint64_t content_end,
+                          const uint8_t* image,uint64_t image_size) {
+  if(size<40 || memcmp(data+size-40,"SNXJIT01",8))return 1;
+  uint64_t footer=size-40,offset=word(data+footer+8),count=word(data+footer+16);
+  uint64_t patches=word(data+footer+24),npatch=word(data+footer+32);
+  if(debug_marker[0]!='S' || count<64 || count>IMAGE_LIMIT || offset<content_end ||
+     !range(offset,count,footer) || patches!=offset+count || npatch>count/8 ||
+     !range(patches,npatch*8,footer) || patches+npatch*8!=footer)return 0;
+  const uint8_t* file=data+offset;
+  if(memcmp(file,"\177ELF\2\1\1",7) || file[16]!=2 || file[17] || file[18]!=62 || file[19])return 0;
+  uintptr_t base=(uintptr_t)image;
+  /* Validate distinct, non-overlapping address fields before copying. */
+  uint64_t previous=0;
+  for(uint64_t i=0;i<npatch;++i) {
+    uint64_t at=word(data+patches+i*8);
+    if(!range(at,8,count) || (i && at<previous))return 0;
+    uint64_t value=word(file+at);
+    if(value>image_size || value>UINT64_MAX-(uint64_t)base)return 0;
+    previous=at+8;
+  }
+  uint8_t* symbols=(uint8_t*)malloc((size_t)count);if(!symbols)return 0;
+  memcpy(symbols,file,(size_t)count);
+  for(uint64_t i=0;i<npatch;++i) {
+    uint64_t at=word(data+patches+i*8),value=word(symbols+at)+(uint64_t)base;
+    memcpy(symbols+at,&value,8);
+  }
+  debug_entry.symfile_addr=(const char*)symbols;debug_entry.symfile_size=count;
+  __jit_debug_descriptor.first_entry=&debug_entry;
+  __jit_debug_descriptor.relevant_entry=&debug_entry;
+  __jit_debug_descriptor.action_flag=1;
+  __jit_debug_register_code();
+  __jit_debug_descriptor.action_flag=0;
+  return 1;
+}
+#endif
 typedef struct { uint64_t rva,size,count,offset,protection; } Segment;
 static int in_segment(const Segment* s,unsigned n,uint64_t at,uint64_t count,unsigned protection) {
   for(unsigned i=0;i<n;++i)if((!protection || s[i].protection==protection) && at>=s[i].rva && range(at-s[i].rva,count,s[i].size))return 1;
@@ -84,7 +141,7 @@ static uint8_t* read_payload(uint64_t offset,uint64_t size) {
 }
 static int load_program(int (**entry)(void),void (**thread)(void*)) {
   uint64_t size=locator.size;uint8_t* data=read_payload(locator.offset,size);if(!data)return 0;
-  int ok=0;uint8_t* image=NULL;uint64_t image_size=0;
+  int ok=0;uint8_t* image=NULL;uint64_t image_size=0;int module_image=0;
   if(size<88 || memcmp(data,"SNXPAY01",8))goto done;
   for(unsigned i=0;i<32;++i)if(data[8+i]!=locator.abi[i])goto done;
   image_size=word(data+40);uint64_t entry_rva=word(data+48),thread_rva=word(data+56);
@@ -114,18 +171,41 @@ static int load_program(int (**entry)(void),void (**thread)(void*)) {
   }
   for(unsigned i=0;i<4;++i)if(segments[i].count && segments[i].offset<at)goto done;
 #if defined(_WIN32)
-  image=(uint8_t*)VirtualAlloc(NULL,(SIZE_T)image_size,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+  if(size>=24 && !memcmp(data+size-24,"SNXPE001",8)) {
+    uint64_t base=word(data+size-16);uint8_t* module=(uint8_t*)GetModuleHandleW(NULL);
+    IMAGE_DOS_HEADER* dos=(IMAGE_DOS_HEADER*)module;
+    IMAGE_NT_HEADERS64* nt=(IMAGE_NT_HEADERS64*)(module+dos->e_lfanew);
+    if(word(data+size-8)!=image_size || !base || base%IMAGE_ALIGN || base>nt->OptionalHeader.SizeOfImage || image_size>nt->OptionalHeader.SizeOfImage-base)goto done;
+    IMAGE_SECTION_HEADER* headers=IMAGE_FIRST_SECTION(nt);
+    for(unsigned i=0;i<4;++i) {
+      Segment* s=&segments[i];int found=0;
+      for(unsigned j=0;j<nt->FileHeader.NumberOfSections;++j) {
+        IMAGE_SECTION_HEADER* h=&headers[j];
+        if(h->VirtualAddress!=base+s->rva)continue;
+        DWORD access=h->Characteristics&(IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE|IMAGE_SCN_MEM_EXECUTE);
+        DWORD expected=IMAGE_SCN_MEM_READ|(i==0?IMAGE_SCN_MEM_EXECUTE:i>=2?IMAGE_SCN_MEM_WRITE:0);
+        uint64_t mapped_size=(s->size+IMAGE_ALIGN-1)&~(IMAGE_ALIGN-1);if(!mapped_size)mapped_size=IMAGE_ALIGN;
+        if(h->Misc.VirtualSize!=mapped_size || access!=expected ||
+           (s->count && (h->PointerToRawData!=locator.offset+s->offset || h->SizeOfRawData<s->count)))goto done;
+        found=1;break;
+      }
+      if(!found)goto done;
+    }
+    image=module+base;module_image=1;
+  } else image=(uint8_t*)VirtualAlloc(NULL,(SIZE_T)image_size,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
 #else
   {long page=sysconf(_SC_PAGESIZE);if(page<=0 || IMAGE_ALIGN%(uint64_t)page)goto done;}
   image=(uint8_t*)mmap(NULL,(size_t)image_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);if(image==MAP_FAILED)image=NULL;
 #endif
   if(!image)goto done;
-  for(unsigned i=0;i<4;++i)if(segments[i].count)memcpy(image+segments[i].rva,data+segments[i].offset,(size_t)segments[i].count);
-  for(uint64_t i=0;i<nrel;++i){uint64_t site=word(data+reloc_at+i*8),value=word(image+site);if(value>image_size)goto done;value+=(uint64_t)(uintptr_t)image;memcpy(image+site,&value,8);}
+  if(!module_image) {
+    for(unsigned i=0;i<4;++i)if(segments[i].count)memcpy(image+segments[i].rva,data+segments[i].offset,(size_t)segments[i].count);
+    for(uint64_t i=0;i<nrel;++i){uint64_t site=word(data+reloc_at+i*8),value=word(image+site);if(value>image_size)goto done;value+=(uint64_t)(uintptr_t)image;memcpy(image+site,&value,8);}
+  }
   at=import_at;
   for(uint64_t i=0;i<nimp;++i){uint64_t slot=word(data+at),n=word(data+at+8);at+=16;char name[256];memcpy(name,data+at,(size_t)n);name[n]=0;at+=n;void* address=resolve_export(name);memcpy(image+slot,&address,8);}
   /* No page is writable and executable at the same time. */
-  for(unsigned i=0;i<2;++i){Segment* s=&segments[i];if(!s->size)continue;
+  for(unsigned i=0;i<2 && !module_image;++i){Segment* s=&segments[i];if(!s->size)continue;
 #if defined(_WIN32)
     DWORD old;if(!VirtualProtect(image+s->rva,(SIZE_T)s->size,i==0?PAGE_EXECUTE_READ:PAGE_READONLY,&old))goto done;
 #else
@@ -137,13 +217,21 @@ static int load_program(int (**entry)(void),void (**thread)(void*)) {
 #else
   __builtin___clear_cache((char*)image,(char*)image+image_size);
 #endif
+  /* Debug sections have no executable permissions and do not alter the image.
+   * Retain their allocation so attaching a debugger after startup also works. */
+#if defined(__linux__)
+  {uint64_t end=at;
+    for(unsigned i=0;i<4;++i)if(segments[i].offset+segments[i].count>end)end=segments[i].offset+segments[i].count;
+    if(!register_debug(data,size,end,image,image_size))goto done;
+  }
+#endif
   { void* code=image+entry_rva;memcpy(entry,&code,sizeof code);code=image+thread_rva;memcpy(thread,&code,sizeof code); }
   ok=1;
 done:
   free(data);
   if(!ok && image){
 #if defined(_WIN32)
-    VirtualFree(image,0,MEM_RELEASE);
+    if(!module_image)VirtualFree(image,0,MEM_RELEASE);
 #else
     munmap(image,(size_t)image_size);
 #endif

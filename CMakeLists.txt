@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(synx VERSION 0.2.0 LANGUAGES C CXX)
+project(synx VERSION 0.3.0 LANGUAGES C CXX)
 
 # C builds the runtime. C++ builds only the test harnesses. The compiler is
 # Synx source in selfhost/, built by a previous Synx release (the seed).

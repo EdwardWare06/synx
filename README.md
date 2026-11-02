@@ -73,17 +73,17 @@ don't need Visual Studio, a C compiler, or a system linker.
 
 | Host | Package |
 |------|---------|
-| Windows x86-64 | `synx-0.2.0-windows-x86_64-setup.exe` or `synx-0.2.0-windows-x86_64.zip` |
-| Linux x86-64 (glibc 2.34+) | `synx-0.2.0-linux-x86_64.tar.gz` |
-| macOS 10.15+ (Rosetta 2 on Apple Silicon) | `synx-0.2.0-macos-x86_64.tar.gz` |
+| Windows x86-64 | `synx-0.3.0-windows-x86_64-setup.exe` or `synx-0.3.0-windows-x86_64.zip` |
+| Linux x86-64 (glibc 2.34+) | `synx-0.3.0-linux-x86_64.tar.gz` |
+| macOS 10.15+ (Rosetta 2 on Apple Silicon) | `synx-0.3.0-macos-x86_64.tar.gz` |
 
 Windows: run the setup program, or extract the zip and run `install.cmd`.
 
 Linux (on macOS, use `macos` in place of `linux`):
 
 ```text
-tar -xzf synx-0.2.0-linux-x86_64.tar.gz
-cd synx-0.2.0-linux-x86_64
+tar -xzf synx-0.3.0-linux-x86_64.tar.gz
+cd synx-0.3.0-linux-x86_64
 ./install.sh
 ```
 
@@ -102,7 +102,7 @@ syntax colors, snippets, compiler errors in the editor, and Run and Build
 buttons.
 
 Extension 0.2.0 adds live errors, completion, navigation, argument hints,
-rename, and formatting. Install `synx-0.2.0.vsix` from the 0.2.0 release to
+rename, and formatting. Install `synx-0.2.0.vsix` from the 0.3.0 release to
 use these features. See the [extension guide](editors/vscode/README.md).
 
 ## Quick start
@@ -188,7 +188,7 @@ packages.
 
 ## Status and limits
 
-Synx is at 0.2.0. It's a working language, but it's still early.
+Synx is at 0.3.0. It's a working language, but it's still early.
 
 - Targets Windows, Linux, and macOS on x86-64. The release workflow checks
   all three hosts. On Apple Silicon, Synx uses Rosetta 2.

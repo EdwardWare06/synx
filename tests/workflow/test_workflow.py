@@ -123,11 +123,24 @@ def main():
         manifests = sorted(cache.glob('*/entry'))
         check(len(manifests) == 4, 'four mode entries')
         manifest = default_entry
-        name, digest, _ = manifest.read_text().split('\n')
+        name, digest, symbols_digest, _ = manifest.read_text().split('\n')
         cached = manifest.parent / name
         check(hashlib.sha256(cached.read_bytes()).hexdigest() == digest, 'manifest records independent executable digest')
         cached.write_bytes(b'corrupt')
         check('run cache: miss' in compiled()[2], 'corrupt output rebuilds')
+        if os.name == 'nt':
+            for damaged in (False, True):
+                name, _, symbols_digest, _ = manifest.read_text().split('\n')
+                symbols = (manifest.parent / name).with_suffix('.pdb')
+                check(hashlib.sha256(symbols.read_bytes()).hexdigest() == symbols_digest, 'cache records independent PDB digest')
+                if damaged:
+                    symbols.write_bytes(b'corrupt PDB')
+                else:
+                    symbols.unlink()
+                check('run cache: miss' in compiled()[2], 'changed or missing PDB rebuilds')
+                check('run cache: hit' in compiled()[2], 'replacement PDB permits cache hit')
+        else:
+            check(symbols_digest == '-', 'non-Windows cache has no PDB companion')
         # Source changes must invalidate even when modification time is retained.
         stat = helper.stat()
         helper.write_text('pub int value() { return 8; }\n', encoding='utf8')

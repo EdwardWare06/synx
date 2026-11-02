@@ -1,0 +1,40 @@
+/// Native debugger fixture. Marker comments identify source breakpoints.
+struct Point { byte label; int x; double y; }
+struct Pair<T> { T first; T second; }
+enum Choice { Empty, Pair(int, long), Named { int count; } }
+enum List { End, Next(int, Box<List>) }
+
+int inner(int input) {
+    int scratch = input * 7;
+    int other = input + 100;
+    print("inner {scratch} {other}"); // INNER
+    return scratch + other - 108;
+}
+
+int inspect(int parameter) {
+    int value = parameter + 3;
+    parameter += 1;
+    Point point = Point { label: 7, x: 42, y: 2.5 };
+    Pair<int> pair = Pair { first: 11, second: 13 };
+    Choice choice = Choice.Pair(17, 19);
+    int[3] numbers = [23, 29, 31];
+    List list = List.Next(37, Box<List>.new(List.End));
+    String original = String.from("moved");
+    String owner = original;
+    int total = 0;
+    for (n in 0..3) { total += n; }
+    print("values {value} {parameter} {point.x} {pair.second} {numbers[1]} {total}"); // VALUES
+    {
+        int value = 91;
+        print("shadow {value}"); // SHADOW
+    }
+    print("outer {value}"); // OUTER
+    int result = inner(value);
+    print("result {result} value {value}"); // RESULT
+    return result;
+}
+
+int main() {
+    int answer = inspect(5);
+    return answer - 56;
+}

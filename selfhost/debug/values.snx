@@ -1,0 +1,46 @@
+/// Owned type graph and source-variable locations. Type references are indices
+/// into Unit.types; NONE means no type. PC ranges are half-open and relative
+/// to their function. A visible variable can have no available location.
+import ids.NONE;
+pub struct Field { pub String name; pub uint type; pub ulong offset; }
+/// kind: opaque=0, signed=1, unsigned=2, bool=3, float=4, pointer=5,
+/// array=6, struct=7, union=8, enum discriminant=9, const=10.
+pub struct Type {
+    pub uint kind; pub String name; pub ulong size; pub uint inner;
+    pub ulong count; pub Vec<Field> fields;
+    pub Type new(uint kind, String name, ulong size) {
+        return Type { kind: kind, name: name, size: size, inner: NONE, count: 0, fields: Vec.new() };
+    }
+    pub Type copy(&const self) {
+        var out = Type.new(self.kind, String.from(self.name), self.size); out.inner = self.inner; out.count = self.count;
+        for (f in &const self.fields) { out.fields.push(Field { name: String.from(f.name), type: f.type, offset: f.offset }); } return out;
+    }
+}
+pub struct Range { pub ulong begin; pub ulong end; }
+/// reg=-1 is memory at RBP+offset; other values are x86-64 register numbers.
+pub struct Location { pub ulong begin; pub ulong end; pub int reg; pub int offset; }
+/// Negative reg values change CFA rules: -2 is RSP+16, -3 is RBP+16,
+/// -4 is RSP+8. Other entries save a hardware register at RBP+offset.
+pub struct Cfi { pub ulong pc; pub int reg; pub int offset; }
+pub struct Variable {
+    pub String name; pub uint type; pub bool parameter;
+    pub Vec<Range> scope; pub Vec<Location> locations;
+    pub Variable copy(&const self) {
+        Vec<Range> scope = Vec.new(); for (r in &const self.scope) { scope.push(*r); }
+        Vec<Location> loc = Vec.new(); for (r in &const self.locations) { loc.push(*r); }
+        return Variable { name: String.from(self.name), type: self.type, parameter: self.parameter, scope: scope, locations: loc };
+    }
+}
+pub struct Values {
+    pub uint ret; pub Vec<uint> args; pub Vec<Variable> variables; pub Vec<Cfi> cfi;
+    pub Values new() { return Values { ret: NONE, args: Vec.new(), variables: Vec.new(), cfi: Vec.new() }; }
+    pub Values copy(&const self) {
+        var out = Values.new(); out.ret = self.ret; for (t in &const self.args) { out.args.push(*t); }
+        for (v in &const self.variables) { out.variables.push(v.copy()); } for (c in &const self.cfi) { out.cfi.push(*c); } return out;
+    }
+    pub void remap(&self, uint base) {
+        if (self.ret != NONE) { self.ret += base; }
+        for (t in &self.args) { if (*t != NONE) { *t += base; } }
+        for (v in &self.variables) { if (v.type != NONE) { v.type += base; } }
+    }
+}

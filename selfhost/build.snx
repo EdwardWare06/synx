@@ -15,6 +15,10 @@ import link.model;
 import link.objects;
 import link.standalone;
 import driver_fingerprint;
+import debug.data;
+import debug.cv_types;
+import link.macho_sha256;
+import link.pe_debug;
 
 pub struct BuildResult {
     pub bool ok;
@@ -46,6 +50,10 @@ pub BuildResult program(&const BuildOptions options) {
                 compilation.ok = ax.generate(&compilation.lowerer.ck, &const compilation.trees, &compilation.lowerer.module);
             }
             if (!compilation.ok) { report(compilation); return BuildResult.failed(); }
+            if (options.target.debug_info) { ax.obj.debug = data.resolve(ax.obj.debug_raw, compilation.sources); ax.obj.debug.types = mem.replace(&ax.debug_types.types, Vec.new());
+                if (options.target.win64_abi() && !cv_types.supported(ax.obj.debug)) { driver_io.text(2, "debug types exceed CodeView record limits; use --no-debug\n"); return BuildResult.failed(); }
+                if (options.target.win64_abi()) { for (s in &const compilation.sources) { ax.obj.debug.hashes.push(macho_sha256.digest(s.data(), 0, s.data().len())); } }
+            }
             var obj = mem.replace(&ax.obj, ObjectFile.new());
             var executable = driver_paths.output_path(options);
             var object = driver_paths.object_path(executable, options.target);
@@ -66,10 +74,11 @@ pub BuildResult program(&const BuildOptions options) {
                 var records = objects.load(data, object, os);
                 match records {
                     Err(error) => { var description = model.description(error.code); driver_io.text(2, "built-in linker: {description} {error.symbol}\n"); return BuildResult.failed(); }
-                    Ok(inputs) => match standalone.bytes(inputs, host, os) {
+                    Ok(inputs) => match standalone.bundle(inputs, host, os, pe_debug.name(executable)) {
                         Err(error) => { var description = model.description(error.code); driver_io.text(2, "built-in linker: {description} {error.symbol} (record {error.record})\n"); return BuildResult.failed(); }
                         Ok(output) => { if (options.verbose) { driver_io.text(2, "link: built-in linker, standalone runtime\n"); }
-                            match linker.publish(executable, output) { Err(_) => { driver_io.text(2, "cannot write {executable}\n"); return BuildResult.failed(); }, Ok(_) => {} }
+                            if (!output.pdb.is_empty()) { match linker.publish(pe_debug.path(executable), output.pdb) { Err(_) => { driver_io.text(2, "cannot write PDB for {executable}\n"); return BuildResult.failed(); }, Ok(_) => {} } }
+                            match linker.publish(executable, output.exe) { Err(_) => { driver_io.text(2, "cannot write {executable}\n"); return BuildResult.failed(); }, Ok(_) => {} }
                         }
                     }
                 }

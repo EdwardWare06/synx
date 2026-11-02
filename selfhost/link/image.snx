@@ -9,6 +9,8 @@ import link.relocate;
 import link.buffer;
 import std.collections.HashMap;
 import std.utf8;
+import debug.data;
+import std.binary;
 
 pub struct Segment { pub SectionKind kind; pub Vec<byte> data; pub ulong size; pub ulong rva; }
 struct Placement { usize group; ulong offset; }
@@ -20,7 +22,10 @@ pub struct Image {
     pub Vec<ulong> absolute_sites;
     pub bool rebase_safe;
     pub HashMap<String, ulong> globals;
+    pub data.Unit debug;
+    pub Vec<RuntimeFunction> unwind;
 }
+pub struct RuntimeFunction { pub ulong begin; pub ulong end; pub ulong info; }
 pub ulong? symbol(&const Image linked, &const str name) {
     match linked.globals.get(model.key(utf8.encode(name))) { Some(value) => return Some(*value), None => return None }
 }
@@ -127,6 +132,37 @@ pub Result<Image, Failure> build_aligned(&const Vec<Object> inputs, &const str e
                 SymbolId { input: model.InputId { index: i }, index: j }));
         }
     }
+    var debug = data.Unit.new();
+    for (i in 0..inputs.len()) {
+        if (!*resolved.selected.get(i).unwrap()) { continue; }
+        var unit = &const inputs.get(i).unwrap().debug;
+        if (unit.empty()) { continue; }
+        uint type_base = debug.types.len() as uint;
+        for (source in &const unit.types) { var t = source.copy(); if (t.inner != 4294967295) { t.inner += type_base; } for (field in &t.fields) { if (field.type != 4294967295) { field.type += type_base; } } debug.types.push(t); }
+        uint file_base = debug.files.len() as uint;
+        for (j in 0..unit.files.len()) { debug.files.push(String.from(unit.files[j])); debug.hashes.push(if (j < unit.hashes.len()) { bytes_copy(unit.hashes[j]) } else { Vec.new() }); }
+        for (source in &const unit.functions) {
+            var f = data.copy_function(source); f.values.remap(type_base);
+            match globals.get(model.key(utf8.encode(f.symbol))) { Some(value) => { f.address = *value; }, None => return Err(model.fail(Code.Invalid, i, 0)) }
+            for (r in &f.rows) { r.file += file_base; } debug.functions.push(f);
+        }
+    }
+    // Keep the legacy Linux transport byte-identical when no checksums exist.
+    bool hashed = false; for (h in &const debug.hashes) { if (!h.is_empty()) { hashed = true; } } if (!hashed) { debug.hashes.clear(); }
+    Vec<RuntimeFunction> unwind = Vec.new();
+    for (i in 0..inputs.len()) { if (!resolved.selected[i]) { continue; } var object = inputs.get(i).unwrap();
+        for (index in &const object.pdata) { var p = placements[i][*index]; var s = segments.get(p.group).unwrap(); ulong size = object.sections[*index].size;
+            if (size % 12 != 0) { return Err(model.fail(Code.Invalid, i, *index)); }
+            for (j in 0..(size / 12) as usize) { usize at = p.offset as usize + j * 12;
+                ulong begin = binary.read_uint(s.data, at, 4, true).unwrap(); ulong end = binary.read_uint(s.data, at + 4, 4, true).unwrap(); ulong info = binary.read_uint(s.data, at + 8, 4, true).unwrap();
+                if (begin >= end || end > segments[0].rva + segments[0].size || begin < segments[0].rva || info % 4 != 0 || info < segments[1].rva || info >= segments[1].rva + segments[1].size || segments[1].rva + segments[1].size - info < 4) { return Err(model.fail(Code.Invalid, i, *index)); }
+                usize u = (info - segments[1].rva) as usize;
+                if (segments[1].data[u] != 1 || (segments[1].data[u + 2] as usize * 2 + 4) > segments[1].data.len() - u) { return Err(model.fail(Code.Unsupported, i, *index)); }
+                unwind.push(RuntimeFunction { begin: begin, end: end, info: info });
+            }
+        }
+    }
     return Ok(Image { base: base, entry: entry_address, end_rva: cursor, segments: segments,
-        absolute_sites: absolute_sites, rebase_safe: rebase_safe, globals: globals });
+        absolute_sites: absolute_sites, rebase_safe: rebase_safe, globals: globals, debug: debug, unwind: unwind });
 }
+Vec<byte> bytes_copy(&const Vec<byte> input) { Vec<byte> out = Vec.new(); for (b in input) { out.push(*b); } return out; }

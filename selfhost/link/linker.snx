@@ -9,8 +9,10 @@ import link.pe;
 import link.elf;
 import link.macho;
 import link.capsule;
+import link.pe_debug;
 import std.fs;
 import std.path.Path;
+import std.mem;
 extern "C" { int synx_rt_link_write(*const byte path, usize length, *const byte data, usize count); }
 
 pub &const str runtime_name(int os) { return match os { 1 => "synx_rt.dll", 2 => "libsynx_rt.dylib", _ => "libsynx_rt.so" }; }
@@ -35,8 +37,12 @@ pub Result<bool, Failure> publish(&const str output, &const Vec<byte> data) {
 pub Result<bool, Failure> file(&const str object_path, &const str executable, &const str runtime_path, int os) {
     if (runtime_path.len() == 0) { return Err(model.fail(Code.Unresolved, 0, 0)); }
     var data = match fs.read(object_path) { Ok(value) => value, Err(error) => return Err(model.fail(Code.Invalid, 0, error.os_code as usize)) };
-    var inputs = objects.load(data, object_path, os)?; inputs.push(startup.make(os));
-    var output = bytes(inputs, os)?;
+    var inputs = objects.load(data, object_path, os)?;
+    bool debug = false; for (obj in &const inputs) { if (!obj.debug.empty()) { debug = true; } }
+    inputs.push(startup.make_debug(os, debug));
+    var output = Vec.new(); var symbols = Vec.new();
+    if (os == 1) { var catalog = imports.collect(inputs, runtime_name(os), os)?; var bundle = pe.write_bundle(inputs, "__synx_start", catalog, pe_debug.name(executable))?; output = mem.replace(&bundle.exe, Vec.new()); symbols = mem.replace(&bundle.pdb, Vec.new()); }
+    else { output = bytes(inputs, os)?; }
     var runtime = match fs.read(runtime_path) { Ok(value) => value, Err(error) => return Err(model.fail(Code.Invalid, 0, error.os_code as usize)) };
     var required = imports.collect(inputs, if (os == 2) { "@rpath/libsynx_rt.dylib" } else { runtime_name(os) }, os)?;
     var verified = capsule.validate(runtime, required, os)?;
@@ -47,5 +53,6 @@ pub Result<bool, Failure> file(&const str object_path, &const str executable, &c
         match fs.read(destination.as_str()) { Ok(existing) => { same = equal(existing, runtime); }, Err(_) => {} }
         if (!same) { var copied = publish(destination.as_str(), runtime)?; }
     }
+    if (!symbols.is_empty()) { var saved = publish(pe_debug.path(executable), symbols)?; }
     return publish(executable, output);
 }

@@ -68,7 +68,12 @@ void synx_rt_panic(const uint8_t* p, uint64_t n) {
   write_all(2, "Synx panic: ", 12);
   write_all(2, p, n);
   write_all(2, "\n", 1);
-  exit(101);
+  /* A panic aborts the process. Do not run C/DLL teardown while workers can
+     still access runtime state. The diagnostic above uses direct writes. */
+#if defined(_WIN32)
+  TerminateProcess(GetCurrentProcess(), 101);
+#endif
+  _Exit(101);
 }
 
 void synx_rt_exit(int32_t code) { exit(code); }

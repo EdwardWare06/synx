@@ -1,0 +1,142 @@
+/// Owned source/PC records shared by Axon and the linker. The binary transport
+/// is non-allocated object metadata, independent of native image relocations.
+import source.{Span, SourceFile};
+import bytes;
+import std.fs;
+import std.path.Path;
+import std.utf8;
+import std.text;
+import debug.values.{Type, Field, Values, Variable, Range, Location, Cfi};
+import ids.NONE;
+
+pub struct RawRow { pub ulong offset; pub Span span; }
+pub struct RawFunction { pub String symbol; pub String name; pub ulong address; pub ulong size; pub Vec<RawRow> rows; pub Values values; }
+pub struct Row { pub ulong offset; pub uint file; pub uint line; pub uint column; }
+pub struct Function { pub String symbol; pub String name; pub ulong address; pub ulong size; pub Vec<Row> rows; pub Values values; }
+pub struct Unit {
+    pub Vec<String> files; pub Vec<Function> functions; pub Vec<Vec<byte>> hashes; pub Vec<Type> types;
+    pub Unit new() { return Unit { files: Vec.new(), functions: Vec.new(), hashes: Vec.new(), types: Vec.new() }; }
+    pub bool empty(&const self) { return self.functions.is_empty(); }
+}
+pub Unit resolve(&const Vec<RawFunction> raw, &const Vec<SourceFile> sources) {
+    var out = Unit.new();
+    for (s in sources) { var path = String.from(s.path()); if (!path.starts_with("<")) { match fs.absolute(path) { Ok(p) => { path = String.from(Path.from(p).normalize().as_str()); }, Err(_) => {} } } out.files.push(path); }
+    for (f in raw) {
+        Vec<Row> rows = Vec.new();
+        for (r in &const f.rows) {
+            if (r.span.file as usize >= sources.len() || r.span.end <= r.span.start || r.offset >= f.size) { continue; }
+            var file = sources.get(r.span.file as usize).unwrap(); if (String.from(file.path()).starts_with("<")) { continue; }
+            var p = file.line_col(r.span.start);
+            if (!rows.is_empty()) { var last = rows.get(rows.len() - 1).unwrap(); if (last.file == r.span.file && last.line == p.line && last.column == p.col) { continue; } }
+            rows.push(Row { offset: r.offset, file: r.span.file, line: p.line, column: p.col });
+        }
+        out.functions.push(Function { symbol: String.from(f.symbol), name: text.replace(f.name, "@fn.", ""), address: f.address, size: f.size, rows: rows, values: f.values.copy() });
+    } return out;
+}
+pub Function copy_function(&const Function f) { Vec<Row> rows = Vec.new(); for (r in &const f.rows) { rows.push(*r); } return Function { symbol: String.from(f.symbol), name: String.from(f.name), address: f.address, size: f.size, rows: rows, values: f.values.copy() }; }
+pub Unit copy(&const Unit u) { var out = Unit.new(); for (t in &const u.types) { out.types.push(t.copy()); } for (file in &const u.files) { out.files.push(String.from(*file)); } for (h in &const u.hashes) { out.hashes.push(bytes.copy(*h, 0, h.len())); } for (f in &const u.functions) { out.functions.push(copy_function(f)); } return out; }
+pub void word(&Vec<byte> out, ulong value, usize width) { for (i in 0..width) { out.push(((value >> (i * 8)) & 255) as byte); } }
+pub void string(&Vec<byte> out, &const str value) { word(&*out, value.len() as ulong, 4); bytes.text(&*out, value); }
+pub Vec<byte> encode(&const Unit unit) {
+    var out = Vec.new(); bytes.text(&out, if (!unit.types.is_empty()) { "SNXLINE3" } else if (unit.hashes.is_empty()) { "SNXLINE1" } else { "SNXLINE2" }); word(&out, unit.files.len() as ulong, 4); word(&out, unit.functions.len() as ulong, 4);
+    for (file in &const unit.files) { string(&out, *file); }
+    for (f in &const unit.functions) { string(&out, f.symbol); string(&out, f.name); word(&out, f.address, 8); word(&out, f.size, 8); word(&out, f.rows.len() as ulong, 4);
+        for (r in &const f.rows) { word(&out, r.offset, 8); word(&out, r.file as ulong, 4); word(&out, r.line as ulong, 4); word(&out, r.column as ulong, 4); }
+    }
+    if (!unit.hashes.is_empty() || !unit.types.is_empty()) { for (i in 0..unit.files.len()) { var h = unit.hashes.get(i); bool valid = h.is_some() && h.unwrap().len() == 32; word(&out, if (valid) { 32 } else { 0 }, 1); if (valid) { bytes.append(&out, *h.unwrap()); } } }
+    if (!unit.types.is_empty()) {
+        word(&out, unit.types.len() as ulong, 4);
+        for (t in &const unit.types) { word(&out, t.kind as ulong, 1); string(&out, t.name); word(&out, t.size, 8); word(&out, t.inner as ulong, 4); word(&out, t.count, 8); word(&out, t.fields.len() as ulong, 4);
+            for (f in &const t.fields) { string(&out, f.name); word(&out, f.type as ulong, 4); word(&out, f.offset, 8); }
+        }
+        for (f in &const unit.functions) { var v = &const f.values; word(&out, v.ret as ulong, 4); word(&out, v.args.len() as ulong, 4); for (t in &const v.args) { word(&out, *t as ulong, 4); }
+            word(&out, v.variables.len() as ulong, 4);
+            for (x in &const v.variables) { string(&out, x.name); word(&out, x.type as ulong, 4); word(&out, if (x.parameter) { 1 } else { 0 }, 1);
+                word(&out, x.scope.len() as ulong, 4); for (r in &const x.scope) { word(&out, r.begin, 8); word(&out, r.end, 8); }
+                word(&out, x.locations.len() as ulong, 4); for (r in &const x.locations) { word(&out, r.begin, 8); word(&out, r.end, 8); word(&out, (r.reg as uint) as ulong, 4); word(&out, (r.offset as uint) as ulong, 4); }
+            }
+            word(&out, v.cfi.len() as ulong, 4); for (c in &const v.cfi) { word(&out, c.pc, 8); word(&out, (c.reg as uint) as ulong, 4); word(&out, (c.offset as uint) as ulong, 4); }
+        }
+    }
+    return out;
+}
+struct Reader {
+    Vec<byte> data; usize pos; bool ok;
+    ulong word(&self, usize count) { if (self.pos > self.data.len() || count > self.data.len() - self.pos) { self.ok = false; return 0; } ulong out = 0; for (i in 0..count) { out |= (bytes.at(self.data, self.pos + i) as ulong) << (i * 8); } self.pos += count; return out; }
+    String string(&self) { ulong n = self.word(4); if (!self.ok || n > 1048576 || n > (self.data.len() - self.pos) as ulong) { self.ok = false; return String.new(); }
+        var raw = bytes.copy(self.data, self.pos, self.pos + n as usize); self.pos += n as usize;
+        for (b in &const raw) { if (*b == 0) { self.ok = false; } }
+        match utf8.decode(raw) { Some(s) => return s, None => { self.ok = false; return String.new(); } }
+    }
+}
+pub Unit? decode(Vec<byte> data) {
+    if (data.len() < 16 || data.len() > 67108864) { return None; }
+    bool values = bytes.equals(bytes.copy(data, 0, 8), "SNXLINE3");
+    bool hashes = values || bytes.equals(bytes.copy(data, 0, 8), "SNXLINE2");
+    if (!hashes && !bytes.equals(bytes.copy(data, 0, 8), "SNXLINE1")) { return None; }
+    var r = Reader { data: data, pos: 8, ok: true }; ulong files = r.word(4); ulong functions = r.word(4);
+    if (files > 65536 || functions > 1000000 || files > (r.data.len() - r.pos) as ulong / 4) { return None; }
+    var out = Unit.new(); for (i in 0..files as usize) { var name = r.string(); if (!r.ok || name.is_empty()) { return None; } out.files.push(name); }
+    ulong total = 0;
+    for (i in 0..functions as usize) {
+        var symbol = r.string(); var name = r.string(); ulong address = r.word(8); ulong size = r.word(8); ulong n = r.word(4);
+        if (!r.ok || symbol.is_empty() || name.is_empty() || size == 0 || size > 268435456 || address > 18446744073709551615 - size || n > 1000000 - total || n > (r.data.len() - r.pos) as ulong / 20) { return None; }
+        total += n; Vec<Row> rows = Vec.new(); ulong previous = 0;
+        for (j in 0..n as usize) { ulong offset = r.word(8); uint file = r.word(4) as uint; uint line = r.word(4) as uint; uint column = r.word(4) as uint;
+            if (!r.ok || offset >= size || (j > 0 && offset <= previous) || file as ulong >= files || line == 0) { return None; } previous = offset;
+            rows.push(Row { offset: offset, file: file, line: line, column: column });
+        }
+        out.functions.push(Function { symbol: symbol, name: name, address: address, size: size, rows: rows, values: Values.new() });
+    }
+    if (hashes) { for (i in 0..files as usize) { ulong n = r.word(1); if (!r.ok || (n != 0 && n != 32) || n > (r.data.len() - r.pos) as ulong) { return None; } out.hashes.push(bytes.copy(r.data, r.pos, r.pos + n as usize)); r.pos += n as usize; } }
+    if (values && !read_values(&r, &out)) { return None; }
+    if (!r.ok || r.pos != r.data.len()) { return None; } return Some(out);
+}
+bool type_ok(uint t, usize count) { return t == NONE || t as usize < count; }
+bool read_values(&Reader r, &Unit out) {
+    ulong count = r.word(4); if (count == 0 || count > 1000000 || count > (r.data.len() - r.pos) as ulong / 29) { return false; }
+    ulong total = 0;
+    for (i in 0..count as usize) {
+        uint kind = r.word(1) as uint; var name = r.string(); ulong size = r.word(8); uint inner = r.word(4) as uint; ulong length = r.word(8); ulong fields = r.word(4);
+        if (!r.ok || kind > 10 || !type_ok(inner, count as usize) || fields > 1000000 - total || fields > (r.data.len() - r.pos) as ulong / 16) { return false; } total += fields;
+        var t = Type.new(kind, name, size); t.inner = inner; t.count = length;
+        for (j in 0..fields as usize) { var field = r.string(); uint ty = r.word(4) as uint; ulong offset = r.word(8); if (!r.ok || !type_ok(ty, count as usize) || (kind != 9 && offset > size)) { return false; } t.fields.push(Field { name: field, type: ty, offset: offset }); }
+        out.types.push(t);
+    }
+    if (!valid_chains(out.types)) { return false; }
+    for (f in &out.functions) {
+        f.values.ret = r.word(4) as uint; ulong argc = r.word(4); if (!type_ok(f.values.ret, count as usize) || argc > 65535 || argc > (r.data.len() - r.pos) as ulong / 4) { return false; }
+        for (i in 0..argc as usize) { uint t = r.word(4) as uint; if (!type_ok(t, count as usize)) { return false; } f.values.args.push(t); }
+        ulong vars = r.word(4); if (vars > 1000000 - total || vars > (r.data.len() - r.pos) as ulong / 17) { return false; } total += vars;
+        for (i in 0..vars as usize) {
+            var name = r.string(); uint ty = r.word(4) as uint; ulong parameter = r.word(1); ulong scopes = r.word(4);
+            if (!r.ok || name.is_empty() || ty as usize >= out.types.len() || parameter > 1 || scopes > 1000000 - total || scopes > (r.data.len() - r.pos) as ulong / 16) { return false; } total += scopes;
+            var v = Variable { name: name, type: ty, parameter: parameter != 0, scope: Vec.new(), locations: Vec.new() }; ulong previous = 0;
+            for (j in 0..scopes as usize) { ulong a = r.word(8); ulong b = r.word(8); if (!r.ok || a >= b || b > f.size || a < previous) { return false; } previous = b; v.scope.push(Range { begin: a, end: b }); }
+            ulong locs = r.word(4); if (locs > 1000000 - total || locs > (r.data.len() - r.pos) as ulong / 24) { return false; } total += locs; previous = 0;
+            for (j in 0..locs as usize) { ulong a = r.word(8); ulong b = r.word(8); int reg = r.word(4) as int; int offset = r.word(4) as int;
+                bool covered = false; for (scope in &const v.scope) { if (a >= scope.begin && b <= scope.end) { covered = true; break; } }
+                if (!r.ok || a >= b || b > f.size || a < previous || reg < -1 || reg > 15 || !covered) { return false; } previous = b; v.locations.push(Location { begin: a, end: b, reg: reg, offset: offset });
+            } f.values.variables.push(v);
+        }
+        ulong cfi = r.word(4); if (cfi > 1000000 - total || cfi > (r.data.len() - r.pos) as ulong / 16) { return false; } total += cfi; ulong previous = 0;
+        for (i in 0..cfi as usize) { ulong pc = r.word(8); int reg = r.word(4) as int; int offset = r.word(4) as int;
+            if (!r.ok || pc >= f.size || pc < previous || reg < -4 || reg > 15 || reg == -1 || (reg < 0 && offset != 0) || (reg >= 0 && offset != 2147483647 && (offset > 0 || offset % 8 != 0))) { return false; } previous = pc; f.values.cfi.push(Cfi { pc: pc, reg: reg, offset: offset });
+        }
+    } return r.ok;
+}
+/// Modifier/array/pointer chains cannot cycle without a nominal type. Bound
+/// their depth before CodeView's recursive emitter visits untrusted metadata.
+bool valid_chains(&const Vec<Type> types) {
+    Vec<byte> colors = Vec.new(); Vec<usize> depths = Vec.new();
+    for (t in types) { colors.push(0); depths.push(0); }
+    for (i in 0..types.len()) {
+        if (colors[i] == 2) { continue; } Vec<usize> path = Vec.new(); usize at = i;
+        while (at < types.len() && colors[at] != 2) {
+            uint kind = types[at].kind; if (kind != 5 && kind != 6 && kind != 10) { break; }
+            if (colors[at] == 1 || path.len() >= 256) { return false; }; *colors.get_mut(at).unwrap() = 1; path.push(at); at = types[at].inner as usize;
+        }
+        usize depth = if (at < depths.len()) { depths[at] } else { 0 }; usize j = path.len();
+        while (j > 0) { j -= 1; depth += 1; if (depth > 256) { return false; }; *depths.get_mut(path[j]).unwrap() = depth; *colors.get_mut(path[j]).unwrap() = 2; }
+    } return true;
+}

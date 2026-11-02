@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag that receives the packages, such as v0.2.0. Empty keeps the packages as run artifacts only. The packages are built from the selected branch, so pick a branch whose compiler source matches the tag.
+        description: Existing release tag that receives the packages, such as v0.3.0. Empty keeps the packages as run artifacts only. The packages are built from the selected branch, so pick a branch whose compiler source matches the tag.
         required: false
         default: ''
       overwrite:
@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Ninja (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get update && sudo apt-get install -y ninja-build gdb binutils
       - name: Ninja (macOS)
         if: runner.os == 'macOS'
         run: brew list ninja >/dev/null 2>&1 || brew install ninja

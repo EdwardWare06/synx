@@ -6,6 +6,10 @@ import link.model.{Object, Section, Symbol, Binding, Definition, Relocation, Rel
 import link.model;
 import link.reader;
 import link.buffer.LIMIT;
+import debug.data.decode;
+import bytes;
+import std.collections.HashMap;
+import std.utf8;
 
 struct RawSection { usize raw; usize relocations; usize count; usize target; }
 
@@ -105,8 +109,14 @@ pub Result<Object, Failure> read(&const Vec<byte> data, &const str object_name, 
             var section_range = span(data, raw, size)?;
         }
         bool debug = starts(section_name, ".debug");
-        bool semantic = starts(section_name, ".drectve") || starts(section_name, ".CRT") || starts(section_name, ".pdata") ||
-            starts(section_name, ".xdata") || starts(section_name, ".tls") || starts(section_name, ".idata");
+        bool pdata = bytes.equals(section_name, ".pdata");
+        bool xdata = bytes.equals(section_name, ".xdata");
+        if ((pdata || xdata) && ((flags & 0xa00000a0) != 0 || (flags & 0x40000040) != 0x40000040 || (pdata && size % 12 != 0) || (xdata && size % 4 != 0))) { return Err(model.fail(Code.Unsupported, 0, i)); }
+        bool semantic = starts(section_name, ".drectve") || starts(section_name, ".CRT") || starts(section_name, ".tls") || starts(section_name, ".idata");
+        if (bytes.equals(section_name, ".snxdbg")) {
+            if (!object.debug.empty() || count != 0) { return Err(model.fail(Code.Invalid, 0, i)); }
+            object.debug = match decode(copy(data, raw, size)?) { Some(v) => v, None => return Err(model.fail(Code.Invalid, 0, i)) };
+        }
         if (semantic && (size != 0 || count != 0)) { return Err(model.fail(Code.Unsupported, 0, i)); }
         if ((flags & 0x1000) != 0) { return Err(model.fail(Code.Unsupported, 0, i)); }
         bool discard = debug || (flags & 0x800) != 0;
@@ -125,6 +135,7 @@ pub Result<Object, Failure> read(&const Vec<byte> data, &const str object_name, 
             if (power >= 14) { return Err(model.fail(Code.Unsupported, 0, i)); }
             ulong alignment = if (power == 0) { 16 } else { (1 as ulong) << (power - 1) };
             target = object.sections.len();
+            if (pdata) { object.pdata.push(target); }
             if (bss) { object.sections.push(Section.bss(size as ulong, alignment)); }
             else {
                 var kind = if (text) { SectionKind.Text } else { if ((flags & 0x80000000) != 0) { SectionKind.Data } else { SectionKind.ReadOnly } };
@@ -199,5 +210,12 @@ pub Result<Object, Failure> read(&const Vec<byte> data, &const str object_name, 
         }
     }
     var valid = model.validate(object, 0)?;
+    HashMap<String, usize> defs = HashMap.new(); for (i in 0..object.symbols.len()) { defs.insert(model.key(object.symbols[i].name), i); }
+    HashMap<String, bool> seen = HashMap.new();
+    for (f in &const object.debug.functions) { var key = model.key(utf8.encode(f.symbol)); if (seen.contains_key(key)) { return Err(model.fail(Code.Invalid, 0, 0)); } seen.insert(String.from(key), true);
+        usize index = match defs.get(key) { Some(n) => *n, None => return Err(model.fail(Code.Invalid, 0, 0)) }; var symbol = object.symbols.get(index).unwrap();
+        match symbol.binding { Global => {}, _ => return Err(model.fail(Code.Invalid, 0, index)) }
+        match symbol.definition { Section(section, offset) => { var s = object.sections.get(section).unwrap(); match s.kind { Text => {}, _ => return Err(model.fail(Code.Invalid, 0, index)) } if (f.address != offset || f.size > s.size - offset) { return Err(model.fail(Code.Invalid, 0, index)); } }, _ => return Err(model.fail(Code.Invalid, 0, index)) }
+    }
     return Ok(object);
 }

@@ -8,10 +8,15 @@ import link.imports;
 import link.buffer.{Buffer, align};
 import link.reader;
 import link.standalone_macho;
+import debug.elf;
 import std.binary;
 import std.collections;
 import std.utf8;
 import link.macho_sha256;
+import debug.data.Unit;
+import link.pe_debug;
+import std.mem;
+pub struct Program { pub Vec<byte> data; pub Unit debug; pub Vec<image.RuntimeFunction> unwind; }
 
 pub const &const str MARKER = "SYNX-NATIVE-TEMPLATE-V1-X64-LOC\0";
 ulong get(&const Vec<byte> data, usize at, usize width) { return binary.read_uint(data, at, width, true).unwrap_or(0); }
@@ -53,7 +58,7 @@ bool exported(&const Vec<byte> host, usize desc, &const str name) {
     }
     return false;
 }
-Result<Vec<byte>, Failure> payload(Vec<Object> inputs, &const Vec<byte> host, usize desc, int os) {
+Result<Program, Failure> payload(Vec<Object> inputs, &const Vec<byte> host, usize desc, int os) {
     var entry = if (os == 2) { "_synx_entry" } else { "synx_entry" };
     var thread = if (os == 2) { "_synx_thread_entry" } else { "synx_thread_entry" };
     var catalogue = imports.collect_for(inputs, "runtime", os, entry)?;
@@ -81,17 +86,33 @@ Result<Vec<byte>, Failure> payload(Vec<Object> inputs, &const Vec<byte> host, us
     for (i in 0..4) { var s = linked.segments.get(i).unwrap(); out.word(s.rva, 8); out.word(s.size, 8); out.word(s.data.len() as ulong, 8); out.word(0, 8); out.word(if (i == 0) { 5 } else if (i == 1) { 1 } else { 3 }, 8); }
     collections.sort(&linked.absolute_sites); for (site in &const linked.absolute_sites) { out.word(*site, 8); }
     for (i in 0..names.len()) { var name = names.get(i).unwrap(); ulong slot = image.symbol(linked, "__synx_standalone_slot_{i}").unwrap(); out.word(slot, 8); out.word(name.len() as ulong, 8); out.append(std.utf8.encode(name)); }
-    for (i in 0..4) { var s = linked.segments.get(i).unwrap(); usize offset = out.data.len(); out.patch(88 + i * 40 + 24, offset as ulong, 8); out.append(s.data); }
-    return Ok(out.data);
+    for (i in 0..4) { var s = linked.segments.get(i).unwrap(); if (os == 1 && !linked.debug.empty()) { var padding = out.pad(align(out.data.len() as ulong, 512)?)?; } usize offset = out.data.len(); out.patch(88 + i * 40 + 24, offset as ulong, 8); out.append(s.data); }
+    if (os == 0 && !linked.debug.empty()) {
+        bool supported = false;
+        for (i in 0..host.len()) { if (*host.get(i).unwrap() == 83 && reader.matches(host, i, "SYNX-GDB-JIT-V1\0")) { supported = true; break; } }
+        if (!supported) { return Err(model.named(Code.Unsupported, 0, 0, "runtime host lacks Linux debugger support; rebuild the runtime host or use --no-debug")); }
+        var symbols = elf.symbols(linked.debug)?;
+        ulong extra = symbols.data.len() as ulong + symbols.patches.len() as ulong * 8 + 40;
+        if (out.data.len() as ulong > 268435456 || extra > 268435456 - out.data.len() as ulong) { return Err(model.fail(Code.Range, 0, 0)); }
+        ulong offset = out.data.len() as ulong; out.append(symbols.data);
+        ulong patches = out.data.len() as ulong; for (p in &const symbols.patches) { out.word(*p, 8); }
+        out.append(std.utf8.encode("SNXJIT01")); out.word(offset, 8); out.word(symbols.data.len() as ulong, 8); out.word(patches, 8); out.word(symbols.patches.len() as ulong, 8);
+    }
+    if (out.data.len() as ulong > 268435456) { return Err(model.fail(Code.Range, 0, 0)); }
+    return Ok(Program { data: out.data, debug: mem.replace(&linked.debug, Unit.new()), unwind: mem.replace(&linked.unwind, Vec.new()) });
 }
 pub Result<Vec<byte>, Failure> bytes(Vec<Object> inputs, &const Vec<byte> host, int os) {
+    var output = bundle(inputs, host, os, "program.pdb")?; return Ok(output.exe);
+}
+pub Result<pe_debug.Output, Failure> bundle(Vec<Object> inputs, &const Vec<byte> host, int os, &const str pdb_name) {
     usize desc = descriptor(host, os)?;
     var stripped = if (os == 2) { standalone_macho.strip(host)? } else { match reader.copy(host, 0, host.len()) { Ok(value) => value, Err(_) => return Err(model.fail(Code.Invalid, 0, 0)) } };
     if (desc > stripped.len() || stripped.len() - desc < 96 + get(host, desc + 88, 8) as usize) { return Err(model.fail(Code.Invalid, 0, desc)); }
     var program = payload(inputs, host, desc, os)?;
+    if (os == 1 && !program.debug.empty()) { return pe_debug.standalone(stripped, desc, program.data, program.debug, program.unwind, pdb_name); }
     var out = Buffer.new(); out.data = stripped;
     var padded = out.pad(align(out.data.len() as ulong, 16)?)?;
-    out.patch(desc + 40, out.data.len() as ulong, 8); out.patch(desc + 48, program.len() as ulong, 8); out.append(program);
-    if (os == 2) { return standalone_macho.sign(out.data); }
-    return Ok(out.data);
+    out.patch(desc + 40, out.data.len() as ulong, 8); out.patch(desc + 48, program.data.len() as ulong, 8); out.append(program.data);
+    if (os == 2) { return Ok(pe_debug.Output { exe: standalone_macho.sign(out.data)?, pdb: Vec.new() }); }
+    return Ok(pe_debug.Output { exe: out.data, pdb: Vec.new() });
 }
