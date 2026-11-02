@@ -46,6 +46,13 @@ jobs:
           test -f "$SYNX_FMT_ASAN"
           python3 -B tests/fmt/test_fmt.py build/selfhost-stages/synx-stage2 build/runtime/synx-host
           SYNX_LSP_ASAN="$SYNX_FMT_ASAN" python3 -B tests/lsp/test_lsp.py build/selfhost-stages/synx-stage2
+      - name: Myelin allocation check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export SYNX_MYELIN_ASAN="$(cc -print-file-name=libasan.so)"
+          test -f "$SYNX_MYELIN_ASAN"
+          python3 -B tests/myelin/test_myelin.py build/selfhost-stages/synx-stage2 --memory
       - name: Failed thread creation cleanup
         if: runner.os == 'Linux'
         shell: bash
